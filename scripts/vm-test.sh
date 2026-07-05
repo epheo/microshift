@@ -162,18 +162,25 @@ koc -n topolvm-system get pods --no-headers | grep -q Running
 log "assert: embedded portail image was imported into cri-o at boot"
 vssh crictl images | grep -q 'localhost/embedded/portail'
 
-log "assert: greenboot declared the boot GREEN (up to 5m)"
+# The log phrasing differs between greenboot implementations (bash: "Boot
+# Status is GREEN"; the CS10 Rust rewrite: "greenboot health-check passed") —
+# accept both, then assert the actual contract: boot_success=1 in grubenv.
+log "assert: greenboot health checks passed (up to 5m)"
 ok=false
 for _ in $(seq 60); do
-    if vssh journalctl -u greenboot-healthcheck --no-pager 2>/dev/null | grep -qi 'Status is GREEN'; then
+    if vssh journalctl -u greenboot-healthcheck --no-pager 2>/dev/null \
+            | grep -qiE 'Status is GREEN|health-check passed'; then
         ok=true; break
     fi
     sleep 5
 done
 ${ok} || {
-    echo "ERROR: greenboot never went GREEN" >&2
+    echo "ERROR: greenboot health checks did not pass" >&2
     vssh journalctl -u greenboot-healthcheck --no-pager | tail -30 || true
     exit 1
 }
+
+log "assert: grubenv records boot_success=1"
+vssh grub2-editenv list | grep -q 'boot_success=1'
 
 log "VM TEST PASSED"
