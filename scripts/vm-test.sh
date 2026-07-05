@@ -33,11 +33,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ssh adds a remote shell evaluation layer that strips quoting from args
+# (e.g. the backslash in a kubectl jsonpath) — re-quote every arg with
+# printf %q so commands run remotely exactly as written here.
 vssh() {
     ssh -p "${SSH_PORT}" -i "${WORKDIR}/id" \
         -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=5 -o LogLevel=ERROR \
-        root@127.0.0.1 "$@"
+        root@127.0.0.1 "$(printf '%q ' "$@")"
 }
 
 # --- 1. Prepare the workdir, ssh key and builder config ----------------------
@@ -144,7 +147,11 @@ koc -n openshift-ovn-kubernetes get pods --no-headers | grep -q Running
 
 log "assert: enable-multi-network=true is native in ovnkube-config"
 koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkube\.conf}' \
-    | grep -q 'enable-multi-network=true'
+    | grep -q 'enable-multi-network=true' || {
+        echo "ERROR: enable-multi-network missing from ovnkube-config:" >&2
+        koc -n openshift-ovn-kubernetes get cm ovnkube-config -o yaml | head -40 >&2 || true
+        exit 1
+    }
 
 log "assert: multus is deployed"
 koc -n openshift-multus get daemonset multus --no-headers >/dev/null
