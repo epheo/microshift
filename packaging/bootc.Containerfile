@@ -31,6 +31,12 @@ ARG USHIFT_RPM_REPO_PATH=/tmp/rpm-repo
 ARG BUILDER_RPM_REPO_PATH=/home/microshift/microshift/_output/rpmbuild/RPMS
 ARG BUILDER_RSHARED_SERVICE=/home/microshift/microshift/packaging/imagemode/systemd/microshift-make-rshared.service
 
+# A bootc image must contain exactly one kernel (bootc install refuses
+# "multiple subdirectories in usr/lib/modules"). Debug kernels have slipped in
+# as weak-dependency resolutions of the package set below — exclude them from
+# every dnf transaction in this image and in derived/site images.
+RUN echo 'excludepkgs=kernel-debug*' >> /etc/dnf/dnf.conf
+
 # Install MicroShift with the OVN + multus + topolvm + greenboot selection.
 # Runtime dependencies (cri-o, openvswitch, ...) come from the public
 # mirror.openshift.com dependencies repo configured by create_repos.sh.
@@ -85,4 +91,13 @@ VOLUME ["/var"]
 
 RUN if systemctl list-unit-files bootc-publish-rhsm-facts.service >/dev/null 2>&1 ; then \
         systemctl disable bootc-publish-rhsm-facts.service ; \
+    fi
+
+# Guard: a second kernel in the image breaks bootc install at deploy time —
+# fail the build here instead.
+RUN count="$(find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d | wc -l)" && \
+    if [ "${count}" != "1" ]; then \
+        echo "ERROR: expected exactly 1 kernel in /usr/lib/modules, found ${count}:"; \
+        ls /usr/lib/modules; \
+        exit 1; \
     fi
