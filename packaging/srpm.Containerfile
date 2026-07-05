@@ -60,6 +60,7 @@ RUN ARCH="x86_64" /tmp/prebuild.sh --replace        "${OKD_RELEASE_IMAGE}" "${OK
 ARG SPEC_TOPOLVM=/tmp/topolvm.spec
 COPY ./src/topolvm/topolvm.spec "${SPEC_TOPOLVM}"
 COPY ./src/topolvm/assets/  ./assets/optional/topolvm/
+COPY ./src/topolvm/dropins/ ./packaging/microshift/dropins/
 COPY ./src/topolvm/greenboot/ ./packaging/greenboot/
 COPY ./src/topolvm/release/ ./assets/optional/topolvm/
 
