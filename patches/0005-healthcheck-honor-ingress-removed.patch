@@ -1,0 +1,29 @@
+diff --git a/pkg/healthcheck/microshift_core_workloads.go b/pkg/healthcheck/microshift_core_workloads.go
+--- a/pkg/healthcheck/microshift_core_workloads.go
++++ b/pkg/healthcheck/microshift_core_workloads.go
+@@ -22,9 +22,6 @@ func getCoreMicroShiftWorkloads() (map[string]NamespaceWorkloads, error) {
+ 		"openshift-service-ca": {
+ 			Deployments: []string{"service-ca"},
+ 		},
+-		"openshift-ingress": {
+-			Deployments: []string{"router-default"},
+-		},
+ 		"openshift-dns": {
+ 			DaemonSets: []string{
+ 				"dns-default",
+@@ -37,6 +34,15 @@ func getCoreMicroShiftWorkloads() (map[string]NamespaceWorkloads, error) {
+ 			DaemonSets: []string{"ovnkube-master", "ovnkube-node"},
+ 		}
+ 	}
++	// Upstream arms this expectation unconditionally, but the router is never
++	// deployed when the config sets ingress.status: Removed — the healthcheck
++	// then waits out its whole timeout on a namespace that does not exist and
++	// greenboot fails an otherwise healthy boot (companion of patch 0003).
++	if cfg.Ingress.Status != config.StatusRemoved {
++		workloads["openshift-ingress"] = NamespaceWorkloads{
++			Deployments: []string{"router-default"},
++		}
++	}
+ 	if err := fillOptionalWorkloadsIfApplicable(cfg, workloads); err != nil {
+ 		return nil, err
+ 	}
