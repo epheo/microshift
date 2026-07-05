@@ -1,0 +1,12 @@
+diff --git a/assets/components/ovn/common/configmap.yaml b/assets/components/ovn/common/configmap.yaml
+index 7279ce1fb..c6abdd4c4 100644
+--- a/assets/components/ovn/common/configmap.yaml
++++ b/assets/components/ovn/common/configmap.yaml
+@@ -25,6 +25,7 @@ data:
+     enable-egress-ip=false
+     enable-egress-firewall=false
+     enable-egress-qos=false
++    enable-multi-network=true
+ 
+     [gateway]
+     mode=local

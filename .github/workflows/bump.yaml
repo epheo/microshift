@@ -1,0 +1,34 @@
+name: bump-versions
+# Weekly watch for new inputs within the pinned minor: upstream z-stream tags,
+# OKD stable payload tags, and portail releases. Opens a pull request when
+# anything moved; the build workflow then validates it end-to-end.
+# Crossing minors (e.g. 4.22 -> 5.0) is deliberately manual.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  bump:
+    if: github.repository_owner == 'epheo'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for newer pinned inputs
+        run: ./scripts/bump-versions.sh
+
+      - name: Open pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: bump/versions
+          commit-message: "chore: bump pinned versions"
+          title: "chore: bump pinned versions"
+          body: |
+            Automated weekly bump of `versions.env` within the pinned minor.
+            See the workflow run for what moved. Merging triggers a full
+            build + smoke test + publish.

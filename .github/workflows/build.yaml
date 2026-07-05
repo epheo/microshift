@@ -1,0 +1,74 @@
+name: build
+# Build epheo's MicroShift distribution: SRPM from pinned upstream source with
+# the patch series and OKD payload swap, native el10 RPMs, then the bootc OS
+# image. Every build is smoke-tested (the image boots as a privileged
+# container and the distribution's opinions are asserted) before any push.
+#
+# Pushes to ghcr.io/<owner>/microshift happen only on main-branch builds and
+# manual dispatches; pull requests build and test without publishing.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      push-image:
+        description: Push the resulting image to ghcr.io
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          swap-storage: false
+
+      - name: Load version pins
+        run: grep -E '^[A-Z_]+=' versions.env >> "${GITHUB_ENV}"
+
+      - name: Build SRPM (source + patches + OKD payload swap)
+        run: make srpm PODMAN="sudo podman"
+
+      - name: Build RPMs (el10)
+        run: make rpm PODMAN="sudo podman"
+
+      - name: Build bootc image
+        run: make image PODMAN="sudo podman"
+
+      - name: Smoke test
+        run: make smoke PODMAN="sudo podman"
+
+      - name: Resolve version string
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(make --silent version PODMAN='sudo podman')"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "minor=$(echo "${USHIFT_GITREF}" | cut -d. -f1,2)" >> "${GITHUB_OUTPUT}"
+
+      - name: Login to ghcr.io
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push-image)
+        run: |
+          sudo podman login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Push image
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push-image)
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${{ github.repository_owner }}/microshift"
+          full="${{ steps.version.outputs.version }}_epheo.${EPHEO_REV}"
+          for tag in "${full}" "${{ steps.version.outputs.minor }}" latest; do
+            sudo podman tag epheo-microshift "${image}:${tag}"
+            sudo podman push "${image}:${tag}"
+          done
+          echo "pushed ${image}:${full}"

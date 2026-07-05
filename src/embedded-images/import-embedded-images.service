@@ -1,0 +1,14 @@
+[Unit]
+Description=Import embedded container images into the cri-o image store
+# Before MicroShift so boot-critical pods (portail/blocky/kea) find their
+# localhost/embedded/* images locally instead of attempting a pull.
+After=local-fs.target
+Before=microshift.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/import-embedded-images.sh
+
+[Install]
+WantedBy=multi-user.target
