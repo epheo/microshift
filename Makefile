@@ -59,9 +59,7 @@ image:
 # Extract the version string stamped into the RPM build (used for image tags).
 .PHONY: version
 version:
-	@cid=$$($(PODMAN) create "$(RPM_IMAGE)") && \
-	trap "$(PODMAN) rm -f $$cid >/dev/null" EXIT && \
-	$(PODMAN) cp "$$cid:/home/microshift/microshift/_output/rpmbuild/RPMS/version.txt" /dev/stdout
+	@$(PODMAN) run --rm "$(RPM_IMAGE)" cat /home/microshift/microshift/_output/rpmbuild/RPMS/version.txt
 
 # Copy the built RPMs out of the stage-2 image into RPM_OUTDIR.
 .PHONY: rpms-out

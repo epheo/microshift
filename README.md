@@ -60,10 +60,12 @@ moving tags `<minor>` (e.g. `4.22`) and `latest`. `EPHEO_REV` in
 
 ## Release cadence
 
-`.github/workflows/bump.yaml` checks weekly for new z-stream tags, OKD stable
-payload tags, and portail releases within the pinned minor, and opens a PR.
-Merging it builds, smoke-tests, and publishes. Crossing minors (including the
-4.x → 5.0 renumbering) is a deliberate manual edit of `versions.env`.
+The build workflow checks daily for new z-stream tags, OKD stable payload
+tags, and portail releases within the pinned minor, auto-commits the bump,
+and the same run builds, VM-tests, and publishes. A weekly run rebuilds even
+with unchanged pins to pick up package-level (CVE) fixes. Crossing minors
+(including the 4.x → 5.0 renumbering) is a deliberate manual edit of
+`versions.env`.
 
 ## Patch policy
 
