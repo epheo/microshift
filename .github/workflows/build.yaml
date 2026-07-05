@@ -1,11 +1,18 @@
 name: build
-# Build epheo's MicroShift distribution: SRPM from pinned upstream source with
-# the patch series and OKD payload swap, native el10 RPMs, then the bootc OS
-# image. Every build is smoke-tested (the image boots as a privileged
-# container and the distribution's opinions are asserted) before any push.
+# The distribution's single CI pipeline:
 #
-# Pushes to ghcr.io/<owner>/microshift happen only on main-branch builds and
-# manual dispatches; pull requests build and test without publishing.
+#   pull_request          build + smoke test, no publish
+#   push to main          build + smoke test + publish
+#   workflow_dispatch     build + smoke test (+ publish unless disabled)
+#   daily schedule        check for new z-stream / OKD payload / portail
+#                         releases within the pinned minor; if anything moved,
+#                         auto-commit the bump to main and build + publish
+#   weekly schedule       full rebuild + publish even with unchanged pins, so
+#                         the image picks up current package-level (CVE) fixes
+#
+# The bump job commits with the workflow GITHUB_TOKEN, whose pushes do not
+# trigger new workflow runs — that's why bump and build live in one workflow:
+# the build job of the SAME run checks out the freshly bumped main.
 
 on:
   push:
@@ -17,15 +24,66 @@ on:
         description: Push the resulting image to ghcr.io
         type: boolean
         default: true
+  schedule:
+    - cron: "15 6 * * *" # daily bump check
+    - cron: "45 5 * * 1" # weekly refresh rebuild
+
+concurrency:
+  group: build-${{ github.ref }}-${{ github.event_name == 'pull_request' && github.event.number || 'main' }}
+  cancel-in-progress: false
 
 jobs:
+  bump:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.commit.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for newer pinned inputs
+        run: ./scripts/bump-versions.sh
+
+      - name: Commit bump to main
+        id: commit
+        run: |
+          set -euo pipefail
+          if git diff --quiet versions.env; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            echo "No new versions."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add versions.env
+            git commit -m "chore: bump pinned versions
+
+            $(git diff --staged versions.env | grep '^[+-][A-Z]' || true)"
+            git push
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
   build:
+    needs: [bump]
+    # Run for every non-schedule event (bump is skipped there); on the daily
+    # schedule only when something was bumped; on the weekly schedule always.
+    if: |
+      always() && (
+        github.event_name != 'schedule' ||
+        needs.bump.outputs.changed == 'true' ||
+        github.event.schedule == '45 5 * * 1'
+      )
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Scheduled runs must build the just-bumped main, not the sha the
+          # schedule fired on.
+          ref: ${{ github.event_name == 'schedule' && 'main' || '' }}
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
@@ -45,8 +103,25 @@ jobs:
       - name: Build bootc image
         run: make image PODMAN="sudo podman"
 
-      - name: Smoke test
-        run: make smoke PODMAN="sudo podman"
+      - name: Install qemu
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-x86
+
+      - name: VM boot test (bootc-image-builder -> qcow2 -> QEMU)
+        run: make vm-test PODMAN="sudo podman"
+
+      - name: Make VM console log readable
+        if: failure()
+        run: sudo chmod -R a+rX /tmp/epheo-microshift-vm 2>/dev/null || true
+
+      - name: Upload VM console log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-console-log
+          path: /tmp/epheo-microshift-vm/console.log
+          if-no-files-found: ignore
 
       - name: Resolve version string
         id: version
@@ -57,12 +132,12 @@ jobs:
           echo "minor=$(echo "${USHIFT_GITREF}" | cut -d. -f1,2)" >> "${GITHUB_OUTPUT}"
 
       - name: Login to ghcr.io
-        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push-image)
+        if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.push-image)
         run: |
           sudo podman login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
 
       - name: Push image
-        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push-image)
+        if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.push-image)
         run: |
           set -euo pipefail
           image="ghcr.io/${{ github.repository_owner }}/microshift"

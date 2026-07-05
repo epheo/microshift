@@ -53,9 +53,15 @@ OKD release — public, no pull secret.
 
 ```sh
 make srpm rpm image   # build everything (rootless podman is fine)
-sudo make smoke       # boot it as a container and assert the opinions
+sudo make smoke       # quick check: boot as a privileged container, assert opinions
+sudo make vm-test     # acceptance: bootc-image-builder -> qcow2 -> QEMU boot,
+                      # asserts opinions + real bootc deployment + greenboot GREEN
 make version          # print the version string of the built RPMs
 ```
+
+`vm-test` is the CI gate — it validates what the container smoke cannot:
+bootloader, ostree deployment, boot ordering, and greenboot actually gating
+the boot. `smoke` remains the fast inner loop for local iteration.
 
 ## Versioning
 

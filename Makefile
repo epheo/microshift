@@ -76,6 +76,12 @@ rpms-out:
 smoke:
 	DIST_IMAGE="$(DIST_IMAGE)" ./scripts/smoke-test.sh
 
+# Full acceptance test: bootc-image-builder -> qcow2 -> QEMU boot, asserting
+# the opinions plus bootc/greenboot behavior on a real boot. The CI gate.
+.PHONY: vm-test
+vm-test:
+	DIST_IMAGE="$(DIST_IMAGE)" ./scripts/vm-test.sh
+
 .PHONY: smoke-clean
 smoke-clean:
 	DIST_IMAGE="$(DIST_IMAGE)" CLEAN=1 ./scripts/smoke-test.sh
