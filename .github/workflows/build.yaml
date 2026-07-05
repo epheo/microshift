@@ -94,6 +94,23 @@ jobs:
       - name: Load version pins
         run: grep -E '^[A-Z_]+=' versions.env >> "${GITHUB_ENV}"
 
+      # Registry CDNs flake (unexpected EOF mid-blob); pull every base image
+      # with retries up front so the builds run against the local store.
+      - name: Pre-pull base images
+        run: |
+          set -euo pipefail
+          for img in \
+              quay.io/fedora/fedora:latest \
+              "${BUILDROOT_IMAGE}" \
+              "${BOOTC_IMAGE_URL}:${BOOTC_IMAGE_TAG}" \
+              quay.io/centos-bootc/bootc-image-builder:latest; do
+            for i in $(seq 5); do
+              if sudo podman pull -q "${img}"; then break; fi
+              if [ "${i}" = "5" ]; then echo "ERROR: could not pull ${img}"; exit 1; fi
+              echo "pull failed (attempt ${i}) for ${img}, retrying"; sleep 15
+            done
+          done
+
       - name: Build SRPM (source + patches + OKD payload swap)
         run: make srpm PODMAN="sudo podman"
 
