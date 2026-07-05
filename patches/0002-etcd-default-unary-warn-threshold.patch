@@ -1,0 +1,15 @@
+diff --git a/etcd/cmd/microshift-etcd/run.go b/etcd/cmd/microshift-etcd/run.go
+--- a/etcd/cmd/microshift-etcd/run.go
++++ b/etcd/cmd/microshift-etcd/run.go
+@@ -75,6 +75,11 @@
+ 
+ 	// based on https://github.com/openshift/cluster-etcd-operator/blob/master/bindata/bootkube/bootstrap-manifests/etcd-member-pod.yaml#L19
+ 	s.etcdCfg = etcd.NewConfig()
++	// The vendored etcd defines DefaultWarningUnaryRequestDuration but never
++	// applies it to embed configs, so the "expensive request" threshold stays
++	// at 0 and the v3rpc interceptor logs a warn-level "request stats" line
++	// for every single request.
++	s.etcdCfg.WarningUnaryRequestDuration = etcd.DefaultWarningUnaryRequestDuration
+ 	s.etcdCfg.ClusterState = "new"
+ 	s.etcdCfg.Logger = "zap"
+ 	s.etcdCfg.Dir = dataDir

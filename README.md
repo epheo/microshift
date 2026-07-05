@@ -15,6 +15,7 @@ Published at `ghcr.io/epheo/microshift`.
 | TopoLVM is the storage driver | community subpackage merged into the spec (LVMS is not in the OKD payload) |
 | [portail](https://github.com/epheo/portail) is the edge | its image is embedded as an OCI archive and imported into cri-o at boot — cold boot needs no registry |
 | Updates must be safe | greenboot MicroShift health gate stays enabled; bootc rollback does the rest |
+| Logs are signal, not noise | `patches/0002` (etcd logs every request at warn — missing threshold default) and `patches/0003` (router status watcher hot-loops when `ingress.status: Removed`) |
 | Native el10 | RPMs are built in a CentOS Stream 10 buildroot |
 
 Everything site-specific (IPs, VLANs, NADs, hardware quirks, extra embedded
