@@ -1,20 +1,9 @@
 # epheo's build of MicroShift
 
 An opinionated, from-source distribution of [MicroShift](https://github.com/openshift/microshift)
-as a bootc OS image — CentOS Stream 10, native el10 RPMs, fully public build
-inputs (no Red Hat subscription or pull secret required).
+as a bootc OS image — CentOS Stream 10, native el10 RPMs.
 
 Published at `ghcr.io/epheo/microshift`.
-
-## Why this exists
-
-The [microshift-io](https://github.com/microshift-io/microshift) community
-project (run by the MicroShift team) proves that MicroShift builds cleanly
-against the public OKD payload, but its bootc image releases are manual and
-infrequent, ship kindnet as the CNI, and mix el9 RPMs onto el10 hosts. This
-repo owns the release button: pinned, reproducible inputs; a CI build for
-every z-stream; and a small set of opinions applied at the *source* level
-instead of as runtime hacks.
 
 ## The opinions
 
