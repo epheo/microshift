@@ -1,0 +1,21 @@
+diff --git a/pkg/config/storage.go b/pkg/config/storage.go
+index a590b29..5848ff1 100644
+--- a/pkg/config/storage.go
++++ b/pkg/config/storage.go
+@@ -112,9 +112,12 @@ func (s Storage) IsValid() []error {
+ 	return errs.UnsortedList()
+ }
+ 
+-// IsEnabled returns false only when .storage.driver: "none". An empty value is considered "enabled"
+-// for backwards compatibility. Otherwise, the meaning of the config would silently change after an
+-// upgrade from enabled-by-default to disabled-by-default.
++// IsEnabled returns true only when .storage.driver is explicitly "lvms".
++// This distribution swaps the payload to OKD, which ships no LVMS operator
++// images: with upstream's enabled-by-default, the healthcheck arms an
++// openshift-storage expectation on any host that has a volume group (its
++// `vgs` probe), and greenboot then fails a boot that is actually healthy.
++// TopoLVM is delivered separately via manifests.d and ignores this knob.
+ func (s Storage) IsEnabled() bool {
+-	return s.Driver != CsiDriverNone
++	return s.Driver == CsiDriverLVMS
+ }
