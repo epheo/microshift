@@ -183,4 +183,32 @@ ${ok} || {
 log "assert: grubenv records boot_success=1"
 vssh grub2-editenv list | grep -q 'boot_success=1'
 
+# --- 7. Assert the recommended site shape: ingress.status Removed -------------
+# Sites are expected to replace the openshift-router with their own edge
+# (see the Containerfile header). Upstream's healthcheck expects the router
+# unconditionally (patch 0005 fixes that): exercise Removed explicitly so a
+# rebase cannot silently regress greenboot for every site following the
+# recommendation.
+log "reconfigure: ingress.status=Removed, restart microshift"
+vssh 'mkdir -p /etc/microshift/config.d && printf "ingress:\n  status: Removed\n" > /etc/microshift/config.d/99-test-ingress-removed.yaml'
+vssh systemctl restart microshift.service
+
+log "waiting for the router namespace to be torn down (up to 5m)"
+ok=false
+for _ in $(seq 60); do
+    # Require a responsive API before trusting the absence of the namespace —
+    # the apiserver blips during the microshift restart.
+    if koc get ns >/dev/null 2>&1 && ! koc get ns openshift-ingress >/dev/null 2>&1; then
+        ok=true; break
+    fi
+    sleep 5
+done
+${ok} || { echo "ERROR: openshift-ingress was not torn down" >&2; koc get ns >&2 || true; exit 1; }
+
+log "assert: microshift healthcheck passes with ingress removed"
+vssh microshift healthcheck -v=2 --timeout=300s || {
+    echo "ERROR: healthcheck failed with ingress.status=Removed" >&2
+    exit 1
+}
+
 log "VM TEST PASSED"
