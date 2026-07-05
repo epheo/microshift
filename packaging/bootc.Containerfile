@@ -79,6 +79,12 @@ COPY --chmod=755 ./src/embedded-images/import-embedded-images.sh /usr/bin/import
 COPY ./src/embedded-images/import-embedded-images.service /usr/lib/systemd/system/import-embedded-images.service
 RUN systemctl enable import-embedded-images.service
 
+# bootc#1682 workaround: keep the skopeo helper privileged under the update
+# timer so hosts pulling from authenticated registries can auto-update —
+# see the drop-in for details.
+COPY ./src/bootc/bootc-fetch-apply-updates-keep-skopeo-root.conf \
+     /usr/lib/systemd/system/bootc-fetch-apply-updates.service.d/10-keep-skopeo-root.conf
+
 # Recursively make the root filesystem subtree shared, as required by the OVN
 # images (mount propagation).
 COPY --from=builder ${BUILDER_RSHARED_SERVICE} /usr/lib/systemd/system/microshift-make-rshared.service
