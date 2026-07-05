@@ -23,7 +23,7 @@ FROM localhost/epheo-microshift-rpm:latest AS builder
 
 FROM ${BOOTC_IMAGE_URL}:${BOOTC_IMAGE_TAG}
 
-ARG PORTAIL_IMAGE=ghcr.io/epheo/portail:0.1.16
+ARG PORTAIL_IMAGE=ghcr.io/epheo/portail:0.1.17
 
 ARG REPO_CONFIG_SCRIPT=/tmp/create_repos.sh
 ARG USHIFT_POSTINSTALL_SCRIPT=/tmp/postinstall.sh
