@@ -62,11 +62,13 @@ moving tags `<minor>` (e.g. `4.22`) and `latest`. `EPHEO_REV` in
 ## Release cadence
 
 The build workflow checks daily for new z-stream tags, OKD stable payload
-tags, and portail releases within the pinned minor, auto-commits the bump,
-and the same run builds, VM-tests, and publishes. A weekly run rebuilds even
-with unchanged pins to pick up package-level (CVE) fixes. Crossing minors
-(including the 4.x → 5.0 renumbering) is a deliberate manual edit of
-`versions.env`.
+tags, and portail releases, auto-commits the bump, and the same run builds,
+VM-tests, and publishes. A weekly run rebuilds even with unchanged pins to
+pick up package-level (CVE) fixes. Minor (and any future major) crossings
+are automatic too, gated on one condition: a stable OKD payload of the new
+minor must exist. There is no manual step in the release process — the CI
+gate is the judge, and a crossing that breaks the patch series simply fails
+the run (main stays red, nothing publishes) until `patches/` is rebased.
 
 ## Patch policy
 
