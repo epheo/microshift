@@ -1,7 +1,7 @@
-# epheo's build of MicroShift
+# Opinionated build of upstream MicroShift and OKD
 
-An opinionated, from-source distribution of [MicroShift](https://github.com/openshift/microshift)
-as a bootc OS image — CentOS Stream 10, native el10 RPMs.
+From-source distribution of [MicroShift](https://github.com/openshift/microshift)
+as a bootc OS image: CentOS Stream 10, native el10 RPMs.
 
 Published at `ghcr.io/epheo/microshift`.
 
