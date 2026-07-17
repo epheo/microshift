@@ -78,9 +78,11 @@ smoke:
 
 # Full acceptance test: bootc-image-builder -> qcow2 -> QEMU boot, asserting
 # the opinions plus bootc/greenboot behavior on a real boot. The CI gate.
+# UPGRADE_FROM forced empty: the blanket export above would otherwise leak
+# the vm-test-upgrade default and flip this into upgrade mode.
 .PHONY: vm-test
 vm-test:
-	DIST_IMAGE="$(DIST_IMAGE)" ./scripts/vm-test.sh
+	DIST_IMAGE="$(DIST_IMAGE)" UPGRADE_FROM= ./scripts/vm-test.sh
 
 # The same suite on the update path every existing install takes: boot the
 # previously published image, bootc switch to the candidate, reboot, assert.
