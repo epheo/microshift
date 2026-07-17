@@ -1,9 +1,9 @@
 name: build
 # The distribution's single CI pipeline:
 #
-#   pull_request          build + smoke test, no publish
-#   push to main          build + smoke test + publish
-#   workflow_dispatch     build + smoke test (+ publish unless disabled)
+#   pull_request          build + test (VM boot + upgrade), no publish
+#   push to main          build + test + publish
+#   workflow_dispatch     build + test (+ publish unless disabled)
 #   daily schedule        check for new z-stream / OKD payload / portail
 #                         releases within the pinned minor; if anything moved,
 #                         auto-commit the bump to main and build + publish
@@ -103,7 +103,8 @@ jobs:
               quay.io/fedora/fedora:latest \
               "${BUILDROOT_IMAGE}" \
               "${BOOTC_IMAGE_URL}:${BOOTC_IMAGE_TAG}" \
-              quay.io/centos-bootc/bootc-image-builder:latest; do
+              quay.io/centos-bootc/bootc-image-builder:latest \
+              quay.io/libpod/registry:2.8; do
             for i in $(seq 5); do
               if sudo podman pull -q "${img}"; then break; fi
               if [ "${i}" = "5" ]; then echo "ERROR: could not pull ${img}"; exit 1; fi
@@ -128,16 +129,24 @@ jobs:
       - name: VM boot test (bootc-image-builder -> qcow2 -> QEMU)
         run: make vm-test PODMAN="sudo podman"
 
-      - name: Make VM console log readable
-        if: failure()
-        run: sudo chmod -R a+rX /tmp/epheo-microshift-vm 2>/dev/null || true
+      # The fresh-boot qcow2 is no longer needed; reclaim its space before
+      # the second bootc-image-builder run.
+      - name: Upgrade test (previous release -> candidate)
+        run: |
+          sudo rm -rf /tmp/epheo-microshift-vm/output
+          make vm-test-upgrade PODMAN="sudo podman" \
+              UPGRADE_FROM="ghcr.io/${{ github.repository_owner }}/microshift:latest"
 
-      - name: Upload VM console log
+      - name: Make VM console logs readable
+        if: failure()
+        run: sudo chmod -R a+rX /tmp/epheo-microshift-vm* 2>/dev/null || true
+
+      - name: Upload VM console logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: vm-console-log
-          path: /tmp/epheo-microshift-vm/console.log
+          path: /tmp/epheo-microshift-vm*/console.log
           if-no-files-found: ignore
 
       - name: Resolve version string

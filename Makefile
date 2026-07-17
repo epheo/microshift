@@ -8,6 +8,8 @@
 #   make rpm     rebuild the SRPM into native el10 RPMs (stream10 buildroot)
 #   make image   assemble the bootc OS image (OVN + multus + topolvm + portail)
 #   make smoke   boot the image as a privileged container and assert the opinions
+#   make vm-test qcow2 + QEMU boot, full assertion suite (the CI gate)
+#   make vm-test-upgrade  the same suite after bootc switch from the last release
 #   make version print the version string of the built RPMs
 #   make clean   remove the intermediate and final images
 
@@ -79,6 +81,15 @@ smoke:
 .PHONY: vm-test
 vm-test:
 	DIST_IMAGE="$(DIST_IMAGE)" ./scripts/vm-test.sh
+
+# The same suite on the update path every existing install takes: boot the
+# previously published image, bootc switch to the candidate, reboot, assert.
+# Skips cleanly when UPGRADE_FROM does not exist yet (first release, forks).
+UPGRADE_FROM ?= ghcr.io/epheo/microshift:latest
+
+.PHONY: vm-test-upgrade
+vm-test-upgrade:
+	DIST_IMAGE="$(DIST_IMAGE)" UPGRADE_FROM="$(UPGRADE_FROM)" ./scripts/vm-test.sh
 
 .PHONY: smoke-clean
 smoke-clean:
