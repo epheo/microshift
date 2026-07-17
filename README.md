@@ -42,16 +42,28 @@ public `mirror.openshift.com` dependencies repo. Payload images come from the
 OKD release — public, no pull secret.
 
 ```sh
-make srpm rpm image   # build everything (rootless podman is fine)
-sudo make smoke       # quick check: boot as a privileged container, assert opinions
-sudo make vm-test     # acceptance: bootc-image-builder -> qcow2 -> QEMU boot,
-                      # asserts opinions + real bootc deployment + greenboot GREEN
-make version          # print the version string of the built RPMs
+make srpm rpm image        # build everything (rootless podman is fine)
+sudo make smoke            # quick check: boot as a privileged container, assert opinions
+sudo make vm-test          # acceptance: bootc-image-builder -> qcow2 -> QEMU boot,
+                           # asserts opinions + real bootc deployment + greenboot GREEN
+sudo make vm-test-upgrade  # the same assertions after a real update: boot the
+                           # previously published image, bootc switch to the
+                           # candidate, reboot
+make version               # print the version string of the built RPMs
 ```
 
 `vm-test` is the CI gate — it validates what the container smoke cannot:
 bootloader, ostree deployment, boot ordering, and greenboot actually gating
-the boot. `smoke` remains the fast inner loop for local iteration.
+the boot. Its opinion assertions are functional, not existence checks: a PVC
+is provisioned and written (TopoLVM), an OVN-K layer2 secondary network is
+attached through a NetworkAttachmentDefinition, the embedded portail
+image is started from cri-o's store with pull policy Never, and steady-state
+journal volume is capped (regression cover for the log-noise patches, which
+could silently go dead on a bump while still applying cleanly). `vm-test-upgrade`
+runs the same suite on the update path every existing install takes (boot
+the last published release, `bootc switch` to the candidate, reboot), so
+the upgrade itself is gated before anything publishes. `smoke` remains the fast
+inner loop for local iteration.
 
 ## Versioning
 
@@ -63,7 +75,7 @@ moving tags `<minor>` (e.g. `4.22`) and `latest`. `EPHEO_REV` in
 
 The build workflow checks daily for new z-stream tags, OKD stable payload
 tags, and portail releases, auto-commits the bump, and the same run builds,
-VM-tests, and publishes. A weekly run rebuilds even with unchanged pins to
+VM-tests, upgrade-tests from the previous release, and publishes. A weekly run rebuilds even with unchanged pins to
 pick up package-level (CVE) fixes. Minor (and any future major) crossings
 are automatic too, gated on one condition: a stable OKD payload of the new
 minor must exist. There is no manual step in the release process — the CI
