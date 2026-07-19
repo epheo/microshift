@@ -1,0 +1,419 @@
+diff --git a/pkg/cmd/addnode.go b/pkg/cmd/addnode.go
+index 864876e8..d04c0a29 100644
+--- a/pkg/cmd/addnode.go
++++ b/pkg/cmd/addnode.go
+@@ -41,6 +41,7 @@ type AddNodeOptions struct {
+ 	KubeconfigPath string
+ 	Timeout        time.Duration
+ 	Learner        bool
++	Worker         bool
+ }
+ 
+ func NewAddNodeCommand() *cobra.Command {
+@@ -70,6 +71,8 @@ func NewAddNodeCommand() *cobra.Command {
+ 		"Timeout for cluster join operations")
+ 	cmd.Flags().BoolVar(&opts.Learner, "learner", true,
+ 		"Join the cluster as a learner node")
++	cmd.Flags().BoolVar(&opts.Worker, "worker", false,
++		"Join as a worker node: no etcd member, node services only (the microshift unit must run with --worker)")
+ 
+ 	if version.Get().BuildVariant != version.BuildVariantCommunity {
+ 		cmd.Hidden = true
+@@ -83,7 +86,7 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
+ 	defer cancel()
+ 
+ 	klog.Info("Starting cluster join process...")
+-	if opts.Learner {
++	if opts.Learner && !opts.Worker {
+ 		klog.Info("Will add etcd node as learner")
+ 	}
+ 
+@@ -114,25 +117,30 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
+ 			return fmt.Errorf("failed to fetch certificate authority %s: %w", resource.Name, err)
+ 		}
+ 	}
+-	for _, resource := range components.ServiceAccountKeyResources {
+-		if err := fetchServiceAccountKey(ctx, client, resource.Name, resource.Dir); err != nil {
+-			return fmt.Errorf("failed to fetch service account key %s: %w", resource.Name, err)
++	// Workers never sign service-account tokens and run no etcd member.
++	if !opts.Worker {
++		for _, resource := range components.ServiceAccountKeyResources {
++			if err := fetchServiceAccountKey(ctx, client, resource.Name, resource.Dir); err != nil {
++				return fmt.Errorf("failed to fetch service account key %s: %w", resource.Name, err)
++			}
+ 		}
+ 	}
+ 	klog.Info("Certificate authorities fetched and written successfully")
+ 
+-	if err := generateEtcdCertificates(cfg); err != nil {
+-		return fmt.Errorf("failed to generate etcd certificates: %w", err)
+-	}
+-	klog.Info("Etcd certificates generated successfully")
++	if !opts.Worker {
++		if err := generateEtcdCertificates(cfg); err != nil {
++			return fmt.Errorf("failed to generate etcd certificates: %w", err)
++		}
++		klog.Info("Etcd certificates generated successfully")
+ 
+-	clusterMembers, err := getClusterNodes(ctx, client)
+-	if err != nil {
+-		return fmt.Errorf("failed to get cluster information: %w", err)
+-	}
++		clusterMembers, err := getClusterNodes(ctx, client)
++		if err != nil {
++			return fmt.Errorf("failed to get cluster information: %w", err)
++		}
+ 
+-	if err := configureEtcdForCluster(ctx, cfg, clusterMembers, opts.Learner); err != nil {
+-		return fmt.Errorf("failed to configure etcd for cluster: %w", err)
++		if err := configureEtcdForCluster(ctx, cfg, clusterMembers, opts.Learner); err != nil {
++			return fmt.Errorf("failed to configure etcd for cluster: %w", err)
++		}
+ 	}
+ 
+ 	if err := configureBootstrapKubeconfig(cfg, opts.KubeconfigPath); err != nil {
+diff --git a/pkg/cmd/init.go b/pkg/cmd/init.go
+index 50851ed3..cf63be11 100644
+--- a/pkg/cmd/init.go
++++ b/pkg/cmd/init.go
+@@ -527,10 +527,18 @@ func initKubeconfigs(
+ 	if err != nil {
+ 		return err
+ 	}
++	// A worker's kubelet talks to the remote control plane, whose serving
++	// cert for non-localhost addresses chains to the external signer.
++	kubeletServerURL := cfg.ApiServer.URL
++	kubeletTrustPEM := internalTrustPEM
++	if cfg.MultiNode.Enabled && cfg.MultiNode.Worker {
++		kubeletServerURL = cfg.MultiNode.Controlplane
++		kubeletTrustPEM = externalTrustPEM
++	}
+ 	if err := util.KubeConfigWithClientCerts(
+ 		cfg.KubeConfigPath(config.Kubelet),
+-		cfg.ApiServer.URL,
+-		internalTrustPEM,
++		kubeletServerURL,
++		kubeletTrustPEM,
+ 		kubeletCertPEM, kubeletKeyPEM,
+ 	); err != nil {
+ 		return err
+diff --git a/pkg/cmd/run.go b/pkg/cmd/run.go
+index bd32bb87..db00165e 100644
+--- a/pkg/cmd/run.go
++++ b/pkg/cmd/run.go
+@@ -53,6 +53,7 @@ func NewRunMicroshiftCommand() *cobra.Command {
+ 	}
+ 
+ 	var multinode bool
++	var worker bool
+ 
+ 	multinodeDefault := true
+ 	if version.Get().BuildVariant != version.BuildVariantCommunity {
+@@ -61,11 +62,13 @@ func NewRunMicroshiftCommand() *cobra.Command {
+ 
+ 	flags := cmd.Flags()
+ 	flags.BoolVar(&multinode, "multinode", multinodeDefault, "enable multinode mode")
++	flags.BoolVar(&worker, "worker", false, "run only the node services; requires --multinode and a bootstrap kubeconfig from 'add-node --worker'")
+ 
+ 	if version.Get().BuildVariant != version.BuildVariantCommunity {
+-		err := flags.MarkHidden("multinode")
+-		if err != nil {
+-			panic(err)
++		for _, f := range []string{"multinode", "worker"} {
++			if err := flags.MarkHidden(f); err != nil {
++				panic(err)
++			}
+ 		}
+ 	}
+ 
+@@ -86,7 +89,10 @@ func NewRunMicroshiftCommand() *cobra.Command {
+ 			}
+ 		}
+ 
+-		cfg = config.ConfigMultiNode(cfg, multinode)
++		if worker && !multinode {
++			return fmt.Errorf("--worker requires --multinode")
++		}
++		cfg = config.ConfigMultiNode(cfg, multinode, worker)
+ 
+ 		for _, w := range cfg.Warnings {
+ 			klog.Warningf("Configuration warning: %s", w)
+@@ -202,6 +208,14 @@ func RunMicroshift(cfg *config.Config) error {
+ 		return err
+ 	}
+ 
++	if cfg.MultiNode.Worker {
++		server, err := util.KubeConfigServerURL(cfg.BootstrapKubeConfigPath())
++		if err != nil {
++			return fmt.Errorf("worker mode requires the bootstrap kubeconfig installed by 'microshift add-node --worker': %w", err)
++		}
++		cfg.MultiNode.Controlplane = server
++	}
++
+ 	// TODO: change to only initialize what is strictly necessary for the selected role(s)
+ 	certChains, err := initCerts(cfg)
+ 	if err != nil {
+@@ -216,27 +230,34 @@ func RunMicroshift(cfg *config.Config) error {
+ 	// Establish the context we will use to control execution
+ 	runCtx, runCancel := context.WithCancel(context.Background())
+ 	m := servicemanager.NewServiceManager(startRec)
+-	util.Must(m.AddService(node.NewNetworkConfiguration(cfg)))
+-	util.Must(m.AddService(controllers.NewEtcd(cfg)))
+-	util.Must(m.AddService(sysconfwatch.NewSysConfWatchController(cfg)))
+-	util.Must(m.AddService(controllers.NewKubeAPIServer(cfg)))
+-	util.Must(m.AddService(controllers.NewKubeScheduler(cfg)))
+-	util.Must(m.AddService(controllers.NewKubeControllerManager(runCtx, cfg)))
+-	util.Must(m.AddService(controllers.NewOpenShiftCRDManager(cfg)))
+-	util.Must(m.AddService(controllers.NewRouteControllerManager(cfg)))
+-	util.Must(m.AddService(controllers.NewOpenShiftDefaultSCCManager(cfg)))
+-	util.Must(m.AddService(mdns.NewMicroShiftmDNSController(cfg)))
+-	util.Must(m.AddService(controllers.NewInfrastructureServices(cfg)))
+-	util.Must(m.AddService(controllers.NewClusterPolicyController(cfg)))
+-	util.Must(m.AddService(controllers.NewVersionManager(cfg)))
+-	util.Must(m.AddService(controllers.NewKubeletCAManager(cfg)))
+-	util.Must(m.AddService(node.NewKubeletServer(cfg)))
+-	util.Must(m.AddService(loadbalancerservice.NewLoadbalancerServiceController(cfg)))
+-	util.Must(m.AddService(controllers.NewKubeStorageVersionMigrator(cfg)))
+-	util.Must(m.AddService(controllers.NewClusterID(cfg)))
+-	util.Must(m.AddService(controllers.NewTelemetryManager(cfg)))
+-	util.Must(m.AddService(controllers.NewHostsWatcherManager(cfg)))
+-	util.Must(m.AddService(gdp.NewGenericDevicePlugin(cfg)))
++	if cfg.MultiNode.Worker {
++		util.Must(m.AddService(node.NewNetworkConfiguration(cfg)))
++		util.Must(m.AddService(sysconfwatch.NewSysConfWatchController(cfg)))
++		util.Must(m.AddService(node.NewKubeletServer(cfg)))
++		util.Must(m.AddService(gdp.NewGenericDevicePlugin(cfg)))
++	} else {
++		util.Must(m.AddService(node.NewNetworkConfiguration(cfg)))
++		util.Must(m.AddService(controllers.NewEtcd(cfg)))
++		util.Must(m.AddService(sysconfwatch.NewSysConfWatchController(cfg)))
++		util.Must(m.AddService(controllers.NewKubeAPIServer(cfg)))
++		util.Must(m.AddService(controllers.NewKubeScheduler(cfg)))
++		util.Must(m.AddService(controllers.NewKubeControllerManager(runCtx, cfg)))
++		util.Must(m.AddService(controllers.NewOpenShiftCRDManager(cfg)))
++		util.Must(m.AddService(controllers.NewRouteControllerManager(cfg)))
++		util.Must(m.AddService(controllers.NewOpenShiftDefaultSCCManager(cfg)))
++		util.Must(m.AddService(mdns.NewMicroShiftmDNSController(cfg)))
++		util.Must(m.AddService(controllers.NewInfrastructureServices(cfg)))
++		util.Must(m.AddService(controllers.NewClusterPolicyController(cfg)))
++		util.Must(m.AddService(controllers.NewVersionManager(cfg)))
++		util.Must(m.AddService(controllers.NewKubeletCAManager(cfg)))
++		util.Must(m.AddService(node.NewKubeletServer(cfg)))
++		util.Must(m.AddService(loadbalancerservice.NewLoadbalancerServiceController(cfg)))
++		util.Must(m.AddService(controllers.NewKubeStorageVersionMigrator(cfg)))
++		util.Must(m.AddService(controllers.NewClusterID(cfg)))
++		util.Must(m.AddService(controllers.NewTelemetryManager(cfg)))
++		util.Must(m.AddService(controllers.NewHostsWatcherManager(cfg)))
++		util.Must(m.AddService(gdp.NewGenericDevicePlugin(cfg)))
++	}
+ 
+ 	// Storing and clearing the env, so other components don't send the READY=1 until MicroShift is fully ready
+ 	notifySocket := os.Getenv("NOTIFY_SOCKET")
+@@ -298,7 +319,9 @@ func RunMicroshift(cfg *config.Config) error {
+ 		}
+ 
+ 		// After MicroShift's core becomes ready, run the kustomizer (delete and/or apply manifests).
+-		kustomize.NewKustomizer(cfg).RunStandalone(runCtx)
++		if !cfg.MultiNode.Worker {
++			kustomize.NewKustomizer(cfg).RunStandalone(runCtx)
++		}
+ 
+ 		// Watch for SIGTERM or service error to exit, now that we are ready.
+ 		select {
+diff --git a/pkg/config/multinode.go b/pkg/config/multinode.go
+index 6db5e733..83de09d4 100644
+--- a/pkg/config/multinode.go
++++ b/pkg/config/multinode.go
+@@ -4,15 +4,24 @@ type MultiNodeConfig struct {
+ 	Enabled bool `json:"enabled"`
+ 	// only one controlplane node is supported
+ 	// IP address of control plane node
++	// on a worker: URL of the control plane, taken from the bootstrap kubeconfig
+ 	Controlplane string `json:"controlplane"`
++	// Worker runs only the node services; the control plane is remote
++	Worker bool `json:"worker"`
+ }
+ 
+ // ConfigMultiNode populates multinode configurations to Config.MultiNode
+-func ConfigMultiNode(c *Config, enabled bool) *Config {
++func ConfigMultiNode(c *Config, enabled bool, worker bool) *Config {
+ 	if !enabled {
+ 		return c
+ 	}
+ 	c.MultiNode.Enabled = enabled
+ 	c.MultiNode.Controlplane = c.Node.NodeIP
++	c.MultiNode.Worker = worker
++	if worker {
++		// The advertise address on lo would blackhole in-cluster apiserver
++		// traffic on a node that serves no API.
++		c.ApiServer.SkipInterface = true
++	}
+ 	return c
+ }
+diff --git a/pkg/node/kubelet.go b/pkg/node/kubelet.go
+index 6a0c8ce6..ac73ba9f 100644
+--- a/pkg/node/kubelet.go
++++ b/pkg/node/kubelet.go
+@@ -51,6 +51,7 @@ const (
+ type KubeletServer struct {
+ 	kubeletflags *kubeletoptions.KubeletFlags
+ 	kubeconfig   *kubeletconfig.KubeletConfiguration
++	workerOnly   bool
+ }
+ 
+ func NewKubeletServer(cfg *config.Config) *KubeletServer {
+@@ -59,10 +60,16 @@ func NewKubeletServer(cfg *config.Config) *KubeletServer {
+ 	return s
+ }
+ 
+-func (s *KubeletServer) Name() string           { return componentKubelet }
+-func (s *KubeletServer) Dependencies() []string { return []string{"kube-apiserver"} }
++func (s *KubeletServer) Name() string { return componentKubelet }
++func (s *KubeletServer) Dependencies() []string {
++	if s.workerOnly {
++		return []string{}
++	}
++	return []string{"kube-apiserver"}
++}
+ 
+ func (s *KubeletServer) configure(cfg *config.Config) {
++	s.workerOnly = cfg.MultiNode.Enabled && cfg.MultiNode.Worker
+ 	if err := s.writeConfig(cfg); err != nil {
+ 		klog.Fatalf("Failed to write kubelet config %v", err)
+ 	}
+@@ -84,8 +91,10 @@ func (s *KubeletServer) configure(cfg *config.Config) {
+ 	kubeletFlags.RuntimeCgroups = "/system.slice/crio.service"
+ 	kubeletFlags.HostnameOverride = cfg.Node.HostnameOverride
+ 	kubeletFlags.NodeIP = nodeIP
+-	kubeletFlags.NodeLabels["node-role.kubernetes.io/control-plane"] = ""
+-	kubeletFlags.NodeLabels["node-role.kubernetes.io/master"] = ""
++	if !s.workerOnly {
++		kubeletFlags.NodeLabels["node-role.kubernetes.io/control-plane"] = ""
++		kubeletFlags.NodeLabels["node-role.kubernetes.io/master"] = ""
++	}
+ 	kubeletFlags.NodeLabels["node-role.kubernetes.io/worker"] = ""
+ 	kubeletFlags.NodeLabels["node.openshift.io/os_id"] = osID
+ 	kubeletFlags.NodeLabels["node.kubernetes.io/instance-type"] = "rhde"
+diff --git a/pkg/util/kubeconfig.go b/pkg/util/kubeconfig.go
+index 19d5f9b1..4ea84eb1 100644
+--- a/pkg/util/kubeconfig.go
++++ b/pkg/util/kubeconfig.go
+@@ -16,6 +16,8 @@ limitations under the License.
+ package util
+ 
+ import (
++	"fmt"
++
+ 	clientcmd "k8s.io/client-go/tools/clientcmd"
+ 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+ )
+@@ -56,3 +58,21 @@ func KubeConfigWithClientCerts(
+ 
+ 	return clientcmd.WriteToFile(kubeConfig, path)
+ }
++
++// KubeConfigServerURL returns the cluster server URL of the kubeconfig's
++// current context.
++func KubeConfigServerURL(path string) (string, error) {
++	kc, err := clientcmd.LoadFromFile(path)
++	if err != nil {
++		return "", err
++	}
++	kcContext, ok := kc.Contexts[kc.CurrentContext]
++	if !ok {
++		return "", fmt.Errorf("kubeconfig %s has no current context", path)
++	}
++	cluster, ok := kc.Clusters[kcContext.Cluster]
++	if !ok || cluster.Server == "" {
++		return "", fmt.Errorf("kubeconfig %s has no server for cluster %q", path, kcContext.Cluster)
++	}
++	return cluster.Server, nil
++}
+diff --git a/scripts/multinode/configure-node.sh b/scripts/multinode/configure-node.sh
+index e55d133b..90aa5931 100755
+--- a/scripts/multinode/configure-node.sh
++++ b/scripts/multinode/configure-node.sh
+@@ -4,6 +4,7 @@ set -euo pipefail
+ # Variables for node configuration
+ NODE_ADDR=""
+ BOOTSTRAP_KUBECONFIG=""
++WORKER=0
+ 
+ function usage() {
+     echo "This script configures a node to run a MicroShift cluster."
+@@ -11,6 +12,7 @@ function usage() {
+     echo "Usage: $(basename "$0") [OPTIONS]"
+     echo "Options:"
+     echo "  --bootstrap-kubeconfig PATH    Path to kubeconfig file for joining existing cluster (optional)"
++    echo "  --worker                       Join as a worker: node services only, no etcd member, no control plane"
+     echo "  -h, --help                     Show this help message"
+     exit 1
+ }
+@@ -40,12 +42,16 @@ telemetry:
+   status: Disabled
+ EOF
+ 
++    local run_args="--multinode"
++    if [ "${WORKER}" -eq 1 ]; then
++        run_args="--multinode --worker"
++    fi
+     sudo mkdir -p /etc/systemd/system/microshift.service.d
+     cat <<EOF | sudo tee /etc/systemd/system/microshift.service.d/multinode.conf &>/dev/null
+ [Service]
+ # Clear previous ExecStart, otherwise systemd would try to run both.
+ ExecStart=
+-ExecStart=microshift run --multinode
++ExecStart=microshift run ${run_args}
+ EOF
+     sudo systemctl daemon-reload
+     sudo systemctl enable microshift.service
+@@ -56,7 +62,12 @@ function start_microshift() {
+ }
+ 
+ function run_add_node_commands() {
+-    if ! sudo microshift add-node --kubeconfig="${BOOTSTRAP_KUBECONFIG}"; then
++    local add_args=""
++    if [ "${WORKER}" -eq 1 ]; then
++        add_args="--worker"
++    fi
++    # shellcheck disable=SC2086
++    if ! sudo microshift add-node --kubeconfig="${BOOTSTRAP_KUBECONFIG}" ${add_args}; then
+         echo "Error: Failed to add node using kubeconfig: ${BOOTSTRAP_KUBECONFIG}"
+         exit 1
+     fi
+@@ -114,6 +125,10 @@ while [[ $# -gt 0 ]]; do
+             BOOTSTRAP_KUBECONFIG="$2"
+             shift 2
+             ;;
++        --worker)
++            WORKER=1
++            shift
++            ;;
+         -h|--help)
+             usage
+             ;;
+@@ -124,6 +139,11 @@ while [[ $# -gt 0 ]]; do
+     esac
+ done
+ 
++if [ "${WORKER}" -eq 1 ] && [ -z "${BOOTSTRAP_KUBECONFIG}" ]; then
++    echo "Error: --worker requires --bootstrap-kubeconfig"
++    usage
++fi
++
+ # Validate BOOTSTRAP_KUBECONFIG if provided
+ if [ -n "${BOOTSTRAP_KUBECONFIG}" ]; then
+     if [ ! -f "${BOOTSTRAP_KUBECONFIG}" ]; then
+@@ -137,7 +157,11 @@ configure_system
+ configure_microshift
+ if [ -n "${BOOTSTRAP_KUBECONFIG}" ]; then
+     run_add_node_commands
+-    run_healthcheck
++    # healthcheck needs the local apiserver a worker does not run;
++    # add-node already waited for the node to be Ready
++    if [ "${WORKER}" -eq 0 ]; then
++        run_healthcheck
++    fi
+ else
+     start_microshift
+ fi
