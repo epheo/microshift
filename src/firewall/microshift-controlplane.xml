@@ -5,4 +5,5 @@
   <port protocol="tcp" port="6443"/>
   <port protocol="tcp" port="9641"/>
   <port protocol="tcp" port="9642"/>
+  <port protocol="udp" port="5353"/>
 </service>
