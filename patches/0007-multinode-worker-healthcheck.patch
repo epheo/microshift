@@ -1,0 +1,135 @@
+diff --git a/pkg/cmd/addnode.go b/pkg/cmd/addnode.go
+index 9de7fe2b..ac8e4c21 100644
+--- a/pkg/cmd/addnode.go
++++ b/pkg/cmd/addnode.go
+@@ -159,6 +159,16 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
+ 		return fmt.Errorf("failed to configure bootstrap kubeconfig: %w", err)
+ 	}
+ 
++	// Role marker for role-agnostic tools (healthcheck, greenboot); a
++	// re-join with a different role must not leave a stale marker behind.
++	if opts.Worker {
++		if err := os.WriteFile(config.WorkerMarkerPath(), []byte{}, 0600); err != nil {
++			return fmt.Errorf("failed to write worker marker: %w", err)
++		}
++	} else if err := os.Remove(config.WorkerMarkerPath()); err != nil && !os.IsNotExist(err) {
++		return fmt.Errorf("failed to remove worker marker: %w", err)
++	}
++
+ 	if err := restartMicroShift(); err != nil {
+ 		return fmt.Errorf("failed to restart MicroShift service: %w", err)
+ 	}
+diff --git a/pkg/config/multinode.go b/pkg/config/multinode.go
+index 197d6896..cc82d119 100644
+--- a/pkg/config/multinode.go
++++ b/pkg/config/multinode.go
+@@ -1,5 +1,11 @@
+ package config
+ 
++import (
++	"path/filepath"
++
++	"github.com/openshift/microshift/pkg/util"
++)
++
+ type MultiNodeConfig struct {
+ 	Enabled bool `json:"enabled"`
+ 	// only one controlplane node is supported
+@@ -24,3 +30,14 @@ func ConfigMultiNode(c *Config, enabled bool, worker bool) *Config {
+ 	}
+ 	return c
+ }
++
++// WorkerMarkerPath is written by 'add-node --worker' so role-agnostic tools
++// (healthcheck, greenboot) can tell a worker from a control plane node.
++func WorkerMarkerPath() string {
++	return filepath.Join(DataDir, "multinode-worker")
++}
++
++func IsWorkerNode() bool {
++	exists, err := util.PathExists(WorkerMarkerPath())
++	return err == nil && exists
++}
+diff --git a/pkg/healthcheck/healthcheck.go b/pkg/healthcheck/healthcheck.go
+index bed41145..77080ac5 100644
+--- a/pkg/healthcheck/healthcheck.go
++++ b/pkg/healthcheck/healthcheck.go
+@@ -6,6 +6,8 @@ import (
+ 	"time"
+ 
+ 	"k8s.io/klog/v2"
++
++	"github.com/openshift/microshift/pkg/config"
+ )
+ 
+ func MicroShiftHealthcheck(ctx context.Context, timeout time.Duration) error {
+@@ -16,6 +18,14 @@ func MicroShiftHealthcheck(ctx context.Context, timeout time.Duration) error {
+ 		return nil
+ 	}
+ 
++	if config.IsWorkerNode() {
++		if err := workerNodeShouldBeReady(ctx, timeout); err != nil {
++			return err
++		}
++		klog.Info("MicroShift worker node is ready")
++		return nil
++	}
++
+ 	workloads, err := getCoreMicroShiftWorkloads()
+ 	if err != nil {
+ 		return err
+diff --git a/pkg/healthcheck/worker.go b/pkg/healthcheck/worker.go
+new file mode 100644
+index 00000000..49597e79
+--- /dev/null
++++ b/pkg/healthcheck/worker.go
+@@ -0,0 +1,49 @@
++package healthcheck
++
++import (
++	"context"
++	"time"
++
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/wait"
++	"k8s.io/client-go/kubernetes"
++	"k8s.io/client-go/tools/clientcmd"
++	"k8s.io/klog/v2"
++
++	"github.com/openshift/microshift/pkg/config"
++)
++
++// workerNodeShouldBeReady gates a worker on its own Node object; the kubelet
++// credentials are the only ones a worker holds, and the Node authorizer only
++// lets them read the node itself.
++func workerNodeShouldBeReady(ctx context.Context, timeout time.Duration) error {
++	cfg, err := config.ActiveConfig()
++	if err != nil {
++		return err
++	}
++	restConfig, err := clientcmd.BuildConfigFromFlags("", cfg.KubeConfigPath(config.Kubelet))
++	if err != nil {
++		return err
++	}
++	client, err := kubernetes.NewForConfig(restConfig)
++	if err != nil {
++		return err
++	}
++
++	nodeName := cfg.CanonicalNodeName()
++	klog.Infof("Waiting %v for node %s to be ready", timeout, nodeName)
++	return wait.PollUntilContextTimeout(ctx, 5*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
++		node, err := client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
++		if err != nil {
++			klog.V(2).Infof("Failed to get node %s: %v", nodeName, err)
++			return false, nil
++		}
++		for _, cond := range node.Status.Conditions {
++			if cond.Type == corev1.NodeReady {
++				return cond.Status == corev1.ConditionTrue, nil
++			}
++		}
++		return false, nil
++	})
++}

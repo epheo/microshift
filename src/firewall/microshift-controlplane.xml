@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>MicroShift control plane</short>
+  <description>Kubernetes API and OVN northbound/southbound databases served to cluster nodes. Workers remove this service via microshift-profile.</description>
+  <port protocol="tcp" port="6443"/>
+  <port protocol="tcp" port="9641"/>
+  <port protocol="tcp" port="9642"/>
+</service>

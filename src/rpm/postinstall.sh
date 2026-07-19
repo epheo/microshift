@@ -16,10 +16,12 @@ fi
 dnf install -y firewalld jq bash-completion
 firewall-offline-cmd --zone=trusted --add-source=10.42.0.0/16
 firewall-offline-cmd --zone=trusted --add-source=169.254.169.1
-# Multinode clusters require connectivity on both apiserver and etcd
-firewall-offline-cmd --zone=public --add-port=6443/tcp
-firewall-offline-cmd --zone=public --add-port=2379/tcp
-firewall-offline-cmd --zone=public --add-port=2380/tcp
+# Role-scoped services from src/firewall; microshift-profile drops the
+# controlplane service on workers. etcd stays closed: workers never dial it,
+# and full-replica secondaries are not a shape this image supports.
+firewall-offline-cmd --zone=public --add-service=microshift-controlplane
+firewall-offline-cmd --zone=public --add-service=microshift-node
+systemctl enable firewalld
 
 # Configure limits for cAdvisor and kubelet
 cat > /etc/sysctl.d/99-microshift.conf <<EOF

@@ -16,6 +16,8 @@ Published at `ghcr.io/epheo/microshift`.
 | [portail](https://github.com/epheo/portail) is the edge | its image is embedded as an OCI archive and imported into cri-o at boot — cold boot needs no registry |
 | Updates must be safe | greenboot MicroShift health gate stays enabled; bootc rollback does the rest |
 | Logs are signal, not noise | `patches/0002` (etcd logs every request at warn — missing threshold default) and `patches/0003` (router status watcher hot-loops when `ingress.status: Removed`) |
+| Every image can be controller or worker | `microshift-profile` selects the role; `patches/0006`+`0007` add a worker mode where nodes hold no signing keys |
+| The firewall is on and role-scoped | firewalld enabled with `microshift-controlplane`/`microshift-node` services; etcd is never exposed |
 | Native el10 | RPMs are built in a CentOS Stream 10 buildroot |
 
 Everything site-specific (IPs, VLANs, NADs, hardware quirks, extra embedded
@@ -81,6 +83,32 @@ are automatic too, gated on one condition: a stable OKD payload of the new
 minor must exist. There is no manual step in the release process — the CI
 gate is the judge, and a crossing that breaks the patch series simply fails
 the run (main stays red, nothing publishes) until `patches/` is rebased.
+
+## Multinode (experimental)
+
+Upstream's community multinode joins every node as a full control plane
+replica, CA private keys included. This distribution ships a worker role
+instead (`patches/0006`, `0007`): `microshift run --worker` starts only the
+node services, the kubelet bootstraps its client cert from the bootstrap
+kubeconfig and obtains its serving cert through a CSR approved by a small
+controller on the control plane, and `add-node --worker` copies only public
+CA certs — a worker never holds signing material. One image serves both
+roles:
+
+```sh
+# on the controller (default profile) — nothing to do; copy the bootstrap
+# kubeconfig from /var/lib/microshift/resources/kubeadmin/<node-addr>/kubeconfig
+
+# on each worker
+microshift-profile worker
+microshift add-node --worker --kubeconfig /path/to/bootstrap-kubeconfig
+```
+
+The greenboot gate stays enabled on workers: `microshift healthcheck`
+detects the role and gates on the node being Ready in the cluster. The
+firewall follows the profile (workers expose only kubelet and Geneve).
+Multinode remains upstream-unsupported and single-controller: losing the
+controller means losing the cluster.
 
 ## Patch policy
 

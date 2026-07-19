@@ -1,5 +1,37 @@
+diff --git a/assets/core/kubelet.yaml b/assets/core/kubelet.yaml
+index 988f071e..5ef9a18e 100644
+--- a/assets/core/kubelet.yaml
++++ b/assets/core/kubelet.yaml
+@@ -18,20 +18,24 @@ featureGates:
+   APIPriorityAndFairness: true
+   DownwardAPIHugePages: true
+   PodSecurity: true
+-  RotateKubeletServerCertificate: false # TODO
++  RotateKubeletServerCertificate: {{ .serverTLSBootstrap }}
+ kubeAPIBurst: 100
+ kubeAPIQPS: 50
+ maxPods: 250
+ memorySwap:
+   swapBehavior: NoSwap
+ nodeStatusReportFrequency: 5m
+-rotateCertificates: false # TODO
++rotateCertificates: {{ .rotateCertificates }}
+ serializeImagePulls: false
+-serverTLSBootstrap: false # TODO
++serverTLSBootstrap: {{ .serverTLSBootstrap }}
++{{- if .tlsCertFile }}
+ tlsCertFile: "{{ .tlsCertFile }}"
++{{- end }}
+ tlsCipherSuites: [{{ .tlsCipherSuites }}]
+ tlsMinVersion: "{{ .tlsMinVersion }}"
++{{- if .tlsPrivateKeyFile }}
+ tlsPrivateKeyFile: "{{ .tlsPrivateKeyFile }}"
++{{- end }}
+ volumePluginDir: "{{ .volumePluginDir }}"
+ {{- if .resolvConf }}
+ resolvConf: "{{ .resolvConf }}"
 diff --git a/pkg/cmd/addnode.go b/pkg/cmd/addnode.go
-index 864876e8..d04c0a29 100644
+index 864876e8..9de7fe2b 100644
 --- a/pkg/cmd/addnode.go
 +++ b/pkg/cmd/addnode.go
 @@ -41,6 +41,7 @@ type AddNodeOptions struct {
@@ -28,14 +60,31 @@ index 864876e8..d04c0a29 100644
  		klog.Info("Will add etcd node as learner")
  	}
  
-@@ -114,25 +117,30 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
+@@ -109,30 +112,47 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
+ 	}
+ 	klog.Info("MicroShift data directories cleaned up successfully")
+ 
++	// Workers must never hold signing material: public certs only, no
++	// service-account keys, no etcd member.
+ 	for _, resource := range components.CertificateAuthorityResources {
++		if opts.Worker {
++			if err := fetchCertificateAuthorityCert(ctx, client, resource.Name, resource.Dir); err != nil {
++				return fmt.Errorf("failed to fetch certificate authority %s: %w", resource.Name, err)
++			}
++			continue
++		}
+ 		if err := fetchCertificateAuthority(ctx, client, resource.Name, resource.Dir); err != nil {
  			return fmt.Errorf("failed to fetch certificate authority %s: %w", resource.Name, err)
  		}
  	}
 -	for _, resource := range components.ServiceAccountKeyResources {
 -		if err := fetchServiceAccountKey(ctx, client, resource.Name, resource.Dir); err != nil {
 -			return fmt.Errorf("failed to fetch service account key %s: %w", resource.Name, err)
-+	// Workers never sign service-account tokens and run no etcd member.
++	if opts.Worker {
++		if err := writeKubeletClientCABundle(); err != nil {
++			return fmt.Errorf("failed to assemble kubelet client CA bundle: %w", err)
++		}
++	}
 +	if !opts.Worker {
 +		for _, resource := range components.ServiceAccountKeyResources {
 +			if err := fetchServiceAccountKey(ctx, client, resource.Name, resource.Dir); err != nil {
@@ -72,33 +121,73 @@ index 864876e8..d04c0a29 100644
  	}
  
  	if err := configureBootstrapKubeconfig(cfg, opts.KubeconfigPath); err != nil {
-diff --git a/pkg/cmd/init.go b/pkg/cmd/init.go
-index 50851ed3..cf63be11 100644
---- a/pkg/cmd/init.go
-+++ b/pkg/cmd/init.go
-@@ -527,10 +527,18 @@ func initKubeconfigs(
- 	if err != nil {
- 		return err
- 	}
-+	// A worker's kubelet talks to the remote control plane, whose serving
-+	// cert for non-localhost addresses chains to the external signer.
-+	kubeletServerURL := cfg.ApiServer.URL
-+	kubeletTrustPEM := internalTrustPEM
-+	if cfg.MultiNode.Enabled && cfg.MultiNode.Worker {
-+		kubeletServerURL = cfg.MultiNode.Controlplane
-+		kubeletTrustPEM = externalTrustPEM
+@@ -217,6 +237,64 @@ func fetchCertificateAuthority(ctx context.Context, client kubernetes.Interface,
+ 	return nil
+ }
+ 
++// fetchCertificateAuthorityCert writes only the public certificate of a CA.
++func fetchCertificateAuthorityCert(ctx context.Context, client kubernetes.Interface, name, dir string) error {
++	secret, err := client.CoreV1().Secrets("kube-system").Get(ctx, name, metav1.GetOptions{})
++	if err != nil {
++		return fmt.Errorf("failed to get %s secret: %w", name, err)
 +	}
- 	if err := util.KubeConfigWithClientCerts(
- 		cfg.KubeConfigPath(config.Kubelet),
--		cfg.ApiServer.URL,
--		internalTrustPEM,
-+		kubeletServerURL,
-+		kubeletTrustPEM,
- 		kubeletCertPEM, kubeletKeyPEM,
- 	); err != nil {
- 		return err
++
++	caCert, exists := secret.Data["ca.crt"]
++	if !exists {
++		return fmt.Errorf("ca.crt not found in secret")
++	}
++
++	if err := os.MkdirAll(dir, 0750); err != nil {
++		return fmt.Errorf("failed to create destination directory: %w", err)
++	}
++
++	if err := os.WriteFile(cryptomaterial.CACertPath(dir), caCert, 0600); err != nil {
++		return fmt.Errorf("failed to write ca.crt: %w", err)
++	}
++
++	if caBundle, ok := secret.Data["ca-bundle.crt"]; ok {
++		if err := os.WriteFile(cryptomaterial.CABundlePath(dir), caBundle, 0600); err != nil {
++			return fmt.Errorf("failed to write ca-bundle.crt: %w", err)
++		}
++	}
++
++	return nil
++}
++
++// writeKubeletClientCABundle mirrors the kubelet client CA bundle that
++// initCerts builds on nodes holding the signer keys.
++func writeKubeletClientCABundle() error {
++	certsDir := cryptomaterial.CertsDirectory(config.DataDir)
++	members := []string{
++		cryptomaterial.KubeControlPlaneSignerCertDir(certsDir),
++		cryptomaterial.KubeAPIServerToKubeletSignerCertDir(certsDir),
++		cryptomaterial.AdminKubeconfigSignerDir(certsDir),
++		cryptomaterial.KubeletCSRSignerSignerCertDir(certsDir),
++		cryptomaterial.CSRSignerCertDir(certsDir),
++	}
++	bundle := []byte{}
++	for _, dir := range members {
++		pemBytes, err := os.ReadFile(cryptomaterial.CACertPath(dir))
++		if err != nil {
++			return err
++		}
++		bundle = append(bundle, pemBytes...)
++		if len(pemBytes) > 0 && pemBytes[len(pemBytes)-1] != '\n' {
++			bundle = append(bundle, '\n')
++		}
++	}
++	path := cryptomaterial.KubeletClientCAPath(certsDir)
++	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
++		return err
++	}
++	return os.WriteFile(path, bundle, 0600)
++}
++
+ func fetchServiceAccountKey(ctx context.Context, client kubernetes.Interface, name, dir string) error {
+ 	secret, err := client.CoreV1().Secrets("kube-system").Get(ctx, name, metav1.GetOptions{})
+ 	if err != nil {
 diff --git a/pkg/cmd/run.go b/pkg/cmd/run.go
-index bd32bb87..db00165e 100644
+index bd32bb87..d5eb6530 100644
 --- a/pkg/cmd/run.go
 +++ b/pkg/cmd/run.go
 @@ -53,6 +53,7 @@ func NewRunMicroshiftCommand() *cobra.Command {
@@ -138,22 +227,44 @@ index bd32bb87..db00165e 100644
  
  		for _, w := range cfg.Warnings {
  			klog.Warningf("Configuration warning: %s", w)
-@@ -202,6 +208,14 @@ func RunMicroshift(cfg *config.Config) error {
+@@ -202,41 +208,68 @@ func RunMicroshift(cfg *config.Config) error {
  		return err
  	}
  
+-	// TODO: change to only initialize what is strictly necessary for the selected role(s)
+-	certChains, err := initCerts(cfg)
+-	if err != nil {
+-		klog.Fatalf("failed to retrieve the necessary certificates: %v", err)
+-	}
++	// A worker holds no signing material: the kubelet bootstraps its client
++	// cert from the bootstrap kubeconfig and obtains its serving cert through
++	// serverTLSBootstrap, so cert init and rotation stay control plane only.
++	var certChains *certchains.CertificateChains
 +	if cfg.MultiNode.Worker {
-+		server, err := util.KubeConfigServerURL(cfg.BootstrapKubeConfigPath())
++		kubeletKubeconfigExists, err := util.PathExists(cfg.KubeConfigPath(config.Kubelet))
 +		if err != nil {
-+			return fmt.Errorf("worker mode requires the bootstrap kubeconfig installed by 'microshift add-node --worker': %w", err)
++			return err
 +		}
-+		cfg.MultiNode.Controlplane = server
-+	}
-+
- 	// TODO: change to only initialize what is strictly necessary for the selected role(s)
- 	certChains, err := initCerts(cfg)
- 	if err != nil {
-@@ -216,27 +230,34 @@ func RunMicroshift(cfg *config.Config) error {
++		if !cfg.BootstrapKubeConfigExists() && !kubeletKubeconfigExists {
++			return fmt.Errorf("worker mode requires the bootstrap kubeconfig installed by 'microshift add-node --worker'")
++		}
++	} else {
++		// TODO: change to only initialize what is strictly necessary for the selected role(s)
++		var err error
++		certChains, err = initCerts(cfg)
++		if err != nil {
++			klog.Fatalf("failed to retrieve the necessary certificates: %v", err)
++		}
+ 
+-	// create kubeconfig for kube-scheduler, kubelet,controller-manager
+-	if err := initKubeconfigs(cfg, certChains); err != nil {
+-		klog.Fatalf("failed to create the necessary kubeconfigs for internal components: %v", err)
++		// create kubeconfig for kube-scheduler, kubelet,controller-manager
++		if err := initKubeconfigs(cfg, certChains); err != nil {
++			klog.Fatalf("failed to create the necessary kubeconfigs for internal components: %v", err)
++		}
+ 	}
+ 
  	// Establish the context we will use to control execution
  	runCtx, runCancel := context.WithCancel(context.Background())
  	m := servicemanager.NewServiceManager(startRec)
@@ -198,6 +309,11 @@ index bd32bb87..db00165e 100644
 +		util.Must(m.AddService(controllers.NewClusterPolicyController(cfg)))
 +		util.Must(m.AddService(controllers.NewVersionManager(cfg)))
 +		util.Must(m.AddService(controllers.NewKubeletCAManager(cfg)))
++		if cfg.MultiNode.Enabled {
++			// Workers hold no signing keys; their serving and renewal CSRs
++			// must be approved here so KCM can sign them.
++			util.Must(m.AddService(controllers.NewKubeletCSRApprover(cfg)))
++		}
 +		util.Must(m.AddService(node.NewKubeletServer(cfg)))
 +		util.Must(m.AddService(loadbalancerservice.NewLoadbalancerServiceController(cfg)))
 +		util.Must(m.AddService(controllers.NewKubeStorageVersionMigrator(cfg)))
@@ -209,7 +325,61 @@ index bd32bb87..db00165e 100644
  
  	// Storing and clearing the env, so other components don't send the READY=1 until MicroShift is fully ready
  	notifySocket := os.Getenv("NOTIFY_SOCKET")
-@@ -298,7 +319,9 @@ func RunMicroshift(cfg *config.Config) error {
+@@ -244,28 +277,32 @@ func RunMicroshift(cfg *config.Config) error {
+ 
+ 	startRec.ServicesStart(microshiftStart)
+ 
+-	_, rotationDate, err := certchains.WhenToRotateAtEarliest(certChains)
+-	if err != nil {
+-		klog.Fatalf("failed to determine when to rotate certificates: %v", err)
+-	}
+-
+-	// Establish a deadline for restarting to rotate the certificates.
+-	certCtx, certCancel := context.WithDeadline(context.Background(), rotationDate)
+-
+-	// Watch for the certificate deadline context to be done, log a
+-	// message, and cancel the run context to propagate the shutdown.
+-	go func() {
+-		select {
+-		case <-certCtx.Done():
+-			klog.Info("Stopping services for certificate rotation")
+-			runCancel()
+-			return
+-		case <-runCtx.Done():
+-			klog.Info("Certificate watcher exiting")
+-			certCancel()
+-			return
++	// The kubelet rotates its bootstrapped certs itself; only locally minted
++	// chains need the restart-to-rotate deadline.
++	if certChains != nil {
++		_, rotationDate, err := certchains.WhenToRotateAtEarliest(certChains)
++		if err != nil {
++			klog.Fatalf("failed to determine when to rotate certificates: %v", err)
+ 		}
+-	}()
++
++		// Establish a deadline for restarting to rotate the certificates.
++		certCtx, certCancel := context.WithDeadline(context.Background(), rotationDate)
++
++		// Watch for the certificate deadline context to be done, log a
++		// message, and cancel the run context to propagate the shutdown.
++		go func() {
++			select {
++			case <-certCtx.Done():
++				klog.Info("Stopping services for certificate rotation")
++				runCancel()
++				return
++			case <-runCtx.Done():
++				klog.Info("Certificate watcher exiting")
++				certCancel()
++				return
++			}
++		}()
++	}
+ 
+ 	// Start everything up
+ 	ready, stopped := make(chan struct{}), make(chan struct{})
+@@ -298,7 +335,9 @@ func RunMicroshift(cfg *config.Config) error {
  		}
  
  		// After MicroShift's core becomes ready, run the kustomizer (delete and/or apply manifests).
@@ -221,14 +391,12 @@ index bd32bb87..db00165e 100644
  		// Watch for SIGTERM or service error to exit, now that we are ready.
  		select {
 diff --git a/pkg/config/multinode.go b/pkg/config/multinode.go
-index 6db5e733..83de09d4 100644
+index 6db5e733..197d6896 100644
 --- a/pkg/config/multinode.go
 +++ b/pkg/config/multinode.go
-@@ -4,15 +4,24 @@ type MultiNodeConfig struct {
- 	Enabled bool `json:"enabled"`
+@@ -5,14 +5,22 @@ type MultiNodeConfig struct {
  	// only one controlplane node is supported
  	// IP address of control plane node
-+	// on a worker: URL of the control plane, taken from the bootstrap kubeconfig
  	Controlplane string `json:"controlplane"`
 +	// Worker runs only the node services; the control plane is remote
 +	Worker bool `json:"worker"`
@@ -250,11 +418,216 @@ index 6db5e733..83de09d4 100644
 +	}
  	return c
  }
+diff --git a/pkg/controllers/kubelet_csr_approver.go b/pkg/controllers/kubelet_csr_approver.go
+new file mode 100644
+index 00000000..579cee8f
+--- /dev/null
++++ b/pkg/controllers/kubelet_csr_approver.go
+@@ -0,0 +1,191 @@
++/*
++Copyright © 2026 MicroShift Contributors
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++package controllers
++
++import (
++	"context"
++	"crypto/x509"
++	"encoding/pem"
++	"fmt"
++	"slices"
++	"strings"
++	"time"
++
++	certsv1 "k8s.io/api/certificates/v1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/client-go/kubernetes"
++	"k8s.io/client-go/tools/clientcmd"
++	"k8s.io/klog/v2"
++
++	"github.com/openshift/microshift/pkg/config"
++)
++
++const nodeUserPrefix = "system:node:"
++
++// KubeletCSRApprover approves the CSRs a worker node cannot self-sign: its
++// serving certificate (serverTLSBootstrap) and client certificate renewals.
++// The initial client CSR is created with the bootstrap kubeconfig identity
++// and auto-approved by kube-controller-manager.
++type KubeletCSRApprover struct {
++	kubeconfigPath string
++}
++
++func NewKubeletCSRApprover(cfg *config.Config) *KubeletCSRApprover {
++	return &KubeletCSRApprover{kubeconfigPath: cfg.KubeConfigPath(config.KubeAdmin)}
++}
++
++func (a *KubeletCSRApprover) Name() string           { return "kubelet-csr-approver" }
++func (a *KubeletCSRApprover) Dependencies() []string { return []string{"kube-apiserver"} }
++
++func (a *KubeletCSRApprover) Run(ctx context.Context, ready chan<- struct{}, stopped chan<- struct{}) error {
++	defer close(stopped)
++
++	restConfig, err := clientcmd.BuildConfigFromFlags("", a.kubeconfigPath)
++	if err != nil {
++		return err
++	}
++	client, err := kubernetes.NewForConfig(restConfig)
++	if err != nil {
++		return err
++	}
++	close(ready)
++
++	ticker := time.NewTicker(30 * time.Second)
++	defer ticker.Stop()
++	for {
++		a.approvePending(ctx, client)
++		select {
++		case <-ctx.Done():
++			return nil
++		case <-ticker.C:
++		}
++	}
++}
++
++func (a *KubeletCSRApprover) approvePending(ctx context.Context, client kubernetes.Interface) {
++	csrs, err := client.CertificatesV1().CertificateSigningRequests().List(ctx, metav1.ListOptions{})
++	if err != nil {
++		klog.Errorf("kubelet-csr-approver: failed to list CSRs: %v", err)
++		return
++	}
++	for i := range csrs.Items {
++		csr := &csrs.Items[i]
++		if isResolved(csr) {
++			continue
++		}
++		approve, reason := shouldApprove(ctx, client, csr)
++		if !approve {
++			if reason != "" {
++				klog.V(2).Infof("kubelet-csr-approver: not approving %s: %s", csr.Name, reason)
++			}
++			continue
++		}
++		csr.Status.Conditions = append(csr.Status.Conditions, certsv1.CertificateSigningRequestCondition{
++			Type:           certsv1.CertificateApproved,
++			Status:         corev1.ConditionTrue,
++			Reason:         "AutoApproved",
++			Message:        "auto-approved kubelet certificate for " + csr.Spec.Username,
++			LastUpdateTime: metav1.Now(),
++		})
++		if _, err := client.CertificatesV1().CertificateSigningRequests().UpdateApproval(ctx, csr.Name, csr, metav1.UpdateOptions{}); err != nil {
++			klog.Errorf("kubelet-csr-approver: failed to approve %s: %v", csr.Name, err)
++			continue
++		}
++		klog.Infof("kubelet-csr-approver: approved %s (%s) for %s", csr.Name, csr.Spec.SignerName, csr.Spec.Username)
++	}
++}
++
++func isResolved(csr *certsv1.CertificateSigningRequest) bool {
++	for _, c := range csr.Status.Conditions {
++		if c.Type == certsv1.CertificateApproved || c.Type == certsv1.CertificateDenied {
++			return true
++		}
++	}
++	return false
++}
++
++func shouldApprove(ctx context.Context, client kubernetes.Interface, csr *certsv1.CertificateSigningRequest) (bool, string) {
++	// Only requests made by a node about itself qualify; everything else is
++	// left for a human or another controller.
++	if !slices.Contains(csr.Spec.Groups, "system:nodes") {
++		return false, ""
++	}
++	nodeName := strings.TrimPrefix(csr.Spec.Username, nodeUserPrefix)
++	if nodeName == csr.Spec.Username {
++		return false, ""
++	}
++
++	req, err := parseCSR(csr.Spec.Request)
++	if err != nil {
++		return false, err.Error()
++	}
++	if req.Subject.CommonName != csr.Spec.Username {
++		return false, "subject does not match requester"
++	}
++	if len(req.Subject.Organization) != 1 || req.Subject.Organization[0] != "system:nodes" {
++		return false, "organization is not system:nodes"
++	}
++
++	switch csr.Spec.SignerName {
++	case certsv1.KubeletServingSignerName:
++		if !slices.Contains(csr.Spec.Usages, certsv1.UsageServerAuth) {
++			return false, "serving CSR without server auth usage"
++		}
++		return validateServingNames(ctx, client, req, nodeName)
++	case certsv1.KubeAPIServerClientKubeletSignerName:
++		if !slices.Contains(csr.Spec.Usages, certsv1.UsageClientAuth) {
++			return false, "client CSR without client auth usage"
++		}
++		if len(req.DNSNames)+len(req.IPAddresses)+len(req.EmailAddresses)+len(req.URIs) != 0 {
++			return false, "client CSR must not request SANs"
++		}
++		return true, ""
++	default:
++		return false, ""
++	}
++}
++
++func validateServingNames(ctx context.Context, client kubernetes.Interface, req *x509.CertificateRequest, nodeName string) (bool, string) {
++	node, err := client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
++	if err != nil {
++		return false, fmt.Sprintf("failed to get node %s: %v", nodeName, err)
++	}
++	allowed := sets.New[string](node.Name)
++	for _, addr := range node.Status.Addresses {
++		allowed.Insert(addr.Address)
++	}
++	for _, dns := range req.DNSNames {
++		if !allowed.Has(dns) {
++			return false, fmt.Sprintf("DNS name %q is not an address of node %s", dns, nodeName)
++		}
++	}
++	for _, ip := range req.IPAddresses {
++		if !allowed.Has(ip.String()) {
++			return false, fmt.Sprintf("IP %q is not an address of node %s", ip.String(), nodeName)
++		}
++	}
++	return true, ""
++}
++
++func parseCSR(pemBytes []byte) (*x509.CertificateRequest, error) {
++	block, _ := pem.Decode(pemBytes)
++	if block == nil || block.Type != "CERTIFICATE REQUEST" {
++		return nil, fmt.Errorf("PEM block type must be CERTIFICATE REQUEST")
++	}
++	return x509.ParseCertificateRequest(block.Bytes)
++}
 diff --git a/pkg/node/kubelet.go b/pkg/node/kubelet.go
-index 6a0c8ce6..ac73ba9f 100644
+index 6a0c8ce6..85f66fcf 100644
 --- a/pkg/node/kubelet.go
 +++ b/pkg/node/kubelet.go
-@@ -51,6 +51,7 @@ const (
+@@ -22,6 +22,7 @@ import (
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
++	"strconv"
+ 	"strings"
+ 	"text/template"
+ 
+@@ -51,6 +52,7 @@ const (
  type KubeletServer struct {
  	kubeletflags *kubeletoptions.KubeletFlags
  	kubeconfig   *kubeletconfig.KubeletConfiguration
@@ -262,7 +635,7 @@ index 6a0c8ce6..ac73ba9f 100644
  }
  
  func NewKubeletServer(cfg *config.Config) *KubeletServer {
-@@ -59,10 +60,16 @@ func NewKubeletServer(cfg *config.Config) *KubeletServer {
+@@ -59,10 +61,16 @@ func NewKubeletServer(cfg *config.Config) *KubeletServer {
  	return s
  }
  
@@ -281,7 +654,7 @@ index 6a0c8ce6..ac73ba9f 100644
  	if err := s.writeConfig(cfg); err != nil {
  		klog.Fatalf("Failed to write kubelet config %v", err)
  	}
-@@ -84,8 +91,10 @@ func (s *KubeletServer) configure(cfg *config.Config) {
+@@ -84,8 +92,10 @@ func (s *KubeletServer) configure(cfg *config.Config) {
  	kubeletFlags.RuntimeCgroups = "/system.slice/crio.service"
  	kubeletFlags.HostnameOverride = cfg.Node.HostnameOverride
  	kubeletFlags.NodeIP = nodeIP
@@ -294,41 +667,54 @@ index 6a0c8ce6..ac73ba9f 100644
  	kubeletFlags.NodeLabels["node-role.kubernetes.io/worker"] = ""
  	kubeletFlags.NodeLabels["node.openshift.io/os_id"] = osID
  	kubeletFlags.NodeLabels["node.kubernetes.io/instance-type"] = "rhde"
-diff --git a/pkg/util/kubeconfig.go b/pkg/util/kubeconfig.go
-index 19d5f9b1..4ea84eb1 100644
---- a/pkg/util/kubeconfig.go
-+++ b/pkg/util/kubeconfig.go
-@@ -16,6 +16,8 @@ limitations under the License.
- package util
+@@ -144,10 +154,21 @@ func (s *KubeletServer) generateConfig(cfg *config.Config) ([]byte, error) {
+ 		userProvidedConfig = string(b)
+ 	}
  
- import (
-+	"fmt"
-+
- 	clientcmd "k8s.io/client-go/tools/clientcmd"
- 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
- )
-@@ -56,3 +58,21 @@ func KubeConfigWithClientCerts(
- 
- 	return clientcmd.WriteToFile(kubeConfig, path)
- }
-+
-+// KubeConfigServerURL returns the cluster server URL of the kubeconfig's
-+// current context.
-+func KubeConfigServerURL(path string) (string, error) {
-+	kc, err := clientcmd.LoadFromFile(path)
-+	if err != nil {
-+		return "", err
++	// Workers have no local signing material: the serving cert comes from a
++	// kubelet-serving CSR (serverTLSBootstrap) and the client cert rotates
++	// through CSRs instead of a restart-to-rotate of local chains.
++	tlsCertFile := cryptomaterial.ServingCertPath(servingCertDir)
++	tlsPrivateKeyFile := cryptomaterial.ServingKeyPath(servingCertDir)
++	if s.workerOnly {
++		tlsCertFile = ""
++		tlsPrivateKeyFile = ""
 +	}
-+	kcContext, ok := kc.Contexts[kc.CurrentContext]
-+	if !ok {
-+		return "", fmt.Errorf("kubeconfig %s has no current context", path)
-+	}
-+	cluster, ok := kc.Clusters[kcContext.Cluster]
-+	if !ok || cluster.Server == "" {
-+		return "", fmt.Errorf("kubeconfig %s has no server for cluster %q", path, kcContext.Cluster)
-+	}
-+	return cluster.Server, nil
+ 	tplParams := map[string]string{
+ 		"clientCAFile":       cryptomaterial.KubeletClientCAPath(cryptomaterial.CertsDirectory(config.DataDir)),
+-		"tlsCertFile":        cryptomaterial.ServingCertPath(servingCertDir),
+-		"tlsPrivateKeyFile":  cryptomaterial.ServingKeyPath(servingCertDir),
++		"serverTLSBootstrap": strconv.FormatBool(s.workerOnly),
++		"rotateCertificates": strconv.FormatBool(s.workerOnly),
++		"tlsCertFile":        tlsCertFile,
++		"tlsPrivateKeyFile":  tlsPrivateKeyFile,
+ 		"volumePluginDir":    config.DataDir + "/kubelet-plugins/volume/exec",
+ 		"clusterDNSIP":       cfg.Network.DNS,
+ 		"resolvConf":         resolvConf,
+diff --git a/pkg/node/kubelet_test.go b/pkg/node/kubelet_test.go
+index a98a071c..85451858 100644
+--- a/pkg/node/kubelet_test.go
++++ b/pkg/node/kubelet_test.go
+@@ -47,4 +47,19 @@ reservedMemory:
+ 	data, err := kubelet.generateConfig(cfg)
+ 	assert.NoError(t, err)
+ 	assert.Contains(t, string(data), expectedConfigPart)
++	assert.Contains(t, string(data), "serverTLSBootstrap: false")
++	assert.Contains(t, string(data), "tlsCertFile")
 +}
++
++func Test_GenerateConfigWorker(t *testing.T) {
++	cfg := config.NewDefault()
++
++	kubelet := &KubeletServer{workerOnly: true}
++	data, err := kubelet.generateConfig(cfg)
++	assert.NoError(t, err)
++	assert.Contains(t, string(data), "serverTLSBootstrap: true")
++	assert.Contains(t, string(data), "rotateCertificates: true")
++	assert.Contains(t, string(data), "RotateKubeletServerCertificate: true")
++	assert.NotContains(t, string(data), "tlsCertFile")
++	assert.NotContains(t, string(data), "tlsPrivateKeyFile")
+ }
 diff --git a/scripts/multinode/configure-node.sh b/scripts/multinode/configure-node.sh
 index e55d133b..90aa5931 100755
 --- a/scripts/multinode/configure-node.sh
