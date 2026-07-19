@@ -100,6 +100,14 @@ vm-test-upgrade:
 multinode-test:
 	DIST_IMAGE="$(DIST_IMAGE)" ./scripts/multinode-test.sh
 
+.PHONY: multinode-smoke
+multinode-smoke:
+	DIST_IMAGE="$(DIST_IMAGE)" ./scripts/multinode-smoke.sh
+
+.PHONY: multinode-smoke-clean
+multinode-smoke-clean:
+	DIST_IMAGE="$(DIST_IMAGE)" CLEAN=1 ./scripts/multinode-smoke.sh
+
 .PHONY: smoke-clean
 smoke-clean:
 	DIST_IMAGE="$(DIST_IMAGE)" CLEAN=1 ./scripts/smoke-test.sh
