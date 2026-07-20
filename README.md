@@ -92,11 +92,11 @@ instead (`patches/0006`, `0007`): `microshift run --worker` starts only the
 node services, the kubelet bootstraps its client cert from the bootstrap
 kubeconfig and obtains its serving cert through a CSR approved by a small
 controller on the control plane, and `add-node --worker` copies only public
-CA certs — a worker never holds signing material. One image serves both
+CA certs, so a worker never holds signing material. One image serves both
 roles:
 
 ```sh
-# on the controller (default profile) — nothing to do; copy the bootstrap
+# on the controller (default profile): nothing to do; copy the bootstrap
 # kubeconfig from /var/lib/microshift/resources/kubeadmin/<node-addr>/kubeconfig
 
 # on each worker
@@ -104,11 +104,19 @@ microshift-profile worker
 microshift add-node --worker --kubeconfig /path/to/bootstrap-kubeconfig
 ```
 
-The greenboot gate stays enabled on workers: `microshift healthcheck`
-detects the role and gates on the node being Ready in the cluster. The
-firewall follows the profile (workers expose only kubelet and Geneve).
-Multinode remains upstream-unsupported and single-controller: losing the
-controller means losing the cluster.
+The join credential is removed once the node is Ready (the kubelet then holds
+only its own rotating cert), and workers keep their kubelet client CA current
+from the CA the control plane publishes, so control-plane CA rotation does not
+require a re-join. The greenboot gate stays enabled on workers: `microshift
+healthcheck` detects the role and gates on the node being Ready in the cluster.
+
+The firewall follows the profile (workers expose only kubelet and Geneve).
+Note that upgrading a pre-existing install to this revision enables firewalld
+if it was inactive: a site relying on previously open ports must add explicit
+firewalld rules. Multinode remains upstream-unsupported and single-controller:
+losing the controller means losing the cluster, and the join credential is
+still the cluster-admin kubeconfig for its short lifetime (a scoped bootstrap
+token is the planned follow-up).
 
 ## Patch policy
 

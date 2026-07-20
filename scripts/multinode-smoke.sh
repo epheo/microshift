@@ -102,9 +102,15 @@ sudo podman run -d "${run_opts[@]}" \
 log "creating ${WORKER} with the worker profile pre-installed"
 sudo podman create "${run_opts[@]}" \
     --name "${WORKER}" --hostname "${WORKER}" "${DIST_IMAGE}" >/dev/null
-override="$(mktemp -d)/50-profile-worker.conf"
-printf '[Service]\nExecStart=\nExecStart=microshift run --multinode --worker\n' > "${override}"
-sudo podman cp "${override}" "${WORKER}:/etc/systemd/system/microshift.service.d/"
+# The image ships no microshift.service.d, and podman cp will not create a
+# missing destination dir, so copy a whole directory into the existing
+# /etc/systemd/system/ (this mirrors what microshift-profile worker writes).
+ovdir="$(mktemp -d)"
+mkdir -p "${ovdir}/microshift.service.d"
+printf '[Service]\nExecStart=\nExecStart=microshift run --multinode --worker\n' \
+    > "${ovdir}/microshift.service.d/50-profile-worker.conf"
+sudo podman cp "${ovdir}/microshift.service.d" "${WORKER}:/etc/systemd/system/"
+rm -rf "${ovdir}"
 sudo podman start "${WORKER}" >/dev/null
 
 trap 'rc=$?; [ ${rc} -ne 0 ] && diagnostics; exit ${rc}' EXIT
@@ -159,17 +165,34 @@ log "assert: worker node is Ready"
 koc get node "${WORKER}" --no-headers | grep -q ' Ready '
 
 log "assert: worker is labeled worker, not control-plane"
-koc get node "${WORKER}" -o jsonpath='{.metadata.labels}' | grep -q 'node-role.kubernetes.io/worker'
-! koc get node "${WORKER}" -o jsonpath='{.metadata.labels}' | grep -q 'node-role.kubernetes.io/control-plane'
+labels="$(koc get node "${WORKER}" -o jsonpath='{.metadata.labels}')"
+echo "${labels}" | grep -q 'node-role.kubernetes.io/worker' \
+    || { echo "ERROR: worker is missing the worker role label" >&2; exit 1; }
+# A bare '! ... | grep -q' is a no-op under set -e, so test the presence
+# explicitly and fail on a match.
+if echo "${labels}" | grep -q 'node-role.kubernetes.io/control-plane'; then
+    echo "ERROR: worker carries the control-plane label" >&2; exit 1
+fi
 
 log "assert: no signing material on the worker"
-! wexec sh -c "find /var/lib/microshift/certs -name ca.key 2>/dev/null | grep -q ." \
-    || { echo "ERROR: CA private key found on the worker" >&2; exit 1; }
-! wexec test -f /var/lib/microshift/resources/kube-apiserver/secrets/service-account-key/service-account.key \
-    || { echo "ERROR: service account key found on the worker" >&2; exit 1; }
+# wexec must succeed for the check to be meaningful; a failed exec inverted by
+# '!' would otherwise read as 'no key found'.
+if wexec sh -c "find /var/lib/microshift/certs -name ca.key 2>/dev/null | grep -q ."; then
+    echo "ERROR: CA private key found on the worker" >&2; exit 1
+fi
+if wexec test -f /var/lib/microshift/resources/kube-apiserver/secrets/service-account-key/service-account.key; then
+    echo "ERROR: service account key found on the worker" >&2; exit 1
+fi
 
-log "assert: kubelet serving CSR was approved and issued"
-koc get csr -o wide | grep "system:node:${WORKER}" | grep kubelet-serving | grep -q 'Approved,Issued'
+log "assert: kubelet serving CSR was approved and issued (up to 2m)"
+# The approver ticks every 30s and node-Ready does not depend on the serving
+# cert, so poll rather than checking once.
+ok=false
+for _ in $(seq 24); do
+    if koc get csr -o wide 2>/dev/null | grep "system:node:${WORKER}" | grep kubelet-serving | grep -q 'Approved,Issued'; then ok=true; break; fi
+    sleep 5
+done
+${ok} || { echo "ERROR: kubelet serving CSR was not approved+issued" >&2; exit 1; }
 
 log "assert: apiserver reaches the worker kubelet over the CSR-issued cert (up to 2m)"
 ok=false
@@ -179,16 +202,27 @@ for _ in $(seq 24); do
 done
 ${ok} || { echo "ERROR: node proxy healthz never answered" >&2; exit 1; }
 
-log "assert: OVN and DNS pods run on the worker (up to 10m)"
+log "assert: OVN and DNS pods run and are ready on the worker (up to 10m)"
 ok=false
 for _ in $(seq 120); do
-    on_worker_bad="$(koc get pods -A -o wide --no-headers --field-selector "spec.nodeName=${WORKER}" 2>/dev/null | grep -cvE 'Running|Completed' || true)"
-    on_worker_total="$(koc get pods -A -o wide --no-headers --field-selector "spec.nodeName=${WORKER}" 2>/dev/null | wc -l)"
+    stats="$(koc get pods -A -o wide --no-headers --field-selector "spec.nodeName=${WORKER}" 2>/dev/null)"
+    on_worker_total="$(echo "${stats}" | grep -c . || true)"
+    # A Running-but-unready (x/y, x<y) pod is not settled; STATUS alone lies.
+    # Columns (-A -o wide): 1 NS, 2 NAME, 3 READY, 4 STATUS.
+    on_worker_bad="$(echo "${stats}" | awk '
+        $4=="Completed" || $4=="Succeeded" {next}
+        $4!="Running" {c++; next}
+        {split($3,a,"/"); if (a[1]!=a[2]) c++}
+        END {print c+0}')"
     if [ "${on_worker_total}" -ge 2 ] && [ "${on_worker_bad}" -eq 0 ]; then ok=true; break; fi
     sleep 5
 done
 ${ok} || { echo "ERROR: workloads on the worker did not settle (total=${on_worker_total} not-ready=${on_worker_bad})" >&2; exit 1; }
-koc get pods -n openshift-ovn-kubernetes -o wide --no-headers --field-selector "spec.nodeName=${WORKER}" | grep -q Running
+# An OVN node pod must be Running AND fully ready on the worker (columns without
+# -A: 1 NAME, 2 READY, 3 STATUS).
+koc get pods -n openshift-ovn-kubernetes -o wide --no-headers --field-selector "spec.nodeName=${WORKER}" \
+    | awk '$3=="Running" {split($2,a,"/"); if (a[1]==a[2] && a[2]>0) f=1} END {exit f?0:1}' \
+    || { echo "ERROR: no ready OVN pod on the worker" >&2; exit 1; }
 
 log "assert: worker healthcheck gates on its own readiness"
 wexec microshift healthcheck -v=2 --timeout=120s
