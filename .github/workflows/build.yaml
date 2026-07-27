@@ -137,16 +137,18 @@ jobs:
           make vm-test-upgrade PODMAN="sudo podman" \
               UPGRADE_FROM="ghcr.io/${{ github.repository_owner }}/microshift:latest"
 
-      - name: Make VM console logs readable
+      - name: Make VM logs readable
         if: failure()
         run: sudo chmod -R a+rX /tmp/epheo-microshift-vm* 2>/dev/null || true
 
-      - name: Upload VM console logs
+      - name: Upload VM logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: vm-console-log
-          path: /tmp/epheo-microshift-vm*/console.log
+          name: vm-logs
+          # console.log is the serial console; diag.log is the MicroShift,
+          # node/pod, OVN-K and crio state dumped by vm-test.sh on failure.
+          path: /tmp/epheo-microshift-vm*/*.log
           if-no-files-found: ignore
 
       - name: Resolve version string

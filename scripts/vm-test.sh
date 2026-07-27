@@ -46,10 +46,15 @@ log() { echo "--- $*"; }
 QEMU_PID=""
 cleanup() {
     rc=$?
+    # Collect in-VM state while the guest is still reachable, before killing it.
+    if [ ${rc} -ne 0 ]; then
+        log "FAILED (rc=${rc}); collecting diagnostics"
+        dump_diag || true
+    fi
     [ -n "${QEMU_PID}" ] && sudo kill "${QEMU_PID}" 2>/dev/null || true
     [ -n "${UPGRADE_FROM}" ] && sudo podman rm -f "${REG_NAME}" 2>/dev/null || true
     if [ ${rc} -ne 0 ]; then
-        log "FAILED (rc=${rc}) — last 60 lines of VM console:"
+        log "last 60 lines of VM console:"
         sudo tail -60 "${WORKDIR}/console.log" 2>/dev/null || true
     fi
     exit ${rc}
@@ -68,6 +73,31 @@ vssh() {
 
 KCFG=/var/lib/microshift/resources/kubeadmin/kubeconfig
 koc() { vssh oc --kubeconfig "${KCFG}" "$@"; }
+
+# A NotReady node is usually a CNI (OVN-K) or crio failure, none of which reach
+# the serial console (they log to journald). Write the full state to a file the
+# workflow uploads as an artifact, and tail it to the job log for quick triage.
+# All best-effort: the guest may be half-up, so nothing here may fail cleanup.
+dump_diag() {
+    local ns=openshift-ovn-kubernetes
+    local out="${WORKDIR}/diag.log"
+    {
+        echo "### journalctl -u microshift (this boot) ###"
+        vssh journalctl -u microshift --no-pager -b 2>&1
+        echo "### nodes ###"; koc get nodes -o wide 2>&1
+        echo "### pods -A ###"; koc get pods -A -o wide 2>&1
+        echo "### ${ns} describe ###"; koc -n "${ns}" describe pods 2>&1
+        echo "### ${ns} logs ###"
+        for p in $(koc -n "${ns}" get pods -o name 2>/dev/null); do
+            echo "--- ${p} ---"
+            koc -n "${ns}" logs "${p}" --all-containers --prefix --tail=300 2>&1
+        done
+        echo "### journalctl -u crio (this boot) ###"
+        vssh journalctl -u crio --no-pager -b 2>&1
+    } > "${out}" 2>&1 || true
+    log "diagnostics written to ${out} (uploaded as an artifact); tail:"
+    tail -n 150 "${out}" 2>/dev/null || true
+}
 
 wait_ssh() {
     log "waiting for ssh (up to 10m)"
