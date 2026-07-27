@@ -20,12 +20,26 @@ cd "$(dirname "$0")/.."
 # shellcheck disable=SC1091
 source versions.env
 
+# Registry tag reads are the only network dependency here and quay.io flakes;
+# a single blip must not red the whole scheduled build. Retry with backoff,
+# matching the pull retries elsewhere in the pipeline.
+list_tags() {
+    local ref=$1 i
+    for i in 1 2 3 4 5; do
+        if skopeo list-tags "docker://${ref}"; then return 0; fi
+        echo "list-tags ${ref} failed (attempt ${i}), retrying" >&2
+        sleep $((i * 10))
+    done
+    echo "ERROR: could not list tags for ${ref}" >&2
+    return 1
+}
+
 # GA tags only (ec/rc excluded), version-sorted.
 all_ushift="$(git ls-remote --tags "${USHIFT_GIT_URL}" 'refs/tags/*' \
     | awk '{print $2}' | sed -e 's|refs/tags/||' -e 's|\^{}||' \
     | grep -E '^[0-9]+\.[0-9]+\.[0-9]+' | grep -vE -- '-(ec|rc)\.' | sort -uV)"
 
-all_okd="$(skopeo list-tags "docker://${OKD_RELEASE_IMAGE}" \
+all_okd="$(list_tags "${OKD_RELEASE_IMAGE}" \
     | jq -r '.Tags[]' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-okd-scos\.[0-9]+$' \
     | sort -uV)"
 
@@ -42,7 +56,7 @@ latest_ushift="$(echo "${all_ushift}" | grep -E "^${minor//./\\.}\." | tail -1)"
 latest_okd="$(echo "${all_okd}" | grep -E "^${minor//./\\.}\." | tail -1)"
 
 portail_repo="${PORTAIL_IMAGE%%:*}"
-latest_portail="$(skopeo list-tags "docker://${portail_repo}" \
+latest_portail="$(list_tags "${portail_repo}" \
     | jq -r '.Tags[]' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
 
 update() {
