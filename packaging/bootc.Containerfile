@@ -59,6 +59,16 @@ RUN ${REPO_CONFIG_SCRIPT} -create ${USHIFT_RPM_REPO_PATH} && \
     rm -rvf ${USHIFT_RPM_REPO_PATH} && \
     dnf clean all
 
+# containers-common 6.x moved the default signature policy to
+# /usr/share/containers/policy.json, but el10 cri-o searches only $HOME and
+# /etc/containers, so without this copy EVERY image pull fails "no policy.json
+# file found". A booted node hides the defect: store-resident and embedded
+# images keep running and greenboot stays green until the first fresh pull
+# (2026-07-28: took out all Always-pull pods and, via the CSI sidecars, every
+# PVC-backed workload). vm-test catches it as node-never-Ready in a clean VM.
+RUN test -f /etc/containers/policy.json || \
+    cp /usr/share/containers/policy.json /etc/containers/policy.json
+
 # Post-install configuration (firewall, sysctl limits, kubeconfig link,
 # service enablement).
 COPY --chmod=755 ./src/rpm/postinstall.sh ${USHIFT_POSTINSTALL_SCRIPT}
@@ -107,3 +117,8 @@ RUN count="$(find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d | wc -l)" && 
         ls /usr/lib/modules; \
         exit 1; \
     fi
+
+# Guard: last step, after every package operation — cri-o reads the signature
+# policy from /etc/containers only, and a base or package bump that loses the
+# file again must fail the build, not the node.
+RUN test -f /etc/containers/policy.json
