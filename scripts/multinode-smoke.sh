@@ -246,6 +246,67 @@ koc get pods -n openshift-ovn-kubernetes -o wide --no-headers --field-selector "
     | awk '$3=="Running" {split($2,a,"/"); if (a[1]==a[2] && a[2]>0) f=1} END {exit f?0:1}' \
     || { echo "ERROR: no ready OVN pod on the worker" >&2; exit 1; }
 
+log "assert: cross-node pod-to-pod, pod-to-service, and cluster DNS"
+util_img="$(koc -n openshift-ovn-kubernetes get pods -o jsonpath='{.items[0].spec.containers[0].image}')"
+koc apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mn-echo-ctrl
+  labels: {app: mn-echo}
+spec:
+  nodeSelector: {kubernetes.io/hostname: ${CTRL}}
+  containers:
+  - name: echo
+    image: ${util_img}
+    command: ["/bin/bash","-c","mkdir -p /tmp/www && cd /tmp/www && echo mn-echo-ctrl > index.html && exec python3 -m http.server 8080"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mn-echo-worker
+  labels: {app: mn-echo}
+spec:
+  nodeSelector: {kubernetes.io/hostname: ${WORKER}}
+  containers:
+  - name: echo
+    image: ${util_img}
+    command: ["/bin/bash","-c","mkdir -p /tmp/www && cd /tmp/www && echo mn-echo-worker > index.html && exec python3 -m http.server 8080"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mn-echo
+spec:
+  selector: {app: mn-echo}
+  ports: [{port: 80, targetPort: 8080}]
+EOF
+ok=false
+for _ in $(seq 60); do
+    if [ "$(koc get pods -l app=mn-echo --no-headers 2>/dev/null | grep -c ' Running')" -eq 2 ]; then ok=true; break; fi
+    sleep 5
+done
+${ok} || { echo "ERROR: echo pods did not start on both nodes" >&2; exit 1; }
+ip_c="$(koc get pod mn-echo-ctrl -o jsonpath='{.status.podIP}')"
+ip_w="$(koc get pod mn-echo-worker -o jsonpath='{.status.podIP}')"
+cip="$(koc get svc mn-echo -o jsonpath='{.spec.clusterIP}')"
+fetch() { # fetch <pod> <url>
+    koc exec "$1" -- python3 -c "import urllib.request; print(urllib.request.urlopen('$2', timeout=5).read().decode().strip())" 2>/dev/null
+}
+ok=false
+for _ in $(seq 24); do
+    if [ "$(fetch mn-echo-worker "http://${ip_c}:8080")" = "mn-echo-ctrl" ]; then ok=true; break; fi
+    sleep 5
+done
+${ok} || { echo "ERROR: worker pod cannot reach the controller pod (pod-to-pod across geneve)" >&2; exit 1; }
+[ "$(fetch mn-echo-ctrl "http://${ip_w}:8080")" = "mn-echo-worker" ] \
+    || { echo "ERROR: controller pod cannot reach the worker pod" >&2; exit 1; }
+fetch mn-echo-worker "http://${cip}:80" | grep -q 'mn-echo' \
+    || { echo "ERROR: worker pod cannot reach the ClusterIP service" >&2; exit 1; }
+koc exec mn-echo-worker -- python3 -c \
+    "import socket; print(socket.getaddrinfo('kubernetes.default.svc.cluster.local', 443)[0][4][0])" \
+    | grep -q '10\.43\.' || { echo "ERROR: cluster DNS does not resolve from a worker pod" >&2; exit 1; }
+
 log "assert: worker healthcheck gates on its own readiness"
 wexec microshift healthcheck -v=2 --timeout=120s
 

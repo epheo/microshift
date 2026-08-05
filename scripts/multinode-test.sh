@@ -1,16 +1,11 @@
 #!/bin/bash
-# Two-node multinode acceptance test: boot two VMs of the image on one
-# NAT-bridged network (the same shape as docs/contributor/multinode in
-# upstream microshift, which uses libvirt's default network), join them
-# with the upstream flow (microshift run --multinode on the primary,
-# microshift add-node on the secondary), and assert the joined node is
-# a full citizen: Ready, every pod Running, and a pod scheduled there
-# reaches the apiserver service VIP through CNI.
-#
-# KNOWN RED as of 2026-08-05: the joined node's ovnkube-node never
-# writes /etc/cni/net.d/10-ovn-kubernetes.conf, so nothing scheduled
-# there gets networking. See MULTINODE-INVESTIGATION.md. This harness
-# exists to make that bug reproducible in CI and to gate the fix.
+# Two-node acceptance test for the worker topology: boot two VMs of the
+# image on one NAT-bridged network, keep firewalld and the role-scoped
+# services in place, join the second VM with 'microshift-profile worker'
+# + 'microshift add-node --worker', and assert the result is a working
+# cluster: both nodes Ready, every pod Running, cross-node pod-to-pod
+# and pod-to-service traffic, cluster DNS from a worker pod, and
+# greenboot health checks green on both roles.
 #
 # Requires root-capable podman, qemu-system-x86_64, dnsmasq, and sudo
 # for the bridge/taps. Runner-sized: two 5GB VMs.
@@ -78,21 +73,22 @@ host_net_down() {
 diagnostics() {
     log "DIAGNOSTICS: nodes, non-running pods"
     koc get nodes -o wide 2>&1 || true
-    koc get pods -A --no-headers 2>&1 | grep -vE 'Running|Completed' || true
-    log "DIAGNOSTICS: not-running pod events"
+    koc get pods -A -o wide --no-headers 2>&1 | grep -vE 'Running|Completed' || true
+    log "DIAGNOSTICS: events"
+    koc get events -A --sort-by='.metadata.creationTimestamp' 2>&1 | tail -30 || true
+    log "DIAGNOSTICS: not-ready pod logs"
     for p in $(koc get pods -A --no-headers 2>/dev/null \
             | awk '$4 !~ /Running|Completed/ {print $1"/"$2}'); do
         echo "--- ${p}"
-        koc -n "${p%/*}" describe pod "${p#*/}" 2>&1 | sed -n '/Events:/,$p' | tail -8 || true
-    done
-    log "DIAGNOSTICS: kubernetes endpoints and per-node CNI/br-ex"
-    koc get endpoints kubernetes 2>&1 || true
-    for fn in v1 v2; do
-        ${fn} sh -c 'hostname; ip -br addr show br-ex 2>/dev/null; ls /etc/cni/net.d/ 2>/dev/null; ss -ltn | grep 6443 || echo "no local 6443"' 2>&1 || true
+        koc -n "${p%/*}" logs "${p#*/}" --all-containers --tail=20 </dev/null 2>&1 || true
     done
     log "DIAGNOSTICS: node2 ovnkube-node containers (raw tails)"
     p2=$(koc -n openshift-ovn-kubernetes get pods -o wide --no-headers 2>/dev/null | awk '/ovnkube-node/ && $7=="node2" {print $1}')
-    [ -n "${p2:-}" ] && koc -n openshift-ovn-kubernetes logs "${p2}" --all-containers --tail=30 2>&1 | tail -40 || true
+    [ -n "${p2:-}" ] && koc -n openshift-ovn-kubernetes logs "${p2}" --all-containers --tail=30 </dev/null 2>&1 | tail -40 || true
+    log "DIAGNOSTICS: per-node CNI/br-ex/routes"
+    for fn in v1 v2; do
+        ${fn} sh -c 'hostname; ip -br addr show br-ex 2>/dev/null; ip route show 10.44.0.0/32; ls /etc/cni/net.d/ 2>/dev/null' 2>&1 || true
+    done
     log "DIAGNOSTICS: node2 microshift journal errors"
     v2 sh -c 'journalctl -u microshift --no-pager -p err -n 20' 2>&1 || true
     log "DIAGNOSTICS: consoles (last 15 lines each)"
@@ -188,7 +184,8 @@ boot_vm 2 "${DISK2}" "${MAC2}" tap-ushift2
 retry 600 "node1 ssh reachable" v1 true
 retry 600 "node2 ssh reachable" v2 true
 
-# First boot pulls the release images; cleanup keeps them local.
+# The single-node first boot must settle before reshaping either node:
+# it proves the image itself and pre-imports the embedded payload.
 settled() { # settled <vssh-fn>
     $1 sh -c 'k="oc --kubeconfig /var/lib/microshift/resources/kubeadmin/kubeconfig"; $k get pods -A --no-headers 2>/dev/null | grep -q . || exit 1; $k get pods -A --no-headers | grep -vE "Running|Completed" | grep -q . && exit 1; exit 0'
 }
@@ -202,20 +199,20 @@ for fn in v1 v2; do
     ${fn} sh -c "printf '${IP1} node1\n${IP2} node2\n' >> /etc/hosts"
 done
 
-# --- 4. Multinode join (upstream scripts/multinode/configure-node.sh) --------
+# --- 4. Reshape: node1 controller, node2 worker -------------------------------
+# firewalld stays RUNNING throughout: the role-scoped services are part of
+# what this test accepts. greenboot is stopped only around cleanup-data
+# (a running health check fights the wipe) and re-asserted at the end.
 node_config() { # node_config <vssh-fn> <hostname> <ip>
     local fn=$1 host=$2 ip=$3
     step() { echo "  [${host}] $1"; shift; "${fn}" "$@" || die "[${host}] failed: $*"; }
-    step "stop greenboot" sh -c 'systemctl stop greenboot-healthcheck 2>/dev/null; systemctl reset-failed greenboot-healthcheck 2>/dev/null; systemctl disable greenboot-healthcheck 2>/dev/null; true'
-    step "stop firewalld" sh -c 'systemctl stop firewalld 2>/dev/null; systemctl disable firewalld 2>/dev/null; true'
+    step "pause greenboot around the wipe" sh -c 'systemctl stop greenboot-healthcheck 2>/dev/null; systemctl reset-failed greenboot-healthcheck 2>/dev/null; true'
     step "set hostname" hostnamectl set-hostname "${host}"
-    step "write multinode config" sh -c "mkdir -p /etc/microshift/config.d && printf 'node:\n  hostnameOverride: ${host}\n  nodeIP: ${ip}\napiServer:\n  subjectAltNames:\n  - ${ip}\n' > /etc/microshift/config.d/20-multinode.yaml"
+    step "write node config" sh -c "mkdir -p /etc/microshift/config.d && printf 'node:\n  hostnameOverride: ${host}\n  nodeIP: ${ip}\napiServer:\n  subjectAltNames:\n  - ${ip}\n' > /etc/microshift/config.d/20-multinode.yaml"
     step "wipe single-node state" sh -c 'echo 1 | microshift-cleanup-data --all --keep-images'
-    step "multinode unit override" sh -c 'mkdir -p /etc/systemd/system/microshift.service.d && printf "[Service]\nExecStart=\nExecStart=microshift run --multinode\n" > /etc/systemd/system/microshift.service.d/multinode.conf'
-    step "daemon-reload" systemctl daemon-reload
 }
 
-log "configuring node1 as the multinode primary"
+log "configuring node1 as the controller"
 node_config v1 node1 "${IP1}"
 v1 systemctl enable --now microshift
 microshift_active() { v1 systemctl is-active -q microshift; }
@@ -223,21 +220,29 @@ retry 600 "microshift active on node1" microshift_active
 node1_ready() { koc get node node1 --no-headers 2>/dev/null | grep -q ' Ready'; }
 retry 600 "node1 Ready" node1_ready
 
-log "joining node2 via microshift add-node"
+log "joining node2 as a worker (microshift-profile worker + add-node --worker)"
 node_config v2 node2 "${IP2}"
+v2 microshift-profile worker
+v2 systemctl enable microshift
 BOOTSTRAP="/var/lib/microshift/resources/kubeadmin/${IP1}/kubeconfig"
 scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
     -i "${WORKDIR}/id" "root@${IP1}:${BOOTSTRAP}" "${WORKDIR}/bootstrap-kubeconfig"
 scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
     -i "${WORKDIR}/id" "${WORKDIR}/bootstrap-kubeconfig" "root@${IP2}:/root/bootstrap-kubeconfig"
-v2 microshift add-node --kubeconfig /root/bootstrap-kubeconfig
+v2 microshift add-node --worker --kubeconfig /root/bootstrap-kubeconfig
 
 # --- 5. The multinode contract ------------------------------------------------
 both_ready() { [ "$(koc get nodes --no-headers 2>/dev/null | grep -c ' Ready')" -eq 2 ]; }
 retry 900 "both nodes Ready" both_ready
 
-# The gate that is red today: every pod on BOTH nodes must run; the
-# joined node's dns-default (daemonset) is the canary.
+log "assert: node2 is a worker, not a control plane"
+labels="$(koc get node node2 -o jsonpath='{.metadata.labels}')"
+echo "${labels}" | grep -q 'node-role.kubernetes.io/worker' \
+    || die "node2 is missing the worker role label"
+if echo "${labels}" | grep -q 'node-role.kubernetes.io/control-plane'; then
+    die "node2 carries the control-plane label"
+fi
+
 pods_settled() {
     local total bad
     total=$(koc get pods -A --no-headers 2>/dev/null | wc -l)
@@ -246,27 +251,77 @@ pods_settled() {
 }
 retry 900 "all pods Running/Completed on both nodes" pods_settled
 
-log "assert: a pod scheduled on node2 reaches the apiserver VIP via CNI"
+# --- 6. Cross-node dataplane ---------------------------------------------------
+log "assert: cross-node pod-to-pod, pod-to-service, and cluster DNS"
 util_img="$(koc -n openshift-ovn-kubernetes get pods -o jsonpath='{.items[0].spec.containers[0].image}')"
 koc apply -f - <<EOF
 apiVersion: v1
 kind: Pod
 metadata:
-  name: mn-probe
+  name: mn-echo-node1
+  labels: {app: mn-echo}
 spec:
-  restartPolicy: Never
-  nodeSelector:
-    kubernetes.io/hostname: node2
+  nodeSelector: {kubernetes.io/hostname: node1}
   containers:
-    - name: probe
-      image: ${util_img}
-      command: ["sleep", "3600"]
+  - name: echo
+    image: ${util_img}
+    command: ["/bin/bash","-c","mkdir -p /tmp/www && cd /tmp/www && echo mn-echo-node1 > index.html && exec python3 -m http.server 8080"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mn-echo-node2
+  labels: {app: mn-echo}
+spec:
+  nodeSelector: {kubernetes.io/hostname: node2}
+  containers:
+  - name: echo
+    image: ${util_img}
+    command: ["/bin/bash","-c","mkdir -p /tmp/www && cd /tmp/www && echo mn-echo-node2 > index.html && exec python3 -m http.server 8080"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mn-echo
+spec:
+  selector: {app: mn-echo}
+  ports: [{port: 80, targetPort: 8080}]
 EOF
-probe_up() { koc get pod mn-probe -o jsonpath='{.status.phase}' 2>/dev/null | grep -q Running; }
-retry 300 "probe pod Running on node2" probe_up
-# Any HTTP status proves CNI + service VIP + cross-node path; 401/403
-# is the expected unauthenticated answer.
-koc exec mn-probe -- curl -ksm5 -o /dev/null -w '%{http_code}' https://10.43.0.1:443/healthz \
-    | grep -qE '200|401|403' || die "apiserver VIP unreachable from a node2 pod"
+echo_up() { [ "$(koc get pods -l app=mn-echo --no-headers 2>/dev/null | grep -c ' Running')" -eq 2 ]; }
+retry 300 "both echo pods Running" echo_up
+
+IP_N1="$(koc get pod mn-echo-node1 -o jsonpath='{.status.podIP}')"
+IP_N2="$(koc get pod mn-echo-node2 -o jsonpath='{.status.podIP}')"
+CIP="$(koc get svc mn-echo -o jsonpath='{.spec.clusterIP}')"
+fetch() { # fetch <pod> <url>
+    koc exec "$1" -- python3 -c "import urllib.request; print(urllib.request.urlopen('$2', timeout=5).read().decode().strip())" 2>/dev/null
+}
+web_answers() { [ "$(fetch mn-echo-node2 "http://${IP_N1}:8080")" = "mn-echo-node1" ]; }
+retry 120 "worker pod reaches controller pod (pod-to-pod across geneve)" web_answers
+[ "$(fetch mn-echo-node1 "http://${IP_N2}:8080")" = "mn-echo-node2" ] \
+    || die "controller pod cannot reach the worker pod"
+fetch mn-echo-node2 "http://${CIP}:80" | grep -q 'mn-echo' \
+    || die "worker pod cannot reach the ClusterIP service"
+koc exec mn-echo-node2 -- python3 -c \
+    "import socket; print(socket.getaddrinfo('kubernetes.default.svc.cluster.local', 443)[0][4][0])" \
+    | grep -q '10\.43\.' || die "cluster DNS does not resolve from a worker pod"
+# The endpoint behind the default kubernetes service must answer from a
+# worker pod: this is the route-to-advertise-address path (patches/0008).
+apiserver_code="$(koc exec mn-echo-node2 -- python3 -c "
+import urllib.request, urllib.error, ssl
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+try:
+    urllib.request.urlopen('https://10.43.0.1:443/healthz', timeout=5, context=ctx)
+    print(200)
+except urllib.error.HTTPError as e:
+    print(e.code)
+")"
+echo "${apiserver_code}" | grep -qE '200|401|403' \
+    || die "apiserver VIP unreachable from a worker pod (got '${apiserver_code}')"
+
+# --- 7. greenboot gates both roles ---------------------------------------------
+log "assert: greenboot health checks pass on both nodes"
+v1 systemctl start greenboot-healthcheck || die "greenboot red on the controller"
+v2 systemctl start greenboot-healthcheck || die "greenboot red on the worker"
 
 log "MULTINODE TEST PASSED"

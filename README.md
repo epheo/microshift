@@ -17,7 +17,7 @@ Published at `ghcr.io/epheo/microshift`.
 | [portail](https://github.com/epheo/portail) is the edge | its image is embedded and imported the same way |
 | Updates must be safe | greenboot MicroShift health gate stays enabled; bootc rollback does the rest |
 | Logs are signal, not noise | `patches/0002` (etcd logs every request at warn — missing threshold default) and `patches/0003` (router status watcher hot-loops when `ingress.status: Removed`) |
-| Every image can be controller or worker | `microshift-profile` selects the role; `patches/0006`+`0007` add a worker mode where nodes hold no signing keys |
+| Every image can be controller or worker | `microshift-profile` selects the role; `patches/0006`-`0008` add a worker mode where nodes hold no signing keys and OVN runs one interconnect zone per node |
 | The firewall is on and role-scoped | firewalld enabled with `microshift-controlplane`/`microshift-node` services; etcd is never exposed |
 | Native el10 | RPMs are built in a CentOS Stream 10 buildroot |
 
@@ -52,6 +52,10 @@ sudo make vm-test          # acceptance: bootc-image-builder -> qcow2 -> QEMU bo
 sudo make vm-test-upgrade  # the same assertions after a real update: boot the
                            # previously published image, bootc switch to the
                            # candidate, reboot
+sudo make multinode-smoke  # worker join in two privileged containers: join
+                           # mechanics, certs, cross-node pod/service traffic
+sudo make multinode-test   # two-VM worker join: bootc deploy + firewalld +
+                           # greenboot + the same cross-node dataplane asserts
 make version               # print the version string of the built RPMs
 ```
 
@@ -89,12 +93,20 @@ the run (main stays red, nothing publishes) until `patches/` is rebased.
 ## Multinode (experimental)
 
 Upstream's community multinode joins every node as a full control plane
-replica, CA private keys included. This distribution ships a worker role
-instead (`patches/0006`, `0007`): `microshift run --worker` starts only the
-node services, the kubelet bootstraps its client cert from the bootstrap
-kubeconfig and obtains its serving cert through a CSR approved by a small
-controller on the control plane, and `add-node --worker` copies only public
-CA certs, so a worker never holds signing material. One image serves both
+replica, CA private keys included — and its OVN manifests still describe
+the central-mode architecture that ovn-kubernetes removed, so a second
+node of any kind never gets networking. This distribution ships a worker
+role instead (`patches/0006`, `0007`): `microshift run --worker` starts
+only the node services, the kubelet bootstraps its client cert from the
+bootstrap kubeconfig and obtains its serving cert through a CSR approved
+by a small controller on the control plane, and `add-node --worker`
+copies only public CA certs, so a worker never holds signing material.
+`patches/0008` rewrites the multinode OVN layout to match the shipped
+binary: every node runs its own interconnect zone (local OVN databases,
+northd, ovn-controller, zone controller), the control plane keeps only
+the cluster manager, and ovnkube authenticates with its service account
+instead of a mounted kubeadmin kubeconfig. Workers boot from the same
+embedded payload, so joins are air-gapped too. One image serves both
 roles:
 
 ```sh
@@ -119,6 +131,12 @@ firewalld rules. Multinode remains upstream-unsupported and single-controller:
 losing the controller means losing the cluster, and the join credential is
 still the cluster-admin kubeconfig for its short lifetime (a scoped bootstrap
 token is the planned follow-up).
+
+Two suites gate the topology: `multinode-smoke` (containers; join
+mechanics, cert flow, cross-node pod-to-pod, pod-to-service and cluster
+DNS) and `multinode-test` (two QEMU VMs; the same dataplane asserts on a
+real bootc deployment with firewalld running and greenboot green on both
+roles).
 
 ## Patch policy
 
