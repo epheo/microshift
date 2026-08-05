@@ -90,53 +90,50 @@ minor must exist. There is no manual step in the release process — the CI
 gate is the judge, and a crossing that breaks the patch series simply fails
 the run (main stays red, nothing publishes) until `patches/` is rebased.
 
-## Multinode (experimental)
+## Multinode
 
-Upstream's community multinode joins every node as a full control plane
-replica, CA private keys included — and its OVN manifests still describe
-the central-mode architecture that ovn-kubernetes removed, so a second
-node of any kind never gets networking. This distribution ships a worker
-role instead (`patches/0006`, `0007`): `microshift run --worker` starts
-only the node services, the kubelet bootstraps its client cert from the
-bootstrap kubeconfig and obtains its serving cert through a CSR approved
-by a small controller on the control plane, and `add-node --worker`
-copies only public CA certs, so a worker never holds signing material.
-`patches/0008` rewrites the multinode OVN layout to match the shipped
-binary: every node runs its own interconnect zone (local OVN databases,
-northd, ovn-controller, zone controller), the control plane keeps only
-the cluster manager, and ovnkube authenticates with its service account
-instead of a mounted kubeadmin kubeconfig. Workers boot from the same
-embedded payload, so joins are air-gapped too. One image serves both
-roles:
+One image, two roles: a controller (the default profile) and any number
+of workers. Deploy the same image on every node.
+
+On the controller, nothing to configure. Copy the bootstrap kubeconfig
+for the joins:
 
 ```sh
-# on the controller (default profile): nothing to do; copy the bootstrap
-# kubeconfig from /var/lib/microshift/resources/kubeadmin/<node-addr>/kubeconfig
+/var/lib/microshift/resources/kubeadmin/<node-addr>/kubeconfig
+```
 
-# on each worker
+On each worker:
+
+```sh
 microshift-profile worker
 microshift add-node --worker --kubeconfig /path/to/bootstrap-kubeconfig
 ```
 
-The join credential is removed once the node is Ready (the kubelet then holds
-only its own rotating cert), and workers keep their kubelet client CA current
-from the CA the control plane publishes, so control-plane CA rotation does not
-require a re-join. The greenboot gate stays enabled on workers: `microshift
-healthcheck` detects the role and gates on the node being Ready in the cluster.
+That is the whole flow. The node appears as a worker in the cluster,
+pod networking spans the nodes, and joins work air-gapped (workers boot
+from the same embedded payload).
 
-The firewall follows the profile (workers expose only kubelet and Geneve).
-Note that upgrading a pre-existing install to this revision enables firewalld
-if it was inactive: a site relying on previously open ports must add explicit
-firewalld rules. Multinode remains upstream-unsupported and single-controller:
-losing the controller means losing the cluster, and the join credential is
-still the cluster-admin kubeconfig for its short lifetime (a scoped bootstrap
-token is the planned follow-up).
+What the worker role gives you:
 
-Two suites gate the topology: `multinode-smoke` (containers; join
-mechanics, cert flow, cross-node pod-to-pod, pod-to-service and cluster
-DNS) and `multinode-test` (two QEMU VMs; the same dataplane asserts on a
-real bootc deployment with firewalld running and greenboot green on both
-roles).
+- Workers hold no signing keys or cluster CA material; kubelet certs
+  are bootstrapped and rotated through CSRs approved on the controller.
+- The join credential is deleted once the node is Ready, and CA
+  rotation on the controller does not require a re-join.
+- The firewall follows the profile: workers expose only kubelet and
+  Geneve, the controller only the apiserver; etcd is never exposed.
+- greenboot gates both roles: `microshift healthcheck` detects the role
+  and a worker gates on its own readiness in the cluster.
+
+Limits: one controller only (losing it means losing the cluster), and
+the join credential is the cluster-admin kubeconfig for its short
+lifetime (a scoped bootstrap token is the planned follow-up). Upstream
+does not support multinode; this distribution carries it as
+`patches/0006`-`0008` and gates it with the `multinode-smoke` and
+`multinode-test` suites.
+
+Note that upgrading a pre-existing install to this revision enables
+firewalld if it was inactive: a site relying on previously open ports
+must add explicit firewalld rules.
 
 ## Patch policy
 
