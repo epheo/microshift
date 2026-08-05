@@ -112,9 +112,13 @@ RUN systemctl enable import-embedded-images.service
 # kubelet sandbox creation hard-fails on open /etc/resolv.conf, and nothing
 # in this image ships one: NetworkManager only writes it when DHCP hands out
 # DNS servers, which an air-gapped site (or qemu restrict=on) never does.
-# An empty file is valid ("no nameservers") and NM overwrites it when it
-# does have data.
-RUN echo 'f /etc/resolv.conf 0644 root root -' \
+# Not empty: coredns' "forward . /etc/resolv.conf" refuses to start on zero
+# nameservers (dns-default crash-loops). 127.0.0.1 lets it start — cluster
+# DNS works, upstream queries fail per-query, which is what air-gapped
+# means; the Corefile has no loop plugin, so no self-forward crash. NM
+# overwrites the file whenever it does have data. The trailing literal \n
+# is a tmpfiles C-style escape.
+RUN echo 'f /etc/resolv.conf 0644 root root - nameserver 127.0.0.1\n' \
         > /usr/lib/tmpfiles.d/microshift-resolv-conf.conf
 
 # bootc#1682 workaround: keep the skopeo helper privileged under the update
