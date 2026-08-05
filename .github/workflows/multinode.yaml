@@ -1,0 +1,57 @@
+# Two-node multinode acceptance: dispatch-only while the joined node's
+# CNI bug stands (MULTINODE-INVESTIGATION.md); flip into the main gate
+# once green. Tests the published image by default so a run costs ~30
+# minutes, not a full source build; set image to a candidate ref to
+# test something else.
+name: multinode
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Image to test
+        default: ghcr.io/epheo/microshift:latest
+
+jobs:
+  multinode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          swap-storage: false
+
+      - name: Enable KVM for the runner
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install qemu and dnsmasq
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-x86 dnsmasq
+          # ubuntu's dnsmasq wants to run globally; the test runs its
+          # own instance on the bridge.
+          sudo systemctl stop dnsmasq 2>/dev/null || true
+          sudo systemctl disable dnsmasq 2>/dev/null || true
+
+      - name: Multinode test
+        run: make multinode-test DIST_IMAGE="${{ inputs.image }}"
+
+      - name: Make VM console logs readable
+        if: failure()
+        run: sudo chmod -R a+rX /tmp/epheo-microshift-multinode 2>/dev/null || true
+
+      - name: Collect console logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multinode-consoles
+          path: /tmp/epheo-microshift-multinode/console*.log
+          if-no-files-found: ignore

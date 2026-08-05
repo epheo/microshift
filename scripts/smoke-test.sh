@@ -145,6 +145,11 @@ koc -n topolvm-system get pods --no-headers | grep -q Running
 log "assert: embedded portail image was imported into cri-o at boot"
 pexec crictl images | grep -q 'localhost/embedded/portail'
 
+# Rerunning the import must find every manifest entry already in the store:
+# proves the boot import covered the whole payload and stayed idempotent.
+log "assert: the whole embedded payload is in cri-o's store"
+pexec /usr/bin/import-embedded-images.sh | { ! grep -q '^importing'; }
+
 log "assert: greenboot MicroShift health gate is enabled"
 pexec test -x /etc/greenboot/check/required.d/40_microshift_running_check.sh
 

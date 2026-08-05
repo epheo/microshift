@@ -93,6 +93,13 @@ UPGRADE_FROM ?= ghcr.io/epheo/microshift:latest
 vm-test-upgrade:
 	DIST_IMAGE="$(DIST_IMAGE)" UPGRADE_FROM="$(UPGRADE_FROM)" ./scripts/vm-test.sh
 
+# Two-node join (upstream multinode flow) on a NAT-bridged pair of VMs.
+# Known red until the joined node's CNI works; see
+# MULTINODE-INVESTIGATION.md. Dispatch-only in CI.
+.PHONY: multinode-test
+multinode-test:
+	DIST_IMAGE="$(DIST_IMAGE)" ./scripts/multinode-test.sh
+
 .PHONY: smoke-clean
 smoke-clean:
 	DIST_IMAGE="$(DIST_IMAGE)" CLEAN=1 ./scripts/smoke-test.sh

@@ -30,6 +30,26 @@ oc_release_info() {
     echo "${okd_image}"
 }
 
+# oc returns manifest-list digests. The bootc stage embeds the payload with
+# skopeo --preserve-digests, and a docker manifest list cannot be written
+# byte-exact into an OCI layout, so the boot import under the pinned ref
+# would fail. The release JSONs are per-arch anyway: pin the arch instance
+# digest instead (also pullable directly on connected nodes).
+resolve_arch_digest() {
+    local -r image=$1
+    local -r goarch="${UNAME_TO_GOARCH_MAP[${ARCH}]}"
+    local digest
+    digest=$(skopeo inspect --retry-times 3 --raw "docker://${image}" \
+        | jq -r --arg a "${goarch}" \
+            '.manifests // [] | .[] | select(.platform.architecture == $a and .platform.os == "linux") | .digest' \
+        | head -1)
+    if [ -n "${digest}" ]; then
+        echo "${image%%@*}@${digest}"
+    else
+        echo "${image}"
+    fi
+}
+
 verify_okd_release() {
     local -r okd_url=$1
     local -r okd_releaseTag=$2
@@ -55,6 +75,7 @@ replace_base_assets() {
 
         local new_image
         new_image=$(oc_release_info "${okd_url}" "${okd_releaseTag}" "${cur_image}")
+        new_image=$(resolve_arch_digest "${new_image}")
 
         echo "[${ARCH}] Replacing '${cur_image}' with '${new_image}'"
         jq --arg a "${cur_image}" --arg b "${new_image}"  '.images[$a] = $b' "${MICROSHIFT_ROOT}/assets/release/release-${ARCH}.json" >"${temp_json}"
@@ -62,7 +83,7 @@ replace_base_assets() {
     done
 
     # Update the infra pods for crio
-    local -r pod_image=$(oc_release_info "${okd_url}" "${okd_releaseTag}" "pod")
+    local -r pod_image=$(resolve_arch_digest "$(oc_release_info "${okd_url}" "${okd_releaseTag}" "pod")")
     sed -i 's,pause_image .*,pause_image = '"\"${pod_image}\""',' "${MICROSHIFT_ROOT}/packaging/crio.conf.d/10-microshift_${UNAME_TO_GOARCH_MAP[${ARCH}]}.conf"
 }
 
@@ -181,7 +202,7 @@ replace_multus_assets() {
 
     for container in multus-cni-microshift containernetworking-plugins-microshift ; do
         local image_with_hash
-        image_with_hash=$(oc_release_info "${okd_url}" "${okd_releaseTag}" "${container}")
+        image_with_hash=$(resolve_arch_digest "$(oc_release_info "${okd_url}" "${okd_releaseTag}" "${container}")")
         echo "[${ARCH}] Replacing '${container}' with '${image_with_hash}'"
         local image_name="${image_with_hash%%@*}"
         local image_hash="${image_with_hash##*@}"
