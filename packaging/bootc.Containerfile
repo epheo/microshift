@@ -7,10 +7,12 @@
 #   - Multus is installed and enabled (microshift-multus ships the config.d
 #     toggle and the cri-o default-network drop-in).
 #   - TopoLVM replaces LVMS as the storage driver (community subpackage).
-#   - portail is the edge/ingress component: its image is embedded as an OCI
-#     archive and imported into cri-o's store at boot, so a cold boot needs no
-#     registry. The openshift-router stays available but sites are expected to
-#     set ingress Removed.
+#   - Air-gapped by default: the full MicroShift payload (every ref in the
+#     installed release-info JSONs) is embedded as a shared-blob OCI layout
+#     and imported into cri-o's store at boot — first boot needs no registry.
+#   - portail is the edge/ingress component: its image is embedded and
+#     imported the same way. The openshift-router stays available (and
+#     embedded) but sites are expected to set ingress Removed.
 #   - greenboot health gating stays fully enabled: a broken update must roll
 #     back on its own.
 #
@@ -53,7 +55,8 @@ RUN ${REPO_CONFIG_SCRIPT} -create ${USHIFT_RPM_REPO_PATH} && \
         microshift-topolvm \
         microshift-topolvm-release-info \
         microshift-greenboot \
-        skopeo && \
+        skopeo \
+        jq && \
     ${REPO_CONFIG_SCRIPT} -delete && \
     rm -vf  ${REPO_CONFIG_SCRIPT} && \
     rm -rvf ${USHIFT_RPM_REPO_PATH} && \
@@ -74,10 +77,19 @@ RUN test -f /etc/containers/policy.json || \
 COPY --chmod=755 ./src/rpm/postinstall.sh ${USHIFT_POSTINSTALL_SCRIPT}
 RUN ${USHIFT_POSTINSTALL_SCRIPT} && rm -vf "${USHIFT_POSTINSTALL_SCRIPT}"
 
+# Embed the full MicroShift payload under /usr/lib/embedded-images.
+# import-embedded-images.service imports every manifest entry into cri-o's
+# graphroot before MicroShift starts, so an air-gapped first boot works out
+# of the box. The list is derived from the installed release-info JSONs at
+# build time; a payload bump cannot silently reintroduce a first-boot pull.
+COPY --chmod=755 ./src/embedded-images/embed-release-images.sh /tmp/embed-release-images.sh
+RUN /tmp/embed-release-images.sh && rm -vf /tmp/embed-release-images.sh
+
 # Embed the portail image as an OCI archive under /usr/lib/embedded-images.
-# import-embedded-images.service imports every archive listed in the manifest
-# into cri-o's graphroot before MicroShift starts; manifests reference
-# localhost/embedded/<name>:<tag> with imagePullPolicy: IfNotPresent.
+# Kept as a separate archive (not the payload layout): site layers follow
+# this exact tar + manifest-line pattern and it shares no blobs with the
+# payload anyway. Workloads reference localhost/embedded/<name>:<tag> with
+# imagePullPolicy: IfNotPresent.
 RUN mkdir -p /usr/lib/embedded-images && \
     name="${PORTAIL_IMAGE##*/}" && \
     tar="/usr/lib/embedded-images/${name%%:*}.tar" && \

@@ -7,6 +7,8 @@
 # The opinion assertions are functional, not existence checks: a PVC is
 # provisioned and written, an OVN-K layer2 secondary network is attached,
 # and the embedded portail image is started with pull policy Never.
+# The fresh-install VM runs with zero egress (restrict=on): going GREEN
+# proves the air-gapped first boot the embedded payload exists for.
 #
 # With UPGRADE_FROM set, the same suite runs on an upgraded system instead
 # of a fresh install: boot a qcow2 built from the previously published
@@ -208,6 +210,13 @@ sudo test -f "${DISK}" || { echo "ERROR: ${DISK} was not produced" >&2; exit 1; 
 # --- 4. Boot the VM -----------------------------------------------------------
 ACCEL="tcg"
 [ -e /dev/kvm ] && ACCEL="kvm"
+
+# Air-gapped first boot is part of the distribution's contract: a fresh
+# install must go GREEN with zero guest egress (restrict=on still allows
+# the inbound ssh hostfwd). Upgrade mode needs egress to reach the host
+# registry at 10.0.2.2 for bootc switch.
+NET_RESTRICT="restrict=on,"
+[ -n "${UPGRADE_FROM}" ] && NET_RESTRICT=""
 log "booting VM (accel=${ACCEL}) with a secondary disk for the TopoLVM VG"
 # The packaged lvmd device-class reserves spare-gb 10; the VG must exceed
 # that plus the PVC probe or TopoLVM reports zero allocatable capacity.
@@ -216,7 +225,7 @@ sudo qemu-system-x86_64 \
     -machine "accel=${ACCEL}" -cpu max -smp "$(nproc)" -m "${VM_MEM}" \
     -drive "file=${DISK},if=virtio,format=qcow2" \
     -drive "file=${WORKDIR}/lvm-disk.raw,if=virtio,format=raw" \
-    -netdev "user,id=n0,hostfwd=tcp::${SSH_PORT}-:22" \
+    -netdev "user,id=n0,${NET_RESTRICT}hostfwd=tcp::${SSH_PORT}-:22" \
     -device virtio-net-pci,netdev=n0 \
     -device virtio-rng-pci \
     -serial "file:${WORKDIR}/console.log" \
@@ -309,6 +318,11 @@ koc -n topolvm-system get pods --no-headers | grep -q Running
 
 log "assert: embedded portail image was imported into cri-o at boot"
 vssh crictl images | grep -q 'localhost/embedded/portail'
+
+# Rerunning the import must find every manifest entry already in the store:
+# proves the boot import covered the whole payload and stayed idempotent.
+log "assert: the whole embedded payload is in cri-o's store"
+vssh /usr/bin/import-embedded-images.sh | { ! grep -q '^importing'; }
 
 # Functional probes reuse an image already on the node (the OVN-K image):
 # no extra registry pull, no docker.io rate limits.
