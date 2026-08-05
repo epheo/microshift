@@ -41,6 +41,16 @@ diagnostics() {
     koc get pods -A -o wide 2>&1 || true
     log "DIAGNOSTICS: csr"
     koc get csr 2>&1 || true
+    log "DIAGNOSTICS: events (FailedCreatePodSandBox carries the CNI error)"
+    koc get events -A --sort-by='.metadata.creationTimestamp' 2>&1 | tail -50 || true
+    # The OVN pods are the CNI brain; dump them even when Ready, since a
+    # hanging CNI ADD leaves them green while everything else is stuck.
+    koc get pods -n openshift-ovn-kubernetes --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null \
+    | while read -r pod; do
+        log "DIAGNOSTICS: logs of openshift-ovn-kubernetes/${pod} (last 80 lines per container, errors and tail)"
+        koc logs -n openshift-ovn-kubernetes "${pod}" --all-containers --tail=-1 </dev/null 2>&1 | grep -E '^[EFW][0-9]{4}|error|failed' | tail -30 || true
+        koc logs -n openshift-ovn-kubernetes "${pod}" --all-containers --tail=25 </dev/null 2>&1 || true
+    done
     # The journals only show kubelet-level restarts; the actual crash reason
     # lives in the container logs of whatever is not Running/Ready.
     koc get pods -A --no-headers 2>/dev/null | awk '
