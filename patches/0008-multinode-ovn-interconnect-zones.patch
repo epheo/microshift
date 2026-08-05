@@ -536,7 +536,7 @@ index 7da633ec..6daac001 100644
          configMap:
            name: ovnkube-config
 diff --git a/assets/components/ovn/multi-node/node/daemonset.yaml b/assets/components/ovn/multi-node/node/daemonset.yaml
-index 4d460606..b7fdc4a5 100644
+index 4d460606..d31f98f6 100644
 --- a/assets/components/ovn/multi-node/node/daemonset.yaml
 +++ b/assets/components/ovn/multi-node/node/daemonset.yaml
 @@ -6,7 +6,12 @@ metadata:
@@ -553,7 +553,7 @@ index 4d460606..b7fdc4a5 100644
  spec:
    selector:
      matchLabels:
-@@ -21,23 +26,276 @@ spec:
+@@ -21,23 +26,292 @@ spec:
          target.workload.openshift.io/management: '{"effect": "PreferredDuringScheduling"}'
        labels:
          app: ovnkube-node
@@ -690,6 +690,18 @@ index 4d460606..b7fdc4a5 100644
 +                set -x
 +                rm -f /var/run/ovn/ovnnb_db.pid
 +
++                # Name this database's interconnect zone after the node; the
++                # zone controller blocks on "NBDB zone to match" until it is.
++                retries=0
++                while [[ "${retries}" -lt 20 ]]; do
++                  if ovn-nbctl -t 5 set nb_global . name="${K8S_NODE}" options:name="${K8S_NODE}"; then
++                    echo "Set the IC zone to ${K8S_NODE}"
++                    break
++                  fi
++                  sleep 2
++                  (( retries += 1 ))
++                done
++
 +                #configure northd_probe_interval
 +                northd_probe_interval=${OVN_NORTHD_PROBE_INTERVAL:-10000}
 +                echo "Setting northd probe interval to ${northd_probe_interval} ms"
@@ -736,6 +748,10 @@ index 4d460606..b7fdc4a5 100644
 +          value: info
 +        - name: OVN_NORTHD_PROBE_INTERVAL
 +          value: "5000"
++        - name: K8S_NODE
++          valueFrom:
++            fieldRef:
++              fieldPath: spec.nodeName
 +        volumeMounts:
 +        - mountPath: /run/openvswitch/
 +          name: run-openvswitch
@@ -838,7 +854,7 @@ index 4d460606..b7fdc4a5 100644
        # ovn-controller: programs the vswitch with flows from the sbdb
        - name: ovn-controller
          image: {{ .ReleaseImage.ovn_kubernetes_microshift }}
-@@ -94,14 +352,16 @@ spec:
+@@ -94,14 +368,16 @@ spec:
            name: node-log
          - mountPath: /dev/log
            name: log-socket
@@ -858,7 +874,7 @@ index 4d460606..b7fdc4a5 100644
          image: {{ .ReleaseImage.ovn_kubernetes_microshift }}
          command:
          - /bin/bash
-@@ -115,7 +375,7 @@ spec:
+@@ -115,7 +391,7 @@ spec:
            fi
  
            # K8S_NODE_IP triggers reconcilation of this daemon when node IP changes
@@ -867,7 +883,7 @@ index 4d460606..b7fdc4a5 100644
  
            echo "I$(date "+%m%d %H:%M:%S.%N") - copy ovn-k8s-cni-overlay"
            cp -f /usr/libexec/cni/ovn-k8s-cni-overlay /cni-bin-dir/
-@@ -130,6 +390,8 @@ spec:
+@@ -130,6 +406,8 @@ spec:
            gateway_mode_flags="--gateway-mode local --gateway-interface br-ex"
  
            sysctl net.ipv4.ip_forward=1
@@ -876,7 +892,7 @@ index 4d460606..b7fdc4a5 100644
  
            gw_interface_flag=
            # if br-ex1 is configured on the node, we want to use it for external gateway traffic
-@@ -138,16 +400,20 @@ spec:
+@@ -138,16 +416,20 @@ spec:
              # the functionality depends on ip_forwarding being enabled
            fi
  
@@ -899,7 +915,7 @@ index 4d460606..b7fdc4a5 100644
          lifecycle:
            preStop:
              exec:
-@@ -168,8 +434,6 @@ spec:
+@@ -168,8 +450,6 @@ spec:
            name: run-ovn
          - mountPath: /run/ovnkube-config/
            name: ovnkube-config
@@ -908,7 +924,7 @@ index 4d460606..b7fdc4a5 100644
          - mountPath: /env
            name: env-overrides
          - mountPath: /etc/cni/net.d
-@@ -178,19 +442,21 @@ spec:
+@@ -178,19 +458,21 @@ spec:
            name: host-cni-bin
          - mountPath: /run/ovn-kubernetes/
            name: host-run-ovn-kubernetes
@@ -934,7 +950,7 @@ index 4d460606..b7fdc4a5 100644
          resources:
            requests:
              cpu: 10m
-@@ -209,7 +475,6 @@ spec:
+@@ -209,7 +491,6 @@ spec:
          securityContext:
            privileged: true
          terminationMessagePolicy: FallbackToLogsOnError
@@ -942,7 +958,7 @@ index 4d460606..b7fdc4a5 100644
        nodeSelector:
          kubernetes.io/os: "linux"
        volumes:
-@@ -217,6 +482,12 @@ spec:
+@@ -217,6 +498,12 @@ spec:
        - name: systemd-units
          hostPath:
            path: /etc/systemd/system
@@ -955,7 +971,7 @@ index 4d460606..b7fdc4a5 100644
        # used for iptables wrapper scripts
        - name: host-slash
          hostPath:
-@@ -230,16 +501,6 @@ spec:
+@@ -230,16 +517,6 @@ spec:
        - name: etc-openvswitch
          hostPath:
            path: /etc/openvswitch
@@ -972,7 +988,7 @@ index 4d460606..b7fdc4a5 100644
        # Used for placement of ACL audit logs
        - name: node-log
          hostPath:
-@@ -247,7 +508,6 @@ spec:
+@@ -247,7 +524,6 @@ spec:
        - name: log-socket
          hostPath:
            path: /dev/log
@@ -980,7 +996,7 @@ index 4d460606..b7fdc4a5 100644
        # For CNI server
        - name: host-run-ovn-kubernetes
          hostPath:
-@@ -258,12 +518,6 @@ spec:
+@@ -258,12 +534,6 @@ spec:
        - name: host-cni-bin
          hostPath:
            path: "/run/cni/bin"
