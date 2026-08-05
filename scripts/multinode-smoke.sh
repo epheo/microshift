@@ -41,6 +41,16 @@ diagnostics() {
     koc get pods -A -o wide 2>&1 || true
     log "DIAGNOSTICS: csr"
     koc get csr 2>&1 || true
+    # The journals only show kubelet-level restarts; the actual crash reason
+    # lives in the container logs of whatever is not Running/Ready.
+    koc get pods -A --no-headers 2>/dev/null | awk '
+        $4=="Completed" || $4=="Succeeded" {next}
+        {split($3,a,"/"); if ($4!="Running" || a[1]!=a[2]) print $1" "$2}' \
+    | while read -r ns pod; do
+        log "DIAGNOSTICS: logs of ${ns}/${pod} (last 60 lines per container)"
+        koc logs -n "${ns}" "${pod}" --all-containers --tail=60 2>&1 || true
+        koc logs -n "${ns}" "${pod}" --all-containers --tail=30 --previous 2>&1 || true
+    done
     log "DIAGNOSTICS: controller microshift journal (last 40 lines)"
     cexec journalctl -u microshift --no-pager -n 40 2>&1 || true
     log "DIAGNOSTICS: worker microshift journal (last 80 lines)"
