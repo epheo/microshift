@@ -48,8 +48,10 @@ diagnostics() {
         {split($3,a,"/"); if ($4!="Running" || a[1]!=a[2]) print $1" "$2}' \
     | while read -r ns pod; do
         log "DIAGNOSTICS: logs of ${ns}/${pod} (last 60 lines per container)"
-        koc logs -n "${ns}" "${pod}" --all-containers --tail=60 2>&1 || true
-        koc logs -n "${ns}" "${pod}" --all-containers --tail=30 --previous 2>&1 || true
+        # </dev/null: cexec runs podman exec -i, which otherwise swallows the
+        # pod list feeding this loop and only the first pod gets dumped.
+        koc logs -n "${ns}" "${pod}" --all-containers --tail=60 </dev/null 2>&1 || true
+        koc logs -n "${ns}" "${pod}" --all-containers --tail=30 --previous </dev/null 2>&1 || true
     done
     log "DIAGNOSTICS: controller microshift journal (last 40 lines)"
     cexec journalctl -u microshift --no-pager -n 40 2>&1 || true

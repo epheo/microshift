@@ -1,8 +1,8 @@
 diff --git a/assets/components/ovn/common/clusterrole-controller.yaml b/assets/components/ovn/common/clusterrole-controller.yaml
-index be69d281..256dd883 100644
+index be69d281..5615de7a 100644
 --- a/assets/components/ovn/common/clusterrole-controller.yaml
 +++ b/assets/components/ovn/common/clusterrole-controller.yaml
-@@ -115,3 +115,17 @@ rules:
+@@ -115,3 +115,29 @@ rules:
  - apiGroups: ['authorization.k8s.io']
    resources: ['subjectaccessreviews']
    verbs: ['create']
@@ -20,6 +20,18 @@ index be69d281..256dd883 100644
 +  - update
 +  - patch
 +  - delete
++# enable-multi-network makes the shared informer factory list these at
++# startup; a forbidden response is fatal for every ovnkube process.
++- apiGroups: ["k8s.cni.cncf.io"]
++  resources:
++  - network-attachment-definitions
++  verbs:
++  - get
++  - list
++  - watch
++  - create
++  - update
++  - patch
 diff --git a/assets/components/ovn/common/configmap.yaml b/assets/components/ovn/common/configmap.yaml
 index c6abdd4c..db815fe7 100644
 --- a/assets/components/ovn/common/configmap.yaml
