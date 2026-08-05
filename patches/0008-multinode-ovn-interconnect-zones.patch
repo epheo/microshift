@@ -1189,7 +1189,7 @@ index 86c06cb8..574acfe2 100644
  // (healthcheck, greenboot) can tell a worker from a control plane node.
  func WorkerMarkerPath() string {
 diff --git a/pkg/node/netconfig.go b/pkg/node/netconfig.go
-index ed338cc7..0e1f2ce5 100644
+index ed338cc7..e86efdf6 100644
 --- a/pkg/node/netconfig.go
 +++ b/pkg/node/netconfig.go
 @@ -38,6 +38,9 @@ const (
@@ -1232,7 +1232,7 @@ index ed338cc7..0e1f2ce5 100644
  		}
  		close(stopChan)
  	}()
-@@ -153,3 +165,99 @@ func (n *NetworkConfiguration) removeServiceIPLoopback() error {
+@@ -153,3 +165,136 @@ func (n *NetworkConfiguration) removeServiceIPLoopback() error {
  	}
  	return nil
  }
@@ -1253,6 +1253,11 @@ index ed338cc7..0e1f2ce5 100644
 +		// until it exists.
 +		return fmt.Errorf("worker node needs %s: %w", ovn.OVNGatewayInterface, err)
 +	}
++
++	// A node repurposed from controller to worker still carries the
++	// advertise address from its control plane life; a local address wins
++	// over any route, so it would swallow all apiserver endpoint traffic.
++	n.removeAdvertiseAddresses()
 +
 +	nodeAddr, err := netlink.ParseAddr(fmt.Sprintf("%s/32", n.nodeIP))
 +	if err != nil {
@@ -1329,6 +1334,38 @@ index ed338cc7..0e1f2ce5 100644
 +	if addr, err := netlink.ParseAddr(fmt.Sprintf("%s/32", n.nodeIP)); err == nil {
 +		if err := netlink.AddrDel(link, addr); err != nil {
 +			klog.Warningf("failed to remove %s from %s: %v", n.nodeIP, ovn.OVNGatewayInterface, err)
++		}
++	}
++}
++
++func (n *NetworkConfiguration) removeAdvertiseAddresses() {
++	for _, name := range []string{ovn.OVNGatewayInterface, loopbackInterface} {
++		link, err := netlink.LinkByName(name)
++		if err != nil {
++			continue
++		}
++		for _, entry := range n.kasAdvertiseAddresses {
++			prefix := 32
++			if net.ParseIP(entry).To4() == nil {
++				prefix = 128
++			}
++			addr, err := netlink.ParseAddr(fmt.Sprintf("%s/%d", entry, prefix))
++			if err != nil {
++				continue
++			}
++			existing, err := netlink.AddrList(link, netlink.FAMILY_ALL)
++			if err != nil {
++				continue
++			}
++			for _, existingAddr := range existing {
++				if addr.Equal(existingAddr) {
++					if err := netlink.AddrDel(link, addr); err != nil {
++						klog.Warningf("failed to remove stale advertise address %s from %s: %v", entry, name, err)
++					} else {
++						klog.Infof("removed stale advertise address %s from %s", entry, name)
++					}
++				}
++			}
 +		}
 +	}
 +}
