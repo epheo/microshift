@@ -33,17 +33,15 @@ index be69d281..5615de7a 100644
 +  - update
 +  - patch
 diff --git a/assets/components/ovn/common/configmap.yaml b/assets/components/ovn/common/configmap.yaml
-index c6abdd4c..db815fe7 100644
+index c6abdd4c..1c0051b0 100644
 --- a/assets/components/ovn/common/configmap.yaml
 +++ b/assets/components/ovn/common/configmap.yaml
-@@ -17,7 +17,13 @@ data:
+@@ -17,7 +17,11 @@ data:
      [kubernetes]
      service-cidrs={{.ServiceCIDR}}
      ovn-config-namespace="openshift-ovn-kubernetes"
 +{{- if .MultiNodeEnabled }}
 +    apiserver=https://{{.MultiNodeControlplane}}:6443
-+    tokenFile=/var/run/secrets/kubernetes.io/serviceaccount/token
-+    cacert=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
 +{{- else }}
      kubeconfig={{.KubeconfigPath}}
 +{{- end }}
