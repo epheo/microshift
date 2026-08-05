@@ -13,7 +13,8 @@ Published at `ghcr.io/epheo/microshift`.
 | OVN secondary networks work out of the box | `patches/0001` adds `enable-multi-network=true` to the ovnkube-config template at the source |
 | Multus enabled | `microshift-multus` (config.d toggle + cri-o default-network drop-in) |
 | TopoLVM is the storage driver | community subpackage merged into the spec (LVMS is not in the OKD payload) |
-| [portail](https://github.com/epheo/portail) is the edge | its image is embedded as an OCI archive and imported into cri-o at boot — cold boot needs no registry |
+| Air-gapped by default | the full MicroShift payload is embedded as a shared-blob OCI layout and imported into cri-o at boot — first boot needs no registry |
+| [portail](https://github.com/epheo/portail) is the edge | its image is embedded and imported the same way |
 | Updates must be safe | greenboot MicroShift health gate stays enabled; bootc rollback does the rest |
 | Logs are signal, not noise | `patches/0002` (etcd logs every request at warn — missing threshold default) and `patches/0003` (router status watcher hot-loops when `ingress.status: Removed`) |
 | Every image can be controller or worker | `microshift-profile` selects the role; `patches/0006`+`0007` add a worker mode where nodes hold no signing keys |
@@ -36,8 +37,8 @@ Three container stages, driven by `make` and pinned by `versions.env`:
 2. **`packaging/rpm.Containerfile`** — rebuild the SRPM into el10 RPMs in a
    CentOS Stream 10 buildroot (`microshift_variant community`).
 3. **`packaging/bootc.Containerfile`** — install the RPM selection onto
-   `centos-bootc:stream10`, embed portail, enable the boot import service and
-   greenboot.
+   `centos-bootc:stream10`, embed the MicroShift payload and portail, enable
+   the boot import service and greenboot.
 
 Runtime dependencies (cri-o, openvswitch, openshift-clients, …) come from the
 public `mirror.openshift.com` dependencies repo. Payload images come from the
@@ -55,8 +56,9 @@ make version               # print the version string of the built RPMs
 ```
 
 `vm-test` is the CI gate — it validates what the container smoke cannot:
-bootloader, ostree deployment, boot ordering, and greenboot actually gating
-the boot. Its opinion assertions are functional, not existence checks: a PVC
+bootloader, ostree deployment, boot ordering, greenboot actually gating
+the boot, and the air-gapped contract (the fresh-install VM has zero
+egress). Its opinion assertions are functional, not existence checks: a PVC
 is provisioned and written (TopoLVM), an OVN-K layer2 secondary network is
 attached through a NetworkAttachmentDefinition, the embedded portail
 image is started from cri-o's store with pull policy Never, and steady-state

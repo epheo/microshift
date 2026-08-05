@@ -7,6 +7,8 @@
 # The opinion assertions are functional, not existence checks: a PVC is
 # provisioned and written, an OVN-K layer2 secondary network is attached,
 # and the embedded portail image is started with pull policy Never.
+# The fresh-install VM runs with zero egress (restrict=on): going GREEN
+# proves the air-gapped first boot the embedded payload exists for.
 #
 # With UPGRADE_FROM set, the same suite runs on an upgraded system instead
 # of a fresh install: boot a qcow2 built from the previously published
@@ -44,10 +46,15 @@ log() { echo "--- $*"; }
 QEMU_PID=""
 cleanup() {
     rc=$?
+    # Collect in-VM state while the guest is still reachable, before killing it.
+    if [ ${rc} -ne 0 ]; then
+        log "FAILED (rc=${rc}); collecting diagnostics"
+        dump_diag || true
+    fi
     [ -n "${QEMU_PID}" ] && sudo kill "${QEMU_PID}" 2>/dev/null || true
     [ -n "${UPGRADE_FROM}" ] && sudo podman rm -f "${REG_NAME}" 2>/dev/null || true
     if [ ${rc} -ne 0 ]; then
-        log "FAILED (rc=${rc}) — last 60 lines of VM console:"
+        log "last 60 lines of VM console:"
         sudo tail -60 "${WORKDIR}/console.log" 2>/dev/null || true
     fi
     exit ${rc}
@@ -66,6 +73,31 @@ vssh() {
 
 KCFG=/var/lib/microshift/resources/kubeadmin/kubeconfig
 koc() { vssh oc --kubeconfig "${KCFG}" "$@"; }
+
+# A NotReady node is usually a CNI (OVN-K) or crio failure, none of which reach
+# the serial console (they log to journald). Write the full state to a file the
+# workflow uploads as an artifact, and tail it to the job log for quick triage.
+# All best-effort: the guest may be half-up, so nothing here may fail cleanup.
+dump_diag() {
+    local ns=openshift-ovn-kubernetes
+    local out="${WORKDIR}/diag.log"
+    {
+        echo "### journalctl -u microshift (this boot) ###"
+        vssh journalctl -u microshift --no-pager -b 2>&1
+        echo "### nodes ###"; koc get nodes -o wide 2>&1
+        echo "### pods -A ###"; koc get pods -A -o wide 2>&1
+        echo "### ${ns} describe ###"; koc -n "${ns}" describe pods 2>&1
+        echo "### ${ns} logs ###"
+        for p in $(koc -n "${ns}" get pods -o name 2>/dev/null); do
+            echo "--- ${p} ---"
+            koc -n "${ns}" logs "${p}" --all-containers --prefix --tail=300 2>&1
+        done
+        echo "### journalctl -u crio (this boot) ###"
+        vssh journalctl -u crio --no-pager -b 2>&1
+    } > "${out}" 2>&1 || true
+    log "diagnostics written to ${out} (uploaded as an artifact); tail:"
+    tail -n 150 "${out}" 2>/dev/null || true
+}
 
 wait_ssh() {
     log "waiting for ssh (up to 10m)"
@@ -208,6 +240,17 @@ sudo test -f "${DISK}" || { echo "ERROR: ${DISK} was not produced" >&2; exit 1; 
 # --- 4. Boot the VM -----------------------------------------------------------
 ACCEL="tcg"
 [ -e /dev/kvm ] && ACCEL="kvm"
+
+# Air-gapped first boot is part of the distribution's contract: a fresh
+# install must go GREEN with zero guest egress (restrict=on still allows
+# the inbound ssh hostfwd). Upgrade mode needs egress to reach the host
+# registry at 10.0.2.2 for bootc switch.
+# ipv6=off: slirp's fec0:: router advertisement lands before the DHCPv4
+# lease, MicroShift then auto-selects IPv6 single-stack with a site-local
+# node IP and OVN-K never reaches node readiness. The target sites are
+# IPv4; keep the test VM IPv4-only.
+NET_RESTRICT="restrict=on,"
+[ -n "${UPGRADE_FROM}" ] && NET_RESTRICT=""
 log "booting VM (accel=${ACCEL}) with a secondary disk for the TopoLVM VG"
 # The packaged lvmd device-class reserves spare-gb 10; the VG must exceed
 # that plus the PVC probe or TopoLVM reports zero allocatable capacity.
@@ -216,7 +259,7 @@ sudo qemu-system-x86_64 \
     -machine "accel=${ACCEL}" -cpu max -smp "$(nproc)" -m "${VM_MEM}" \
     -drive "file=${DISK},if=virtio,format=qcow2" \
     -drive "file=${WORKDIR}/lvm-disk.raw,if=virtio,format=raw" \
-    -netdev "user,id=n0,hostfwd=tcp::${SSH_PORT}-:22" \
+    -netdev "user,id=n0,ipv6=off,${NET_RESTRICT}hostfwd=tcp::${SSH_PORT}-:22" \
     -device virtio-net-pci,netdev=n0 \
     -device virtio-rng-pci \
     -serial "file:${WORKDIR}/console.log" \
@@ -309,6 +352,11 @@ koc -n topolvm-system get pods --no-headers | grep -q Running
 
 log "assert: embedded portail image was imported into cri-o at boot"
 vssh crictl images | grep -q 'localhost/embedded/portail'
+
+# Rerunning the import must find every manifest entry already in the store:
+# proves the boot import covered the whole payload and stayed idempotent.
+log "assert: the whole embedded payload is in cri-o's store"
+vssh /usr/bin/import-embedded-images.sh | { ! grep -q '^importing'; }
 
 # Functional probes reuse an image already on the node (the OVN-K image):
 # no extra registry pull, no docker.io rate limits.
