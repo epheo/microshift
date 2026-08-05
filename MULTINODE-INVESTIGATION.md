@@ -219,12 +219,25 @@ rest), and naming each node's NBDB zone in nbdb post-start
   same wall; multinode at this tag only makes sense with a single
   master-labeled node.
 
-## Next steps
+## Resolution (2026-08-05, run 31010457141)
 
-- multinode-smoke in CI (.github/workflows/multinode-smoke.yaml,
-  push-triggered on multinode-worker) is the iteration loop; the
-  controller side converged run by run, the worker join and the
-  cross-zone dataplane (transit switch routes, geneve between the
-  nodes) are the layers still to prove.
-- Retire the dual-control-plane path in the harness as a bug repro
-  only; the gate for the fix is the worker join.
+MULTINODE SMOKE TEST PASSED end to end on the worker topology:
+worker Ready with worker-only labels, no signing material, CSR
+bootstrap + serving cert flow, apiserver to kubelet TLS, OVN and
+DNS pods Running and Ready on the worker (the CNI config that this
+whole investigation was about gets written), healthcheck gating.
+Two last worker-side fixes after the zone rewrite: br-ex carries
+the node IP as a /32 alias (gateway init refuses an IP-less
+interface), and the virtual advertise address is routed via the
+control plane IP that add-node --worker records in the worker
+marker, so pod traffic to the apiserver endpoint leaves the node.
+That route is the direct fix for the very first piece of evidence
+collected here (the endpoint dead-ending on the joined node).
+
+## Remaining, beyond the smoke
+
+- Two-VM vm-test join scenario (bootc deploy + greenboot gating).
+- Cross-node pod-to-pod and pod-to-service traffic depth beyond
+  the readiness probes the smoke asserts.
+- The dual-control-plane path stays a bug repro only; upstream
+  proposal material: worker role series (patches/0006-0008).
