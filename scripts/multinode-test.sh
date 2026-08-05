@@ -335,8 +335,18 @@ echo "${apiserver_code}" | grep -qE '200|401|403' \
     || die "apiserver VIP unreachable from a worker pod (got '${apiserver_code}')"
 
 # --- 7. greenboot gates both roles ---------------------------------------------
+# Run the packaged check scripts directly: that is exactly what greenboot
+# executes, without re-arming the boot-status/rollback machinery mid-life,
+# and the failing check's own output lands in the log.
 log "assert: greenboot health checks pass on both nodes"
-v1 systemctl start greenboot-healthcheck || die "greenboot red on the controller"
-v2 systemctl start greenboot-healthcheck || die "greenboot red on the worker"
+greenboot_checks() { # greenboot_checks <vssh-fn> <label>
+    $1 sh -c 'rc=0; for s in /usr/lib/greenboot/check/required.d/*.sh /etc/greenboot/check/required.d/*.sh; do
+        [ -e "$s" ] || continue
+        echo "== $s"
+        if ! "$s"; then echo "CHECK FAILED: $s"; rc=1; fi
+    done; exit $rc' || die "greenboot checks red on the $2"
+}
+greenboot_checks v1 controller
+greenboot_checks v2 worker
 
 log "MULTINODE TEST PASSED"
