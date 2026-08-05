@@ -101,17 +101,86 @@ run its symptom was multus timing out against the apiserver VIP:
    https://10.44.0.0:6443/healthz` answers "ok" locally, microshift
    is active, and `journalctl -u microshift -p err` is empty on node2.
    The API plane is fine end to end.
-2. OVN interconnect between the per-node zones is not established:
-   northd's "No path" plus the connected-loop suggest the transit
-   switch/chassis registration between zones never forms. Check
-   ovn-sbctl on each node for remote chassis / transit switch ports,
-   and whether microshift multinode expects ovn-ic daemons that are
-   not shipped/enabled. THIS IS NOW THE PRIME SUSPECT.
-3. The lease-holder design: if node2's CNI setup waits on a
-   cluster-singleton master that only programs node1's databases,
-   node2's zone is never programmed. Check which component writes the
-   joined node's logical switch in multinode mode. (Closely related
-   to 2; the fix likely answers both.)
+2. CONFIRMED, sharpened into the root cause below (2026-08-05,
+   static source analysis at tag 4.22.4-202607070723.p0).
+3. CONFIRMED as part of the same mechanism.
+
+## Root cause (confirmed statically, 2026-08-05)
+
+There is no OVN interconnect in microshift multinode at this tag.
+There are no zones, no transit switches, no ovn-ic daemons.
+The multi-node assets assume exactly one master-labeled node.
+Plain add-node creates a second one, and the topology collapses:
+
+- add-node joins etcd and brings up a full control plane on node2,
+  which self-labels master like any microshift node
+  (pkg/cmd/addnode.go; "What works" above shows both nodes with
+  the master role).
+- The multi-node ovnkube-master daemonset selects
+  node-role.kubernetes.io/master, so it lands on both nodes
+  (assets/components/ovn/multi-node/master/daemonset.yaml:471).
+- Each master pod bootstraps NB/SB with ovn-ctl run_nb_ovsdb using
+  only --db-nb-cluster-local-* flags; no --db-*-cluster-remote-addr
+  exists anywhere in the asset. Each node therefore runs its own
+  single-member raft: two disjoint OVN database pairs, never joined.
+- ovnkube-node and ovnkube-master pass no NB/SB address flags and
+  the ovnkube-config configmap has no [ovnnorth]/[ovnsouth]
+  sections, so every consumer defaults to the LOCAL unix sockets in
+  /run/ovn (hostPath). ovn-controller reads ovn-remote from local
+  OVS external_ids, which ovnkube-node sets from the same default.
+  Every node talks only to its own database.
+- ovnkube-master is a cluster-singleton lease ([masterha] in the
+  configmap). Node1 wins; node2's master loops forever (evidence
+  item: two masters, node2 stuck on the lease). The leader writes
+  node2's subnet and routes into NODE1's NB only.
+- Node2's chassis never registers in node1's SB (its ovn-controller
+  only knows its own empty SB), so node1's northd logs "No path for
+  static route 10.42.1.0/24". Node2's ovnkube-node waits on OVN
+  state that never arrives and never writes
+  /etc/cni/net.d/10-ovn-kubernetes.conf (the readinessProbe is
+  literally test -f on that file).
+- Bonus fight: both control planes run the components controller
+  and both render the cluster-scoped daemonsets with
+  OVN_NB/SB_DB_LIST = tcp:<own NodeIP>:664x, because
+  ConfigMultiNode hardcodes Controlplane = local NodeIP
+  (pkg/config/multinode.go:16) and add-node never records the real
+  controlplane IP. Last renderer wins; the endpoints flap.
+
+So the dual-control-plane join cannot work at this tag by
+construction. No firewall, DNS, or topology fix on our side changes
+that. pkg/config/multinode.go says it outright: "only one
+controlplane node is supported". Upstream's own
+scripts/multinode/configure-node.sh drives exactly the failing flow
+(plain add-node, full second control plane, no OVN wiring), so the
+upstream dev-preview flow is broken the same way; consistent with
+upstream's move toward an explicit worker role.
+
+Implication for the fix: the worker-role branch (patches 0006/0007)
+is not just hardening, it is the only topology these assets can
+support. One master-labeled node, workers without the master label,
+single OVN database pair on the controlplane.
+
+Deeper layer, found while fixing the worker (2026-08-05, CI runs
+30994415951..31002487265): pointing a worker at remote databases is
+not even possible. ovn-kubernetes removed central mode in this
+release; OVN DB connections are unix-socket only (the OvnAuthConfig
+comment says so outright) and there is no [ovnnorth]/[ovnsouth]
+address to configure. The single-node assets were already ported to
+the modern layout (--init-cluster-manager plus a combined
+--init-ovnkube-controller/--init-node container); the multi-node
+assets never were. patches/0008 rewrites them: every node runs its
+own interconnect zone (local nbdb/sbdb/northd/ovn-controller plus
+the combined zone controller with --zone), the master daemonset
+keeps only the cluster manager, and ovnkube authenticates with the
+pod service account against https://<controlplane>:6443 because
+CA-less workers have no kubeadmin kubeconfig to mount. Three
+follow-on fixes that surfaced one per CI run, each fatal only
+because SA auth made RBAC and startup checks real for the first
+time: the k8s.cni.cncf.io informer RBAC (enable-multi-network),
+the auth-priority rule that clears Token when the config file sets
+tokenFile (set only apiserver= and let SA autodetection fill the
+rest), and naming each node's NBDB zone in nbdb post-start
+(nb_global name/options:name, as CNO's script-lib does).
 
 ## Distro-level fixes already identified (independent of the bug)
 
@@ -138,14 +207,24 @@ run its symptom was multus timing out against the apiserver VIP:
   pods on node1 run fine; node2 failures are openshift-dns, multus,
   piraeus alike - anything needing CNI).
 
-## Open questions for the next session on this repo
+## Open questions, answered 2026-08-05
 
-- Does `microshift run --multinode` change advertiseAddress handling,
-  and does add-node bring up a full control plane on the secondary?
-  (openshift/microshift: cmd/microshift, pkg/config, addnode.go -
-  "initial cluster" log line comes from addnode.go:483.)
-- Is the 4.22 multinode flow validated upstream against OKD SCOS
-  payloads at all? The docs call multinode "not supported, test-only".
-- Since both members run full control planes, is there supposed to be
-  a per-zone ovnkube-master (no cluster-wide lease), and is the lease
-  contention in evidence item 2 itself the bug?
+- Does add-node bring up a full control plane on the secondary?
+  Yes: etcd member join plus the whole stack; node2 self-labels
+  master. That label is what doubles ovnkube-master.
+- Is there supposed to be a per-zone ovnkube-master? No. No zones,
+  no interconnect, singleton lease by design. The lease contention
+  is a symptom of the unsupported second master, not the bug itself.
+- Upstream validation: their own configure-node.sh flow hits the
+  same wall; multinode at this tag only makes sense with a single
+  master-labeled node.
+
+## Next steps
+
+- multinode-smoke in CI (.github/workflows/multinode-smoke.yaml,
+  push-triggered on multinode-worker) is the iteration loop; the
+  controller side converged run by run, the worker join and the
+  cross-zone dataplane (transit switch routes, geneve between the
+  nodes) are the layers still to prove.
+- Retire the dual-control-plane path in the harness as a bug repro
+  only; the gate for the fix is the worker join.
