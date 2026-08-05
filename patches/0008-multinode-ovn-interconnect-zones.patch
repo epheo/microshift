@@ -1,8 +1,18 @@
 diff --git a/assets/components/ovn/common/clusterrole-controller.yaml b/assets/components/ovn/common/clusterrole-controller.yaml
-index be69d281..5615de7a 100644
+index be69d281..8568a7ad 100644
 --- a/assets/components/ovn/common/clusterrole-controller.yaml
 +++ b/assets/components/ovn/common/clusterrole-controller.yaml
-@@ -115,3 +115,29 @@ rules:
+@@ -71,6 +71,9 @@ rules:
+ - apiGroups: [""]
+   resources:
+   - "nodes/status"
++  # The pod-networks annotation that unblocks every CNI ADD is written via
++  # the pods/status subresource; plain "pods" patch does not cover it.
++  - "pods/status"
+   verbs:
+   - patch
+   - update
+@@ -115,3 +118,29 @@ rules:
  - apiGroups: ['authorization.k8s.io']
    resources: ['subjectaccessreviews']
    verbs: ['create']
