@@ -174,9 +174,13 @@ boot_vm() { # boot_vm <n> <disk> <mac> <tap>
     local n=$1 disk=$2 mac=$3 tap=$4
     local accel=tcg
     [ -e /dev/kvm ] && accel=kvm
+    # Secondary disk: the TopoLVM VG (packaged lvmd device-class reserves
+    # spare-gb 10; the VG must exceed that or capacity reports zero).
+    sudo truncate --size=16G "${WORKDIR}/lvm-disk${n}.raw"
     sudo qemu-system-x86_64 \
         -machine "accel=${accel}" -cpu max -smp 4 -m "${VM_MEM}" \
         -drive "file=${disk},if=virtio,format=qcow2" \
+        -drive "file=${WORKDIR}/lvm-disk${n}.raw,if=virtio,format=raw" \
         -netdev "tap,id=n0,ifname=${tap},script=no,downscript=no" \
         -device "virtio-net-pci,netdev=n0,mac=${mac}" \
         -device virtio-rng-pci \
@@ -190,6 +194,10 @@ boot_vm 2 "${DISK2}" "${MAC2}" tap-ushift2
 
 retry 600 "node1 ssh reachable" v1 true
 retry 600 "node2 ssh reachable" v2 true
+
+log "provisioning the TopoLVM volume group on each node"
+v1 vgcreate -f -y myvg1 /dev/vdb
+v2 vgcreate -f -y myvg1 /dev/vdb
 
 # The single-node first boot must settle before reshaping either node:
 # it proves the image itself and pre-imports the embedded payload.
