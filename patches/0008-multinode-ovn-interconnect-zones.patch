@@ -59,7 +59,7 @@ index c6abdd4c..1c0051b0 100644
      platform-type="BareMetal"
  
 diff --git a/assets/components/ovn/multi-node/master/daemonset.yaml b/assets/components/ovn/multi-node/master/daemonset.yaml
-index 7da633ec..6daac001 100644
+index 0ef7e7a8..6daac001 100644
 --- a/assets/components/ovn/multi-node/master/daemonset.yaml
 +++ b/assets/components/ovn/multi-node/master/daemonset.yaml
 @@ -6,7 +6,10 @@ metadata:
@@ -91,7 +91,7 @@ index 7da633ec..6daac001 100644
          component: network
          type: infra
          openshift.io/component: network
-@@ -34,326 +34,10 @@ spec:
+@@ -34,330 +34,10 @@ spec:
        hostNetwork: true
        dnsPolicy: Default
        priorityClassName: "system-cluster-critical"
@@ -129,8 +129,8 @@ index 7da633ec..6daac001 100644
 -          echo "$(date -Iseconds) - starting ovn-northd"
 -          exec ovn-northd \
 -            --no-chdir "-vconsole:${OVN_LOG_LEVEL}" -vfile:off "-vPATTERN:console:%D{%Y-%m-%dT%H:%M:%S.###Z}|%05N|%c%T|%p|%m" \
--            --ovnnb-db "{{.OVN_NB_DB_LIST}}" \
--            --ovnsb-db "{{.OVN_SB_DB_LIST}}" \
+-            --ovnnb-db "tcp:${K8S_NODE_IP}:{{.OVN_NB_PORT}}" \
+-            --ovnsb-db "tcp:${K8S_NODE_IP}:{{.OVN_SB_PORT}}" \
 -            --pidfile /var/run/ovn/ovn-northd.pid &
 -
 -          wait $!
@@ -202,6 +202,8 @@ index 7da633ec..6daac001 100644
 -            --db-nb-cluster-local-proto=tcp \
 -            --no-monitor"
 -
+-          rm -f /run/ovn/ovnnb_db.sock
+-
 -          echo "$(date -Iseconds) - starting nbdb"
 -
 -          exec /usr/share/ovn/scripts/ovn-ctl \
@@ -238,7 +240,7 @@ index 7da633ec..6daac001 100644
 -                done
 -
 -                #configure northd_probe_interval
--                OVN_NB_CTL="ovn-nbctl --db "{{.OVN_NB_DB_LIST}}""
+-                OVN_NB_CTL="ovn-nbctl --no-leader-only"
 -                northd_probe_interval=${OVN_NORTHD_PROBE_INTERVAL:-10000}
 -                echo "Setting northd probe interval to ${northd_probe_interval} ms"
 -                retries=0
@@ -347,6 +349,8 @@ index 7da633ec..6daac001 100644
 -            --db-sb-cluster-local-proto=tcp \
 -            --no-monitor"
 -
+-          rm -f /run/ovn/ovnsb_db.sock
+-
 -          echo "$(date -Iseconds) - starting sbdb "
 -          exec /usr/share/ovn/scripts/ovn-ctl \
 -            ${OVN_ARGS} \
@@ -421,7 +425,7 @@ index 7da633ec..6daac001 100644
        - name: ovnkube-cluster-manager
          image: {{ .ReleaseImage.ovn_kubernetes_microshift }}
          command:
-@@ -383,8 +67,6 @@ spec:
+@@ -387,8 +67,6 @@ spec:
          volumeMounts:
          - mountPath: /run/ovnkube-config/
            name: ovnkube-config
@@ -430,7 +434,7 @@ index 7da633ec..6daac001 100644
          - mountPath: /env
            name: env-overrides
          resources:
-@@ -392,114 +74,10 @@ spec:
+@@ -396,114 +74,10 @@ spec:
              cpu: 10m
              memory: 10Mi
          terminationMessagePolicy: FallbackToLogsOnError
@@ -546,7 +550,7 @@ index 7da633ec..6daac001 100644
          configMap:
            name: ovnkube-config
 diff --git a/assets/components/ovn/multi-node/node/daemonset.yaml b/assets/components/ovn/multi-node/node/daemonset.yaml
-index 4d460606..d31f98f6 100644
+index 7d01ee56..d8797640 100644
 --- a/assets/components/ovn/multi-node/node/daemonset.yaml
 +++ b/assets/components/ovn/multi-node/node/daemonset.yaml
 @@ -6,7 +6,12 @@ metadata:
@@ -563,7 +567,7 @@ index 4d460606..d31f98f6 100644
  spec:
    selector:
      matchLabels:
-@@ -21,23 +26,292 @@ spec:
+@@ -21,23 +26,296 @@ spec:
          target.workload.openshift.io/management: '{"effect": "PreferredDuringScheduling"}'
        labels:
          app: ovnkube-node
@@ -679,6 +683,8 @@ index 4d460606..d31f98f6 100644
 +          db="nb"
 +          ovn_db_file="/etc/ovn/ovn${db}_db.db"
 +          OVN_ARGS="--db-nb-cluster-local-port=9643 --no-monitor"
++
++          rm -f /run/ovn/ovnnb_db.sock
 +
 +          echo "$(date -Iseconds) - starting nbdb"
 +          exec /usr/share/ovn/scripts/ovn-ctl \
@@ -815,6 +821,8 @@ index 4d460606..d31f98f6 100644
 +
 +          OVN_ARGS="--db-sb-cluster-local-port=9644 --no-monitor"
 +
++          rm -f /run/ovn/ovnsb_db.sock
++
 +          echo "$(date -Iseconds) - starting sbdb "
 +          exec /usr/share/ovn/scripts/ovn-ctl \
 +            ${OVN_ARGS} \
@@ -864,7 +872,22 @@ index 4d460606..d31f98f6 100644
        # ovn-controller: programs the vswitch with flows from the sbdb
        - name: ovn-controller
          image: {{ .ReleaseImage.ovn_kubernetes_microshift }}
-@@ -94,14 +368,16 @@ spec:
+@@ -55,14 +333,6 @@ spec:
+           # K8S_NODE_IP triggers reconcilation of this daemon when node IP changes
+           echo "$(date -Iseconds) - starting ovn-controller, Node: ${K8S_NODE} IP: ${K8S_NODE_IP}"
+ 
+-          # Wait for the SBDB unix socket to appear. The sbdb container
+-          # removes stale sockets and creates fresh ones on startup.
+-          # Connecting to a stale socket would cause ovn-controller to
+-          # cache a raft commit index higher than the fresh SBDB's.
+-          echo "Waiting for SBDB socket..."
+-          while [ ! -S /run/ovn/ovnsb_db.sock ]; do sleep 1; done
+-          echo "SBDB socket ready"
+-
+           exec ovn-controller unix:/var/run/openvswitch/db.sock -vfile:off \
+             --no-chdir --pidfile=/var/run/ovn/ovn-controller.pid \
+             --syslog-method="null" \
+@@ -102,14 +372,16 @@ spec:
            name: node-log
          - mountPath: /dev/log
            name: log-socket
@@ -884,7 +907,7 @@ index 4d460606..d31f98f6 100644
          image: {{ .ReleaseImage.ovn_kubernetes_microshift }}
          command:
          - /bin/bash
-@@ -115,7 +391,7 @@ spec:
+@@ -123,7 +395,7 @@ spec:
            fi
  
            # K8S_NODE_IP triggers reconcilation of this daemon when node IP changes
@@ -893,7 +916,7 @@ index 4d460606..d31f98f6 100644
  
            echo "I$(date "+%m%d %H:%M:%S.%N") - copy ovn-k8s-cni-overlay"
            cp -f /usr/libexec/cni/ovn-k8s-cni-overlay /cni-bin-dir/
-@@ -130,6 +406,8 @@ spec:
+@@ -138,6 +410,8 @@ spec:
            gateway_mode_flags="--gateway-mode local --gateway-interface br-ex"
  
            sysctl net.ipv4.ip_forward=1
@@ -902,7 +925,7 @@ index 4d460606..d31f98f6 100644
  
            gw_interface_flag=
            # if br-ex1 is configured on the node, we want to use it for external gateway traffic
-@@ -138,16 +416,20 @@ spec:
+@@ -146,16 +420,20 @@ spec:
              # the functionality depends on ip_forwarding being enabled
            fi
  
@@ -925,7 +948,7 @@ index 4d460606..d31f98f6 100644
          lifecycle:
            preStop:
              exec:
-@@ -168,8 +450,6 @@ spec:
+@@ -176,8 +454,6 @@ spec:
            name: run-ovn
          - mountPath: /run/ovnkube-config/
            name: ovnkube-config
@@ -934,7 +957,7 @@ index 4d460606..d31f98f6 100644
          - mountPath: /env
            name: env-overrides
          - mountPath: /etc/cni/net.d
-@@ -178,19 +458,21 @@ spec:
+@@ -186,19 +462,21 @@ spec:
            name: host-cni-bin
          - mountPath: /run/ovn-kubernetes/
            name: host-run-ovn-kubernetes
@@ -960,7 +983,7 @@ index 4d460606..d31f98f6 100644
          resources:
            requests:
              cpu: 10m
-@@ -209,7 +491,6 @@ spec:
+@@ -217,7 +495,6 @@ spec:
          securityContext:
            privileged: true
          terminationMessagePolicy: FallbackToLogsOnError
@@ -968,7 +991,7 @@ index 4d460606..d31f98f6 100644
        nodeSelector:
          kubernetes.io/os: "linux"
        volumes:
-@@ -217,6 +498,12 @@ spec:
+@@ -225,6 +502,12 @@ spec:
        - name: systemd-units
          hostPath:
            path: /etc/systemd/system
@@ -981,7 +1004,7 @@ index 4d460606..d31f98f6 100644
        # used for iptables wrapper scripts
        - name: host-slash
          hostPath:
-@@ -230,16 +517,6 @@ spec:
+@@ -238,16 +521,6 @@ spec:
        - name: etc-openvswitch
          hostPath:
            path: /etc/openvswitch
@@ -998,7 +1021,7 @@ index 4d460606..d31f98f6 100644
        # Used for placement of ACL audit logs
        - name: node-log
          hostPath:
-@@ -247,7 +524,6 @@ spec:
+@@ -255,7 +528,6 @@ spec:
        - name: log-socket
          hostPath:
            path: /dev/log
@@ -1006,7 +1029,7 @@ index 4d460606..d31f98f6 100644
        # For CNI server
        - name: host-run-ovn-kubernetes
          hostPath:
-@@ -258,12 +534,6 @@ spec:
+@@ -266,12 +538,6 @@ spec:
        - name: host-cni-bin
          hostPath:
            path: "/run/cni/bin"
@@ -1093,14 +1116,14 @@ index 7e16d79a..ecfc4138 100644
  	exists, err := util.PathExists(kubeconfigPath)
  	if err != nil {
 diff --git a/pkg/components/networking.go b/pkg/components/networking.go
-index 1e546661..60075a35 100644
+index 2e6ccad9..60075a35 100644
 --- a/pkg/components/networking.go
 +++ b/pkg/components/networking.go
-@@ -110,15 +110,16 @@ func startCNIPlugin(ctx context.Context, cfg *config.Config, kubeconfigPath stri
+@@ -110,13 +110,16 @@ func startCNIPlugin(ctx context.Context, cfg *config.Config, kubeconfigPath stri
  		return err
  	}
  
--	// Multinode only params: OVN_NB_DB_LIST, OVN_SB_DB_LIST, OVN_NB_PORT, OVN_SB_PORT
+-	// Multinode only params: OVN_NB_PORT, OVN_SB_PORT
 +	// Multinode renders ovnkube-config with service-account auth against the
 +	// controlplane apiserver: workers hold no kubeadmin kubeconfig, and OVN
 +	// databases are local-only since central mode was removed, so the old
@@ -1109,8 +1132,6 @@ index 1e546661..60075a35 100644
 -		"OVNConfig":      ovnConfig,
 -		"KubeconfigPath": kubeconfigPath,
 -		"KubeconfigDir":  filepath.Join(config.DataDir, "/resources/kubeadmin"),
--		"OVN_NB_DB_LIST": fmt.Sprintf("tcp:%s:%s", cfg.MultiNode.Controlplane, ovn.OVN_NB_PORT),
--		"OVN_SB_DB_LIST": fmt.Sprintf("tcp:%s:%s", cfg.MultiNode.Controlplane, ovn.OVN_SB_PORT),
 -		"OVN_NB_PORT":    ovn.OVN_NB_PORT,
 -		"OVN_SB_PORT":    ovn.OVN_SB_PORT,
 +		"OVNConfig":             ovnConfig,

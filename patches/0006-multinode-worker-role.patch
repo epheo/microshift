@@ -292,10 +292,10 @@ index 864876e8..7e16d79a 100644
  	secret, err := client.CoreV1().Secrets("kube-system").Get(ctx, name, metav1.GetOptions{})
  	if err != nil {
 diff --git a/pkg/cmd/run.go b/pkg/cmd/run.go
-index bd32bb87..cef16dcf 100644
+index 12bc989e..433f1fa0 100644
 --- a/pkg/cmd/run.go
 +++ b/pkg/cmd/run.go
-@@ -53,6 +53,7 @@ func NewRunMicroshiftCommand() *cobra.Command {
+@@ -54,6 +54,7 @@ func NewRunMicroshiftCommand() *cobra.Command {
  	}
  
  	var multinode bool
@@ -303,7 +303,7 @@ index bd32bb87..cef16dcf 100644
  
  	multinodeDefault := true
  	if version.Get().BuildVariant != version.BuildVariantCommunity {
-@@ -61,11 +62,13 @@ func NewRunMicroshiftCommand() *cobra.Command {
+@@ -62,11 +63,13 @@ func NewRunMicroshiftCommand() *cobra.Command {
  
  	flags := cmd.Flags()
  	flags.BoolVar(&multinode, "multinode", multinodeDefault, "enable multinode mode")
@@ -320,7 +320,7 @@ index bd32bb87..cef16dcf 100644
  		}
  	}
  
-@@ -86,7 +89,16 @@ func NewRunMicroshiftCommand() *cobra.Command {
+@@ -87,7 +90,16 @@ func NewRunMicroshiftCommand() *cobra.Command {
  			}
  		}
  
@@ -338,7 +338,7 @@ index bd32bb87..cef16dcf 100644
  
  		for _, w := range cfg.Warnings {
  			klog.Warningf("Configuration warning: %s", w)
-@@ -202,41 +214,69 @@ func RunMicroshift(cfg *config.Config) error {
+@@ -203,42 +215,70 @@ func RunMicroshift(cfg *config.Config) error {
  		return err
  	}
  
@@ -389,8 +389,8 @@ index bd32bb87..cef16dcf 100644
 -	util.Must(m.AddService(controllers.NewRouteControllerManager(cfg)))
 -	util.Must(m.AddService(controllers.NewOpenShiftDefaultSCCManager(cfg)))
 -	util.Must(m.AddService(mdns.NewMicroShiftmDNSController(cfg)))
--	util.Must(m.AddService(controllers.NewInfrastructureServices(cfg)))
 -	util.Must(m.AddService(controllers.NewClusterPolicyController(cfg)))
+-	util.Must(m.AddService(controllers.NewInfrastructureServices(cfg)))
 -	util.Must(m.AddService(controllers.NewVersionManager(cfg)))
 -	util.Must(m.AddService(controllers.NewKubeletCAManager(cfg)))
 -	util.Must(m.AddService(node.NewKubeletServer(cfg)))
@@ -399,6 +399,7 @@ index bd32bb87..cef16dcf 100644
 -	util.Must(m.AddService(controllers.NewClusterID(cfg)))
 -	util.Must(m.AddService(controllers.NewTelemetryManager(cfg)))
 -	util.Must(m.AddService(controllers.NewHostsWatcherManager(cfg)))
+-	util.Must(m.AddService(controllers.NewDNSConfigurationWatcherManager(cfg)))
 -	util.Must(m.AddService(gdp.NewGenericDevicePlugin(cfg)))
 +	if cfg.MultiNode.Worker {
 +		util.Must(m.AddService(node.NewNetworkConfiguration(cfg)))
@@ -417,8 +418,8 @@ index bd32bb87..cef16dcf 100644
 +		util.Must(m.AddService(controllers.NewRouteControllerManager(cfg)))
 +		util.Must(m.AddService(controllers.NewOpenShiftDefaultSCCManager(cfg)))
 +		util.Must(m.AddService(mdns.NewMicroShiftmDNSController(cfg)))
-+		util.Must(m.AddService(controllers.NewInfrastructureServices(cfg)))
 +		util.Must(m.AddService(controllers.NewClusterPolicyController(cfg)))
++		util.Must(m.AddService(controllers.NewInfrastructureServices(cfg)))
 +		util.Must(m.AddService(controllers.NewVersionManager(cfg)))
 +		util.Must(m.AddService(controllers.NewKubeletCAManager(cfg)))
 +		if cfg.MultiNode.Enabled {
@@ -432,12 +433,13 @@ index bd32bb87..cef16dcf 100644
 +		util.Must(m.AddService(controllers.NewClusterID(cfg)))
 +		util.Must(m.AddService(controllers.NewTelemetryManager(cfg)))
 +		util.Must(m.AddService(controllers.NewHostsWatcherManager(cfg)))
++		util.Must(m.AddService(controllers.NewDNSConfigurationWatcherManager(cfg)))
 +		util.Must(m.AddService(gdp.NewGenericDevicePlugin(cfg)))
 +	}
+ 	util.Must(m.AddService(c2cc.NewC2CCRouteManager(cfg)))
  
  	// Storing and clearing the env, so other components don't send the READY=1 until MicroShift is fully ready
- 	notifySocket := os.Getenv("NOTIFY_SOCKET")
-@@ -244,28 +284,32 @@ func RunMicroshift(cfg *config.Config) error {
+@@ -247,28 +287,32 @@ func RunMicroshift(cfg *config.Config) error {
  
  	startRec.ServicesStart(microshiftStart)
  
@@ -491,7 +493,7 @@ index bd32bb87..cef16dcf 100644
  
  	// Start everything up
  	ready, stopped := make(chan struct{}), make(chan struct{})
-@@ -298,7 +342,9 @@ func RunMicroshift(cfg *config.Config) error {
+@@ -301,7 +345,9 @@ func RunMicroshift(cfg *config.Config) error {
  		}
  
  		// After MicroShift's core becomes ready, run the kustomizer (delete and/or apply manifests).
@@ -502,11 +504,371 @@ index bd32bb87..cef16dcf 100644
  
  		// Watch for SIGTERM or service error to exit, now that we are ready.
  		select {
+diff --git a/pkg/cmd/run.go.orig b/pkg/cmd/run.go.orig
+new file mode 100644
+index 00000000..f41d7552
+--- /dev/null
++++ b/pkg/cmd/run.go.orig
+@@ -0,0 +1,354 @@
++package cmd
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"os/signal"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"syscall"
++	"time"
++
++	"github.com/coreos/go-systemd/daemon"
++	"github.com/openshift/microshift/pkg/admin/data"
++	"github.com/openshift/microshift/pkg/admin/prerun"
++	"github.com/openshift/microshift/pkg/config"
++	"github.com/openshift/microshift/pkg/controllers"
++	"github.com/openshift/microshift/pkg/controllers/c2cc"
++	"github.com/openshift/microshift/pkg/gdp"
++	"github.com/openshift/microshift/pkg/kustomize"
++	"github.com/openshift/microshift/pkg/loadbalancerservice"
++	"github.com/openshift/microshift/pkg/mdns"
++	"github.com/openshift/microshift/pkg/node"
++	"github.com/openshift/microshift/pkg/release"
++	"github.com/openshift/microshift/pkg/servicemanager"
++	"github.com/openshift/microshift/pkg/servicemanager/startuprecorder"
++	"github.com/openshift/microshift/pkg/sysconfwatch"
++	"github.com/openshift/microshift/pkg/util"
++	"github.com/openshift/microshift/pkg/util/cryptomaterial/certchains"
++	"github.com/openshift/microshift/pkg/version"
++	"github.com/spf13/cobra"
++
++	logsAPIV1 "k8s.io/component-base/logs/api/v1"
++	"k8s.io/klog/v2"
++	"sigs.k8s.io/yaml"
++)
++
++const (
++	gracefulShutdownTimeout = 15
++)
++
++var (
++	preRunFailedLogPath = util.LogFilePath(filepath.Join(config.BackupsDir, "prerun_failed.log"))
++	cleanUpFileLogPaths = []util.LogFilePath{
++		preRunFailedLogPath,
++	}
++)
++
++func NewRunMicroshiftCommand() *cobra.Command {
++	cmd := &cobra.Command{
++		Use:   "run",
++		Short: "Run MicroShift",
++	}
++
++	var multinode bool
++	var worker bool
++
++	multinodeDefault := true
++	if version.Get().BuildVariant != version.BuildVariantCommunity {
++		multinodeDefault = false
++	}
++
++	flags := cmd.Flags()
++	flags.BoolVar(&multinode, "multinode", multinodeDefault, "enable multinode mode")
++	flags.BoolVar(&worker, "worker", false, "run only the node services; requires --multinode and a bootstrap kubeconfig from 'add-node --worker'")
++
++	if version.Get().BuildVariant != version.BuildVariantCommunity {
++		for _, f := range []string{"multinode", "worker"} {
++			if err := flags.MarkHidden(f); err != nil {
++				panic(err)
++			}
++		}
++	}
++
++	cmd.RunE = func(cmd *cobra.Command, args []string) error {
++		versionInfo := version.Get()
++		klog.InfoS("Version", "microshift", versionInfo.String(), "base", release.Base)
++
++		cfg, err := config.ActiveConfig()
++		if err != nil {
++			return err
++		}
++
++		// `v` is a flag registered in klog's init()
++		if vFlag := flags.Lookup("v"); vFlag != nil {
++			verbosity := strconv.Itoa(cfg.GetVerbosity())
++			if err := vFlag.Value.Set(verbosity); err != nil {
++				klog.Errorf("Failed to set log verbosity: %v", err)
++			}
++		}
++
++		// A node joined as a worker (add-node --worker wrote the marker) must
++		// run as a worker even if the unit was not started with --worker,
++		// otherwise it would initCerts a full control plane over its
++		// public-only certs. The marker is the authoritative role source; the
++		// flag is a hint. Worker mode is a multinode mode.
++		worker = worker || config.IsWorkerNode()
++		if worker {
++			multinode = true
++		}
++		cfg = config.ConfigMultiNode(cfg, multinode, worker)
++
++		for _, w := range cfg.Warnings {
++			klog.Warningf("Configuration warning: %s", w)
++		}
++
++		// Things to very badly if the node's name has changed
++		// since the last time the server started.
++		err = cfg.EnsureNodeNameHasNotChanged()
++		if err != nil {
++			return err
++		}
++		return RunMicroshift(cfg)
++	}
++
++	return cmd
++}
++
++func cleanUpPreviousLogFiles() {
++	for _, p := range cleanUpFileLogPaths {
++		if errLog := p.Remove(); errLog != nil {
++			klog.ErrorS(errLog, "Failed to remove log file", "path", p)
++		}
++	}
++}
++
++func writeLogFileError(l util.LogFilePath, err error) {
++	if errLog := l.Write([]byte(err.Error())); errLog != nil {
++		klog.ErrorS(errLog, "Failed to write log file", "path", l)
++	}
++}
++
++func logConfig(cfg *config.Config) {
++	marshalled, err := yaml.Marshal(cfg)
++	if err != nil {
++		klog.Fatal(err)
++	}
++	klog.Info("Effective configuration:")
++	for _, line := range strings.Split(string(marshalled), "\n") {
++		klog.Info(line)
++	}
++}
++
++func prerunDataManagement() error {
++	dataManager, err := data.NewManager(config.BackupsDir)
++	if err != nil {
++		return fmt.Errorf("failed to create data manager: %w", err)
++	}
++
++	return prerun.DataManagement(dataManager)
++}
++
++//nolint:cyclop
++func RunMicroshift(cfg *config.Config) error {
++	// fail early if we don't have enough privileges
++	if os.Geteuid() > 0 {
++		klog.Fatalf("MicroShift must be run privileged")
++	}
++
++	microshiftStart := time.Now()
++	startRec := startuprecorder.New()
++	startRec.MicroshiftStarts(microshiftStart)
++
++	// Tell the logging code that it's OK to receive reconfiguration
++	// instructions unless those instructions are different. This
++	// overrides the default behavior of erroring out if any
++	// instructions are received a second time. That default behavior
++	// causes issues with embedded components that all use the same
++	// logging code and are not expecting to be compiled together into
++	// the same process, as they are in MicroShift. See comments in
++	// k8s.io/component-base/logs/api/v1/options.go for details.
++	logsAPIV1.ReapplyHandling = logsAPIV1.ReapplyHandlingIgnoreUnchanged
++
++	cleanUpPreviousLogFiles()
++
++	if err := prerunDataManagement(); err != nil {
++		writeLogFileError(preRunFailedLogPath, err)
++		return err
++	}
++
++	logConfig(cfg)
++
++	// TO-DO: When multi-node is ready, we need to add the controller host-name/mDNS hostname
++	//        or VIP to this list on start
++	//        see https://github.com/openshift/microshift/pull/471
++
++	if err := util.AddToNoProxyEnv(
++		cfg.Node.NodeIP,
++		cfg.Node.HostnameOverride,
++		cfg.Network.ClusterNetwork[0],
++		cfg.Network.ServiceNetwork[0],
++		".svc",
++		".cluster.local",
++		"."+cfg.DNS.BaseDomain); err != nil {
++		klog.Fatal(err)
++	}
++
++	if err := util.MakeDir(config.DataDir); err != nil {
++		return fmt.Errorf("failed to create dir %q: %w", config.DataDir, err)
++	}
++
++	if err := prerun.VersionMetadataManagement(); err != nil {
++		writeLogFileError(preRunFailedLogPath, err)
++		return err
++	}
++
++	if err := prerun.FeatureGateLockManagement(cfg); err != nil {
++		writeLogFileError(preRunFailedLogPath, err)
++		return err
++	}
++
++	if err := prerun.WriteVersionMetadata(); err != nil {
++		writeLogFileError(preRunFailedLogPath, err)
++		return err
++	}
++
++	// TODO: change to only initialize what is strictly necessary for the selected role(s)
++	certChains, err := initCerts(cfg)
++	if err != nil {
++		klog.Fatalf("failed to retrieve the necessary certificates: %v", err)
++	}
++
++	// create kubeconfig for kube-scheduler, kubelet,controller-manager
++	if err := initKubeconfigs(cfg, certChains); err != nil {
++		klog.Fatalf("failed to create the necessary kubeconfigs for internal components: %v", err)
++	}
++
++	// Establish the context we will use to control execution
++	runCtx, runCancel := context.WithCancel(context.Background())
++	m := servicemanager.NewServiceManager(startRec)
++	util.Must(m.AddService(node.NewNetworkConfiguration(cfg)))
++	util.Must(m.AddService(controllers.NewEtcd(cfg)))
++	util.Must(m.AddService(sysconfwatch.NewSysConfWatchController(cfg)))
++	util.Must(m.AddService(controllers.NewKubeAPIServer(cfg)))
++	util.Must(m.AddService(controllers.NewKubeScheduler(cfg)))
++	util.Must(m.AddService(controllers.NewKubeControllerManager(runCtx, cfg)))
++	util.Must(m.AddService(controllers.NewOpenShiftCRDManager(cfg)))
++	util.Must(m.AddService(controllers.NewRouteControllerManager(cfg)))
++	util.Must(m.AddService(controllers.NewOpenShiftDefaultSCCManager(cfg)))
++	util.Must(m.AddService(mdns.NewMicroShiftmDNSController(cfg)))
++	util.Must(m.AddService(controllers.NewClusterPolicyController(cfg)))
++	util.Must(m.AddService(controllers.NewInfrastructureServices(cfg)))
++	util.Must(m.AddService(controllers.NewVersionManager(cfg)))
++	util.Must(m.AddService(controllers.NewKubeletCAManager(cfg)))
++	util.Must(m.AddService(node.NewKubeletServer(cfg)))
++	util.Must(m.AddService(loadbalancerservice.NewLoadbalancerServiceController(cfg)))
++	util.Must(m.AddService(controllers.NewKubeStorageVersionMigrator(cfg)))
++	util.Must(m.AddService(controllers.NewClusterID(cfg)))
++	util.Must(m.AddService(controllers.NewTelemetryManager(cfg)))
++	util.Must(m.AddService(controllers.NewHostsWatcherManager(cfg)))
++	util.Must(m.AddService(controllers.NewDNSConfigurationWatcherManager(cfg)))
++	util.Must(m.AddService(gdp.NewGenericDevicePlugin(cfg)))
++	util.Must(m.AddService(c2cc.NewC2CCRouteManager(cfg)))
++
++	// Storing and clearing the env, so other components don't send the READY=1 until MicroShift is fully ready
++	notifySocket := os.Getenv("NOTIFY_SOCKET")
++	_ = os.Unsetenv("NOTIFY_SOCKET")
++
++	startRec.ServicesStart(microshiftStart)
++
++	// The kubelet rotates its bootstrapped certs itself; only locally minted
++	// chains need the restart-to-rotate deadline.
++	if certChains != nil {
++		_, rotationDate, err := certchains.WhenToRotateAtEarliest(certChains)
++		if err != nil {
++			klog.Fatalf("failed to determine when to rotate certificates: %v", err)
++		}
++
++		// Establish a deadline for restarting to rotate the certificates.
++		certCtx, certCancel := context.WithDeadline(context.Background(), rotationDate)
++
++		// Watch for the certificate deadline context to be done, log a
++		// message, and cancel the run context to propagate the shutdown.
++		go func() {
++			select {
++			case <-certCtx.Done():
++				klog.Info("Stopping services for certificate rotation")
++				runCancel()
++				return
++			case <-runCtx.Done():
++				klog.Info("Certificate watcher exiting")
++				certCancel()
++				return
++			}
++		}()
++	}
++
++	// Start everything up
++	ready, stopped := make(chan struct{}), make(chan struct{})
++	go func() {
++		klog.Infof("Started %s", m.Name())
++		if err := m.Run(runCtx, ready, stopped); err != nil {
++			klog.Errorf("Stopped %s: %v", m.Name(), err)
++		} else {
++			klog.Infof("%s completed", m.Name())
++		}
++	}()
++
++	// Connect signal handler
++	sigTerm := make(chan os.Signal, 1)
++	signal.Notify(sigTerm, os.Interrupt, syscall.SIGTERM)
++
++	var serviceErr error
++
++	select {
++	case <-ready:
++		startRec.MicroshiftReady()
++
++		_ = os.Setenv("NOTIFY_SOCKET", notifySocket)
++		if supported, err := daemon.SdNotify(false, daemon.SdNotifyReady); err != nil {
++			klog.Warningf("error sending sd_notify readiness message: %v", err)
++		} else if supported {
++			klog.Info("sent sd_notify readiness message")
++		} else {
++			klog.Info("service does not support sd_notify readiness messages")
++		}
++
++		// After MicroShift's core becomes ready, run the kustomizer (delete and/or apply manifests).
++		if !cfg.MultiNode.Worker {
++			kustomize.NewKustomizer(cfg).RunStandalone(runCtx)
++		}
++
++		// Watch for SIGTERM or service error to exit, now that we are ready.
++		select {
++		case <-sigTerm:
++			klog.Info("Interrupt received")
++		case err := <-m.ErrChan():
++			serviceErr = err
++			klog.Infof("Service error: %v", err)
++		}
++	case <-sigTerm:
++		// A signal that comes in before we are ready is handled here.
++		klog.Info("Interrupt received")
++	case err := <-m.ErrChan():
++		// A service error that comes in before we are ready is handled here.
++		serviceErr = err
++		klog.Infof("Service error before ready: %v", err)
++	case <-runCtx.Done():
++		// We might end up here if the certificate rotation is
++		// triggered and we exit on our own, instead of via a signal.
++	}
++	klog.Info("MICROSHIFT STOPPING")
++	microshiftStop := time.Now()
++	runCancel()
++
++	select {
++	case <-stopped:
++	case <-time.After(time.Duration(gracefulShutdownTimeout) * time.Second):
++		klog.InfoS("MICROSHIFT STOP TIMED OUT", "since-stop", time.Since(microshiftStop))
++	}
++	klog.InfoS("MICROSHIFT STOPPED", "since-stop", time.Since(microshiftStop))
++	return serviceErr
++}
 diff --git a/pkg/config/multinode.go b/pkg/config/multinode.go
-index 6db5e733..86c06cb8 100644
+index 37bd5b77..86c06cb8 100644
 --- a/pkg/config/multinode.go
 +++ b/pkg/config/multinode.go
-@@ -1,18 +1,52 @@
+@@ -1,14 +1,52 @@
  package config
  
 +import (
@@ -518,9 +880,9 @@ index 6db5e733..86c06cb8 100644
 +
  type MultiNodeConfig struct {
  	Enabled bool `json:"enabled"`
- 	// only one controlplane node is supported
- 	// IP address of control plane node
- 	Controlplane string `json:"controlplane"`
++	// only one controlplane node is supported
++	// IP address of control plane node
++	Controlplane string `json:"controlplane"`
 +	// Worker runs only the node services; the control plane is remote
 +	Worker bool `json:"worker"`
  }
@@ -532,7 +894,7 @@ index 6db5e733..86c06cb8 100644
  		return c
  	}
  	c.MultiNode.Enabled = enabled
- 	c.MultiNode.Controlplane = c.Node.NodeIP
++	c.MultiNode.Controlplane = c.Node.NodeIP
 +	c.MultiNode.Worker = worker
 +	if worker {
 +		// The advertise address on lo would blackhole in-cluster apiserver
@@ -673,7 +1035,7 @@ index 00000000..67365d32
 +}
 diff --git a/pkg/controllers/kubelet_csr_approver.go b/pkg/controllers/kubelet_csr_approver.go
 new file mode 100644
-index 00000000..133d3f84
+index 00000000..4c0f12e3
 --- /dev/null
 +++ b/pkg/controllers/kubelet_csr_approver.go
 @@ -0,0 +1,192 @@
@@ -708,8 +1070,8 @@ index 00000000..133d3f84
 +	"k8s.io/apimachinery/pkg/util/sets"
 +	"k8s.io/client-go/kubernetes"
 +	"k8s.io/client-go/tools/clientcmd"
-+	k8scert "k8s.io/kubernetes/pkg/apis/certificates"
 +	"k8s.io/klog/v2"
++	k8scert "k8s.io/kubernetes/pkg/apis/certificates"
 +
 +	"github.com/openshift/microshift/pkg/config"
 +)
