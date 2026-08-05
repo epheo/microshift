@@ -1,0 +1,58 @@
+name: multinode-smoke
+# Worker-join smoke for the multinode-worker branch: build the image from
+# this branch's source, then run the two-container join test.
+# Publishes nothing; build.yaml stays the only publish path.
+
+on:
+  push:
+    branches: [multinode-worker]
+  workflow_dispatch:
+
+concurrency:
+  group: multinode-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          swap-storage: false
+
+      - name: Load version pins
+        run: grep -E '^[A-Z_]+=' versions.env >> "${GITHUB_ENV}"
+
+      # Registry CDNs flake (unexpected EOF mid-blob); pull every base image
+      # with retries up front so the builds run against the local store.
+      - name: Pre-pull base images
+        run: |
+          set -euo pipefail
+          for img in \
+              quay.io/fedora/fedora:latest \
+              "${BUILDROOT_IMAGE}" \
+              "${BOOTC_IMAGE_URL}:${BOOTC_IMAGE_TAG}"; do
+            for i in $(seq 5); do
+              if sudo podman pull -q "${img}"; then break; fi
+              if [ "${i}" = "5" ]; then echo "ERROR: could not pull ${img}"; exit 1; fi
+              echo "pull failed (attempt ${i}) for ${img}, retrying"; sleep 15
+            done
+          done
+
+      - name: Build SRPM (source + patches + OKD payload swap)
+        run: make srpm PODMAN="sudo podman"
+
+      - name: Build RPMs (el10)
+        run: make rpm PODMAN="sudo podman"
+
+      - name: Build bootc image
+        run: make image PODMAN="sudo podman"
+
+      - name: Worker-join smoke test
+        run: make multinode-smoke
