@@ -1019,6 +1019,79 @@ index 4d460606..d31f98f6 100644
        - name: ovnkube-config
          configMap:
            name: ovnkube-config
+diff --git a/pkg/cmd/addnode.go b/pkg/cmd/addnode.go
+index 7e16d79a..ecfc4138 100644
+--- a/pkg/cmd/addnode.go
++++ b/pkg/cmd/addnode.go
+@@ -6,6 +6,7 @@ import (
+ 	"fmt"
+ 	"math/big"
+ 	"net"
++	"net/url"
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+@@ -185,8 +186,15 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
+ 
+ 	// Role marker for role-agnostic tools (healthcheck, greenboot); a
+ 	// re-join with a different role must not leave a stale marker behind.
++	// The marker carries the control plane's routable IP: the worker needs
++	// it at runtime to route the virtual advertise address off-node, and
++	// the bootstrap kubeconfig is the only artifact that knows it.
+ 	if opts.Worker {
+-		if err := os.WriteFile(config.WorkerMarkerPath(), []byte{}, 0600); err != nil {
++		cpIP, err := resolveControlplaneIP(opts.KubeconfigPath)
++		if err != nil {
++			return fmt.Errorf("failed to resolve the control plane address: %w", err)
++		}
++		if err := os.WriteFile(config.WorkerMarkerPath(), []byte(cpIP+"\n"), 0600); err != nil {
+ 			return fmt.Errorf("failed to write worker marker: %w", err)
+ 		}
+ 	} else if err := os.Remove(config.WorkerMarkerPath()); err != nil && !os.IsNotExist(err) {
+@@ -217,6 +225,43 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
+ 	return nil
+ }
+ 
++func resolveControlplaneIP(kubeconfigPath string) (string, error) {
++	kc, err := clientcmd.LoadFromFile(kubeconfigPath)
++	if err != nil {
++		return "", err
++	}
++	server := ""
++	for _, cluster := range kc.Clusters {
++		server = cluster.Server
++		break
++	}
++	if server == "" {
++		return "", fmt.Errorf("no cluster in bootstrap kubeconfig")
++	}
++	u, err := url.Parse(server)
++	if err != nil {
++		return "", err
++	}
++	host := u.Hostname()
++	if ip := net.ParseIP(host); ip != nil {
++		return ip.String(), nil
++	}
++	addrs, err := net.LookupHost(host)
++	if err != nil {
++		return "", err
++	}
++	// The route added from this value is v4; prefer a v4 answer.
++	for _, a := range addrs {
++		if ip := net.ParseIP(a); ip != nil && ip.To4() != nil {
++			return ip.String(), nil
++		}
++	}
++	if len(addrs) > 0 {
++		return addrs[0], nil
++	}
++	return "", fmt.Errorf("cannot resolve control plane host %q", host)
++}
++
+ func createKubernetesClient(kubeconfigPath string) (*kubernetes.Clientset, error) {
+ 	exists, err := util.PathExists(kubeconfigPath)
+ 	if err != nil {
 diff --git a/pkg/components/networking.go b/pkg/components/networking.go
 index 1e546661..60075a35 100644
 --- a/pkg/components/networking.go
@@ -1048,3 +1121,193 @@ index 1e546661..60075a35 100644
  	}
  	if err := assets.ApplyConfigMaps(ctx, cm, renderTemplate, renderParamsFromConfig(cfg, extraParams), kubeconfigPath); err != nil {
  		klog.Warningf("Failed to apply configMap %v %v", cm, err)
+diff --git a/pkg/config/multinode.go b/pkg/config/multinode.go
+index 86c06cb8..574acfe2 100644
+--- a/pkg/config/multinode.go
++++ b/pkg/config/multinode.go
+@@ -1,8 +1,10 @@
+ package config
+ 
+ import (
++	"net"
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 
+ 	"k8s.io/klog/v2"
+ )
+@@ -28,10 +30,30 @@ func ConfigMultiNode(c *Config, enabled bool, worker bool) *Config {
+ 		// The advertise address on lo would blackhole in-cluster apiserver
+ 		// traffic on a node that serves no API.
+ 		c.ApiServer.SkipInterface = true
++		// After a join the marker records the control plane's routable IP
++		// (the default above is this node's own, which is only right on
++		// the control plane itself).
++		if ip := WorkerControlplane(); ip != "" {
++			c.MultiNode.Controlplane = ip
++		}
+ 	}
+ 	return c
+ }
+ 
++// WorkerControlplane returns the control plane IP recorded by
++// 'add-node --worker', or "" before a join.
++func WorkerControlplane() string {
++	data, err := os.ReadFile(WorkerMarkerPath())
++	if err != nil {
++		return ""
++	}
++	ip := strings.TrimSpace(string(data))
++	if net.ParseIP(ip) == nil {
++		return ""
++	}
++	return ip
++}
++
+ // WorkerMarkerPath is written by 'add-node --worker' so role-agnostic tools
+ // (healthcheck, greenboot) can tell a worker from a control plane node.
+ func WorkerMarkerPath() string {
+diff --git a/pkg/node/netconfig.go b/pkg/node/netconfig.go
+index ed338cc7..0e1f2ce5 100644
+--- a/pkg/node/netconfig.go
++++ b/pkg/node/netconfig.go
+@@ -38,6 +38,9 @@ const (
+ type NetworkConfiguration struct {
+ 	kasAdvertiseAddresses      []string
+ 	skipInterfaceConfiguration bool
++	workerNode                 bool
++	nodeIP                     string
++	controlplaneIP             string
+ }
+ 
+ func NewNetworkConfiguration(cfg *config.Config) *NetworkConfiguration {
+@@ -52,6 +55,9 @@ func (n *NetworkConfiguration) Dependencies() []string { return []string{} }
+ func (n *NetworkConfiguration) configure(cfg *config.Config) {
+ 	n.kasAdvertiseAddresses = cfg.ApiServer.AdvertiseAddresses
+ 	n.skipInterfaceConfiguration = cfg.ApiServer.SkipInterface
++	n.workerNode = cfg.MultiNode.Enabled && cfg.MultiNode.Worker
++	n.nodeIP = cfg.Node.NodeIP
++	n.controlplaneIP = cfg.MultiNode.Controlplane
+ }
+ 
+ func (n *NetworkConfiguration) Run(ctx context.Context, ready chan<- struct{}, stopped chan<- struct{}) error {
+@@ -63,6 +69,10 @@ func (n *NetworkConfiguration) Run(ctx context.Context, ready chan<- struct{}, s
+ 		if err := n.addServiceIPLoopback(); err != nil {
+ 			return err
+ 		}
++	} else if n.workerNode {
++		if err := n.addWorkerGatewayConfig(); err != nil {
++			return err
++		}
+ 	}
+ 	// Always drive stopChan on cancel; skipping interface config must not
+ 	// leave Run blocked forever (workers force SkipInterface).
+@@ -72,6 +82,8 @@ func (n *NetworkConfiguration) Run(ctx context.Context, ready chan<- struct{}, s
+ 			if err := n.removeServiceIPLoopback(); err != nil {
+ 				klog.Warningf("failed to remove IP from interface: %v", err)
+ 			}
++		} else if n.workerNode {
++			n.removeWorkerGatewayConfig()
+ 		}
+ 		close(stopChan)
+ 	}()
+@@ -153,3 +165,99 @@ func (n *NetworkConfiguration) removeServiceIPLoopback() error {
+ 	}
+ 	return nil
+ }
++
++// addWorkerGatewayConfig gives a worker the dataplane a control plane node
++// gets from addServiceIPLoopback, without the blackhole:
++//   - ovnkube's gateway init refuses to start without an IPv4 on br-ex.
++//     OCP puts the node IP on br-ex; mirror that as a /32 alias on the
++//     virtual bridge, which also makes the gateway IP this node advertises
++//     to other zones genuinely routable.
++//   - the virtual advertise address must leave the node: without a route
++//     via the control plane, pod traffic to the apiserver endpoint
++//     dead-ends locally (the original multinode CNI failure).
++func (n *NetworkConfiguration) addWorkerGatewayConfig() error {
++	link, err := netlink.LinkByName(ovn.OVNGatewayInterface)
++	if err != nil {
++		// br-ex is created by microshift-ovs-init; systemd restarts us
++		// until it exists.
++		return fmt.Errorf("worker node needs %s: %w", ovn.OVNGatewayInterface, err)
++	}
++
++	nodeAddr, err := netlink.ParseAddr(fmt.Sprintf("%s/32", n.nodeIP))
++	if err != nil {
++		return err
++	}
++	existing, err := netlink.AddrList(link, netlink.FAMILY_ALL)
++	if err != nil {
++		return err
++	}
++	present := false
++	for _, a := range existing {
++		if nodeAddr.Equal(a) {
++			present = true
++			break
++		}
++	}
++	if !present {
++		if err := netlink.AddrAdd(link, nodeAddr); err != nil {
++			return err
++		}
++	}
++
++	gw := net.ParseIP(n.controlplaneIP)
++	if gw == nil || n.controlplaneIP == n.nodeIP {
++		// Pre-join (no marker yet) there is nowhere to route to; the
++		// post-join restart comes back through here with the marker set.
++		klog.Infof("no control plane address yet, skipping advertise address routes")
++		return nil
++	}
++	for _, entry := range n.kasAdvertiseAddresses {
++		ip := net.ParseIP(entry)
++		if ip == nil || (ip.To4() == nil) != (gw.To4() == nil) {
++			continue
++		}
++		prefix := 32
++		if ip.To4() == nil {
++			prefix = 128
++		}
++		_, dst, err := net.ParseCIDR(fmt.Sprintf("%s/%d", entry, prefix))
++		if err != nil {
++			return err
++		}
++		if err := netlink.RouteReplace(&netlink.Route{Dst: dst, Gw: gw}); err != nil {
++			return fmt.Errorf("failed to route %s via %s: %w", entry, n.controlplaneIP, err)
++		}
++	}
++	return nil
++}
++
++func (n *NetworkConfiguration) removeWorkerGatewayConfig() {
++	if gw := net.ParseIP(n.controlplaneIP); gw != nil && n.controlplaneIP != n.nodeIP {
++		for _, entry := range n.kasAdvertiseAddresses {
++			ip := net.ParseIP(entry)
++			if ip == nil || (ip.To4() == nil) != (gw.To4() == nil) {
++				continue
++			}
++			prefix := 32
++			if ip.To4() == nil {
++				prefix = 128
++			}
++			_, dst, err := net.ParseCIDR(fmt.Sprintf("%s/%d", entry, prefix))
++			if err != nil {
++				continue
++			}
++			if err := netlink.RouteDel(&netlink.Route{Dst: dst, Gw: gw}); err != nil {
++				klog.Warningf("failed to remove route to %s: %v", entry, err)
++			}
++		}
++	}
++	link, err := netlink.LinkByName(ovn.OVNGatewayInterface)
++	if err != nil {
++		return
++	}
++	if addr, err := netlink.ParseAddr(fmt.Sprintf("%s/32", n.nodeIP)); err == nil {
++		if err := netlink.AddrDel(link, addr); err != nil {
++			klog.Warningf("failed to remove %s from %s: %v", n.nodeIP, ovn.OVNGatewayInterface, err)
++		}
++	}
++}
