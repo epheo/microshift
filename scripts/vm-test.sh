@@ -245,6 +245,10 @@ ACCEL="tcg"
 # install must go GREEN with zero guest egress (restrict=on still allows
 # the inbound ssh hostfwd). Upgrade mode needs egress to reach the host
 # registry at 10.0.2.2 for bootc switch.
+# ipv6=off: slirp's fec0:: router advertisement lands before the DHCPv4
+# lease, MicroShift then auto-selects IPv6 single-stack with a site-local
+# node IP and OVN-K never reaches node readiness. The target sites are
+# IPv4; keep the test VM IPv4-only.
 NET_RESTRICT="restrict=on,"
 [ -n "${UPGRADE_FROM}" ] && NET_RESTRICT=""
 log "booting VM (accel=${ACCEL}) with a secondary disk for the TopoLVM VG"
@@ -255,7 +259,7 @@ sudo qemu-system-x86_64 \
     -machine "accel=${ACCEL}" -cpu max -smp "$(nproc)" -m "${VM_MEM}" \
     -drive "file=${DISK},if=virtio,format=qcow2" \
     -drive "file=${WORKDIR}/lvm-disk.raw,if=virtio,format=raw" \
-    -netdev "user,id=n0,${NET_RESTRICT}hostfwd=tcp::${SSH_PORT}-:22" \
+    -netdev "user,id=n0,ipv6=off,${NET_RESTRICT}hostfwd=tcp::${SSH_PORT}-:22" \
     -device virtio-net-pci,netdev=n0 \
     -device virtio-rng-pci \
     -serial "file:${WORKDIR}/console.log" \
