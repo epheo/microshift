@@ -292,7 +292,7 @@ index 864876e8..7e16d79a 100644
  	secret, err := client.CoreV1().Secrets("kube-system").Get(ctx, name, metav1.GetOptions{})
  	if err != nil {
 diff --git a/pkg/cmd/run.go b/pkg/cmd/run.go
-index 12bc989e..433f1fa0 100644
+index 12bc989e..ed4abd80 100644
 --- a/pkg/cmd/run.go
 +++ b/pkg/cmd/run.go
 @@ -54,6 +54,7 @@ func NewRunMicroshiftCommand() *cobra.Command {
@@ -338,7 +338,7 @@ index 12bc989e..433f1fa0 100644
  
  		for _, w := range cfg.Warnings {
  			klog.Warningf("Configuration warning: %s", w)
-@@ -203,42 +215,70 @@ func RunMicroshift(cfg *config.Config) error {
+@@ -203,43 +215,72 @@ func RunMicroshift(cfg *config.Config) error {
  		return err
  	}
  
@@ -401,6 +401,7 @@ index 12bc989e..433f1fa0 100644
 -	util.Must(m.AddService(controllers.NewHostsWatcherManager(cfg)))
 -	util.Must(m.AddService(controllers.NewDNSConfigurationWatcherManager(cfg)))
 -	util.Must(m.AddService(gdp.NewGenericDevicePlugin(cfg)))
+-	util.Must(m.AddService(c2cc.NewC2CCRouteManager(cfg)))
 +	if cfg.MultiNode.Worker {
 +		util.Must(m.AddService(node.NewNetworkConfiguration(cfg)))
 +		util.Must(m.AddService(sysconfwatch.NewSysConfWatchController(cfg)))
@@ -435,11 +436,13 @@ index 12bc989e..433f1fa0 100644
 +		util.Must(m.AddService(controllers.NewHostsWatcherManager(cfg)))
 +		util.Must(m.AddService(controllers.NewDNSConfigurationWatcherManager(cfg)))
 +		util.Must(m.AddService(gdp.NewGenericDevicePlugin(cfg)))
++		// Reads the kubeadmin kubeconfig, which a worker does not have.
++		util.Must(m.AddService(c2cc.NewC2CCRouteManager(cfg)))
 +	}
- 	util.Must(m.AddService(c2cc.NewC2CCRouteManager(cfg)))
  
  	// Storing and clearing the env, so other components don't send the READY=1 until MicroShift is fully ready
-@@ -247,28 +287,32 @@ func RunMicroshift(cfg *config.Config) error {
+ 	notifySocket := os.Getenv("NOTIFY_SOCKET")
+@@ -247,28 +288,32 @@ func RunMicroshift(cfg *config.Config) error {
  
  	startRec.ServicesStart(microshiftStart)
  
@@ -493,7 +496,7 @@ index 12bc989e..433f1fa0 100644
  
  	// Start everything up
  	ready, stopped := make(chan struct{}), make(chan struct{})
-@@ -301,7 +345,9 @@ func RunMicroshift(cfg *config.Config) error {
+@@ -301,7 +346,9 @@ func RunMicroshift(cfg *config.Config) error {
  		}
  
  		// After MicroShift's core becomes ready, run the kustomizer (delete and/or apply manifests).

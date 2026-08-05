@@ -140,8 +140,15 @@ elif ! sudo podman image exists "${DIST_IMAGE}"; then
     esac
 fi
 
+# bootc-image-builder resolves bare names against docker.io; a locally
+# built image must be addressed as localhost/<name> (registry refs as-is).
+case "${DIST_IMAGE}" in
+    *.*/*) SRC_IMAGE="${DIST_IMAGE}" ;;
+    *)     SRC_IMAGE="localhost/${DIST_IMAGE}:latest" ;;
+esac
+
 # --- 2. qcow2 ----------------------------------------------------------------
-log "building qcow2 from ${DIST_IMAGE} (bootc-image-builder)"
+log "building qcow2 from ${SRC_IMAGE} (bootc-image-builder)"
 ssh-keygen -q -t ed25519 -N '' -f "${WORKDIR}/id"
 cat > "${WORKDIR}/config.toml" <<EOF
 [[customizations.user]]
@@ -153,7 +160,7 @@ sudo podman run --rm --privileged \
     -v "${WORKDIR}/config.toml:/config.toml:ro" \
     -v "${WORKDIR}/output:/output" \
     -v /var/lib/containers/storage:/var/lib/containers/storage \
-    "${BIB_IMAGE}" --type qcow2 --config /config.toml "${DIST_IMAGE}"
+    "${BIB_IMAGE}" --type qcow2 --config /config.toml "${SRC_IMAGE}"
 DISK1="${WORKDIR}/output/qcow2/disk.qcow2"
 sudo test -f "${DISK1}" || die "bootc-image-builder produced no qcow2"
 DISK2="${WORKDIR}/disk2.qcow2"
