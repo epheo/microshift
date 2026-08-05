@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>MicroShift node</short>
+  <description>Kubelet API for the apiserver and Geneve overlay traffic between cluster nodes.</description>
+  <port protocol="tcp" port="10250"/>
+  <port protocol="udp" port="6081"/>
+</service>

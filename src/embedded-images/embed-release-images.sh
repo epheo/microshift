@@ -29,7 +29,9 @@ jq -r '.images | to_entries[] | "\(.key) \(.value)"' \
         continue
     fi
     echo "embedding ${key} (${ref})"
-    skopeo copy -q --retry-times 3 --preserve-digests \
+    # quay's CDN flakes with unexpected EOF mid-blob under load; retries are
+    # whole-copy, so give it headroom and a pause between attempts.
+    skopeo copy -q --retry-times 5 --retry-delay 10s --preserve-digests \
         "docker://${ref}" "oci:${LAYOUT}:${key}"
     case "${ref}" in
     *@sha256:*)

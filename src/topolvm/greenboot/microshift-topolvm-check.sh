@@ -13,6 +13,12 @@ fi
 
 exit_if_fail_marker_exists
 
+# Workers cannot query cluster workloads; the controller's check gates them.
+if [ -f /var/lib/microshift/multinode-worker ]; then
+    echo "SKIPPED (worker node)"
+    exit 0
+fi
+
 echo "STARTED"
 
 # Set the wait timeout for the current check based on the boot counter

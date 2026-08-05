@@ -1,0 +1,1452 @@
+diff --git a/assets/core/kubelet.yaml b/assets/core/kubelet.yaml
+index 988f071e..5ef9a18e 100644
+--- a/assets/core/kubelet.yaml
++++ b/assets/core/kubelet.yaml
+@@ -18,20 +18,24 @@ featureGates:
+   APIPriorityAndFairness: true
+   DownwardAPIHugePages: true
+   PodSecurity: true
+-  RotateKubeletServerCertificate: false # TODO
++  RotateKubeletServerCertificate: {{ .serverTLSBootstrap }}
+ kubeAPIBurst: 100
+ kubeAPIQPS: 50
+ maxPods: 250
+ memorySwap:
+   swapBehavior: NoSwap
+ nodeStatusReportFrequency: 5m
+-rotateCertificates: false # TODO
++rotateCertificates: {{ .rotateCertificates }}
+ serializeImagePulls: false
+-serverTLSBootstrap: false # TODO
++serverTLSBootstrap: {{ .serverTLSBootstrap }}
++{{- if .tlsCertFile }}
+ tlsCertFile: "{{ .tlsCertFile }}"
++{{- end }}
+ tlsCipherSuites: [{{ .tlsCipherSuites }}]
+ tlsMinVersion: "{{ .tlsMinVersion }}"
++{{- if .tlsPrivateKeyFile }}
+ tlsPrivateKeyFile: "{{ .tlsPrivateKeyFile }}"
++{{- end }}
+ volumePluginDir: "{{ .volumePluginDir }}"
+ {{- if .resolvConf }}
+ resolvConf: "{{ .resolvConf }}"
+diff --git a/pkg/cmd/addnode.go b/pkg/cmd/addnode.go
+index 864876e8..7e16d79a 100644
+--- a/pkg/cmd/addnode.go
++++ b/pkg/cmd/addnode.go
+@@ -26,6 +26,8 @@ import (
+ 	clientv3 "go.etcd.io/etcd/client/v3"
+ 
+ 	corev1 "k8s.io/api/core/v1"
++	rbacv1 "k8s.io/api/rbac/v1"
++	apierrors "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/client-go/kubernetes"
+ 	"k8s.io/client-go/tools/clientcmd"
+@@ -41,6 +43,7 @@ type AddNodeOptions struct {
+ 	KubeconfigPath string
+ 	Timeout        time.Duration
+ 	Learner        bool
++	Worker         bool
+ }
+ 
+ func NewAddNodeCommand() *cobra.Command {
+@@ -70,6 +73,8 @@ func NewAddNodeCommand() *cobra.Command {
+ 		"Timeout for cluster join operations")
+ 	cmd.Flags().BoolVar(&opts.Learner, "learner", true,
+ 		"Join the cluster as a learner node")
++	cmd.Flags().BoolVar(&opts.Worker, "worker", false,
++		"Join as a worker node: no etcd member, node services only (the microshift unit must run with --worker)")
+ 
+ 	if version.Get().BuildVariant != version.BuildVariantCommunity {
+ 		cmd.Hidden = true
+@@ -82,8 +87,16 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
+ 	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
+ 	defer cancel()
+ 
++	// This distribution supports only worker nodes in multinode; the etcd
++	// ports a full replica needs are firewalled. Refuse here, before
++	// cleanupMicroShiftData would wipe this node's certs only to time out
++	// dialing an unreachable etcd.
++	if !opts.Worker {
++		return fmt.Errorf("full etcd-replica joins are not supported on this build; re-run with --worker")
++	}
++
+ 	klog.Info("Starting cluster join process...")
+-	if opts.Learner {
++	if opts.Learner && !opts.Worker {
+ 		klog.Info("Will add etcd node as learner")
+ 	}
+ 
+@@ -100,8 +113,16 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
+ 
+ 	nodeName := cfg.CanonicalNodeName()
+ 	if isNodeAlreadyInCluster(ctx, client, nodeName) {
+-		klog.Infof("Node %s is already part of the cluster. Skipping join process.", nodeName)
+-		return nil
++		// For a worker the join is the only thing that writes local state (CA
++		// certs, kubelet CA bundle, bootstrap kubeconfig, marker). If that
++		// state is gone (node re-provisioned) re-run the join to restore it,
++		// even though the Node object still exists. A fully provisioned worker
++		// still carries the marker, so it short-circuits as before.
++		if !opts.Worker || config.IsWorkerNode() {
++			klog.Infof("Node %s is already part of the cluster. Skipping join process.", nodeName)
++			return nil
++		}
++		klog.Infof("Node %s exists in the cluster but local worker state is missing; re-materializing bootstrap materials", nodeName)
+ 	}
+ 
+ 	if err := cleanupMicroShiftData(cfg); err != nil {
+@@ -109,36 +130,69 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
+ 	}
+ 	klog.Info("MicroShift data directories cleaned up successfully")
+ 
++	// Workers must never hold signing material: public certs only, no
++	// service-account keys, no etcd member.
+ 	for _, resource := range components.CertificateAuthorityResources {
++		if opts.Worker {
++			if err := fetchCertificateAuthorityCert(ctx, client, resource.Name, resource.Dir); err != nil {
++				return fmt.Errorf("failed to fetch certificate authority %s: %w", resource.Name, err)
++			}
++			continue
++		}
+ 		if err := fetchCertificateAuthority(ctx, client, resource.Name, resource.Dir); err != nil {
+ 			return fmt.Errorf("failed to fetch certificate authority %s: %w", resource.Name, err)
+ 		}
+ 	}
+-	for _, resource := range components.ServiceAccountKeyResources {
+-		if err := fetchServiceAccountKey(ctx, client, resource.Name, resource.Dir); err != nil {
+-			return fmt.Errorf("failed to fetch service account key %s: %w", resource.Name, err)
++	if opts.Worker {
++		if err := writeKubeletClientCABundle(); err != nil {
++			return fmt.Errorf("failed to assemble kubelet client CA bundle: %w", err)
++		}
++		// Let workers refresh that bundle themselves after control plane CA
++		// rotation; they hold no admin creds, so grant the node group read on
++		// just the published CA configmap (see NewKubeletClientCARefresh).
++		if err := ensureKubeletCAReaderRBAC(ctx, client); err != nil {
++			return fmt.Errorf("failed to ensure kubelet CA reader RBAC: %w", err)
++		}
++	}
++	if !opts.Worker {
++		for _, resource := range components.ServiceAccountKeyResources {
++			if err := fetchServiceAccountKey(ctx, client, resource.Name, resource.Dir); err != nil {
++				return fmt.Errorf("failed to fetch service account key %s: %w", resource.Name, err)
++			}
+ 		}
+ 	}
+ 	klog.Info("Certificate authorities fetched and written successfully")
+ 
+-	if err := generateEtcdCertificates(cfg); err != nil {
+-		return fmt.Errorf("failed to generate etcd certificates: %w", err)
+-	}
+-	klog.Info("Etcd certificates generated successfully")
++	if !opts.Worker {
++		if err := generateEtcdCertificates(cfg); err != nil {
++			return fmt.Errorf("failed to generate etcd certificates: %w", err)
++		}
++		klog.Info("Etcd certificates generated successfully")
+ 
+-	clusterMembers, err := getClusterNodes(ctx, client)
+-	if err != nil {
+-		return fmt.Errorf("failed to get cluster information: %w", err)
+-	}
++		clusterMembers, err := getClusterNodes(ctx, client)
++		if err != nil {
++			return fmt.Errorf("failed to get cluster information: %w", err)
++		}
+ 
+-	if err := configureEtcdForCluster(ctx, cfg, clusterMembers, opts.Learner); err != nil {
+-		return fmt.Errorf("failed to configure etcd for cluster: %w", err)
++		if err := configureEtcdForCluster(ctx, cfg, clusterMembers, opts.Learner); err != nil {
++			return fmt.Errorf("failed to configure etcd for cluster: %w", err)
++		}
+ 	}
+ 
+ 	if err := configureBootstrapKubeconfig(cfg, opts.KubeconfigPath); err != nil {
+ 		return fmt.Errorf("failed to configure bootstrap kubeconfig: %w", err)
+ 	}
+ 
++	// Role marker for role-agnostic tools (healthcheck, greenboot); a
++	// re-join with a different role must not leave a stale marker behind.
++	if opts.Worker {
++		if err := os.WriteFile(config.WorkerMarkerPath(), []byte{}, 0600); err != nil {
++			return fmt.Errorf("failed to write worker marker: %w", err)
++		}
++	} else if err := os.Remove(config.WorkerMarkerPath()); err != nil && !os.IsNotExist(err) {
++		return fmt.Errorf("failed to remove worker marker: %w", err)
++	}
++
+ 	if err := restartMicroShift(); err != nil {
+ 		return fmt.Errorf("failed to restart MicroShift service: %w", err)
+ 	}
+@@ -148,6 +202,17 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
+ 		return fmt.Errorf("node failed to become ready: %w", err)
+ 	}
+ 
++	// The join credential (the passed-in kubeconfig, today cluster-admin) must
++	// not linger on a worker: once the node is Ready its kubelet holds its own
++	// rotating client cert and no longer needs the bootstrap kubeconfig. A
++	// scoped bootstrap token is the deeper fix; this bounds the exposure to the
++	// join window meanwhile.
++	if opts.Worker {
++		if err := os.Remove(cfg.BootstrapKubeConfigPath()); err != nil && !os.IsNotExist(err) {
++			klog.Warningf("failed to remove bootstrap kubeconfig after join: %v", err)
++		}
++	}
++
+ 	klog.Info("Node successfully joined the cluster")
+ 	return nil
+ }
+@@ -217,6 +282,92 @@ func fetchCertificateAuthority(ctx context.Context, client kubernetes.Interface,
+ 	return nil
+ }
+ 
++// fetchCertificateAuthorityCert writes only the public certificate of a CA.
++func fetchCertificateAuthorityCert(ctx context.Context, client kubernetes.Interface, name, dir string) error {
++	secret, err := client.CoreV1().Secrets("kube-system").Get(ctx, name, metav1.GetOptions{})
++	if err != nil {
++		return fmt.Errorf("failed to get %s secret: %w", name, err)
++	}
++
++	caCert, exists := secret.Data["ca.crt"]
++	if !exists {
++		return fmt.Errorf("ca.crt not found in secret")
++	}
++
++	if err := os.MkdirAll(dir, 0750); err != nil {
++		return fmt.Errorf("failed to create destination directory: %w", err)
++	}
++
++	if err := os.WriteFile(cryptomaterial.CACertPath(dir), caCert, 0600); err != nil {
++		return fmt.Errorf("failed to write ca.crt: %w", err)
++	}
++
++	if caBundle, ok := secret.Data["ca-bundle.crt"]; ok {
++		if err := os.WriteFile(cryptomaterial.CABundlePath(dir), caBundle, 0600); err != nil {
++			return fmt.Errorf("failed to write ca-bundle.crt: %w", err)
++		}
++	}
++
++	return nil
++}
++
++// ensureKubeletCAReaderRBAC lets the node group read only the published
++// kubelet client CA configmap, so a worker can keep its local bundle current
++// after control plane CA rotation without holding any admin credential.
++func ensureKubeletCAReaderRBAC(ctx context.Context, client kubernetes.Interface) error {
++	const name = "microshift-kubelet-client-ca-reader"
++	role := &rbacv1.Role{
++		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "kube-system"},
++		Rules: []rbacv1.PolicyRule{{
++			APIGroups:     []string{""},
++			Resources:     []string{"configmaps"},
++			ResourceNames: []string{"kubelet-client-ca"},
++			Verbs:         []string{"get", "list", "watch"},
++		}},
++	}
++	if _, err := client.RbacV1().Roles("kube-system").Create(ctx, role, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
++		return err
++	}
++	binding := &rbacv1.RoleBinding{
++		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "kube-system"},
++		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: name},
++		Subjects:   []rbacv1.Subject{{Kind: "Group", Name: "system:nodes", APIGroup: rbacv1.GroupName}},
++	}
++	if _, err := client.RbacV1().RoleBindings("kube-system").Create(ctx, binding, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
++		return err
++	}
++	return nil
++}
++
++// writeKubeletClientCABundle mirrors the kubelet client CA bundle that
++// initCerts builds on nodes holding the signer keys.
++func writeKubeletClientCABundle() error {
++	certsDir := cryptomaterial.CertsDirectory(config.DataDir)
++	members := []string{
++		cryptomaterial.KubeControlPlaneSignerCertDir(certsDir),
++		cryptomaterial.KubeAPIServerToKubeletSignerCertDir(certsDir),
++		cryptomaterial.AdminKubeconfigSignerDir(certsDir),
++		cryptomaterial.KubeletCSRSignerSignerCertDir(certsDir),
++		cryptomaterial.CSRSignerCertDir(certsDir),
++	}
++	bundle := []byte{}
++	for _, dir := range members {
++		pemBytes, err := os.ReadFile(cryptomaterial.CACertPath(dir))
++		if err != nil {
++			return err
++		}
++		bundle = append(bundle, pemBytes...)
++		if len(pemBytes) > 0 && pemBytes[len(pemBytes)-1] != '\n' {
++			bundle = append(bundle, '\n')
++		}
++	}
++	path := cryptomaterial.KubeletClientCAPath(certsDir)
++	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
++		return err
++	}
++	return os.WriteFile(path, bundle, 0600)
++}
++
+ func fetchServiceAccountKey(ctx context.Context, client kubernetes.Interface, name, dir string) error {
+ 	secret, err := client.CoreV1().Secrets("kube-system").Get(ctx, name, metav1.GetOptions{})
+ 	if err != nil {
+diff --git a/pkg/cmd/run.go b/pkg/cmd/run.go
+index 12bc989e..ed4abd80 100644
+--- a/pkg/cmd/run.go
++++ b/pkg/cmd/run.go
+@@ -54,6 +54,7 @@ func NewRunMicroshiftCommand() *cobra.Command {
+ 	}
+ 
+ 	var multinode bool
++	var worker bool
+ 
+ 	multinodeDefault := true
+ 	if version.Get().BuildVariant != version.BuildVariantCommunity {
+@@ -62,11 +63,13 @@ func NewRunMicroshiftCommand() *cobra.Command {
+ 
+ 	flags := cmd.Flags()
+ 	flags.BoolVar(&multinode, "multinode", multinodeDefault, "enable multinode mode")
++	flags.BoolVar(&worker, "worker", false, "run only the node services; requires --multinode and a bootstrap kubeconfig from 'add-node --worker'")
+ 
+ 	if version.Get().BuildVariant != version.BuildVariantCommunity {
+-		err := flags.MarkHidden("multinode")
+-		if err != nil {
+-			panic(err)
++		for _, f := range []string{"multinode", "worker"} {
++			if err := flags.MarkHidden(f); err != nil {
++				panic(err)
++			}
+ 		}
+ 	}
+ 
+@@ -87,7 +90,16 @@ func NewRunMicroshiftCommand() *cobra.Command {
+ 			}
+ 		}
+ 
+-		cfg = config.ConfigMultiNode(cfg, multinode)
++		// A node joined as a worker (add-node --worker wrote the marker) must
++		// run as a worker even if the unit was not started with --worker,
++		// otherwise it would initCerts a full control plane over its
++		// public-only certs. The marker is the authoritative role source; the
++		// flag is a hint. Worker mode is a multinode mode.
++		worker = worker || config.IsWorkerNode()
++		if worker {
++			multinode = true
++		}
++		cfg = config.ConfigMultiNode(cfg, multinode, worker)
+ 
+ 		for _, w := range cfg.Warnings {
+ 			klog.Warningf("Configuration warning: %s", w)
+@@ -203,43 +215,72 @@ func RunMicroshift(cfg *config.Config) error {
+ 		return err
+ 	}
+ 
+-	// TODO: change to only initialize what is strictly necessary for the selected role(s)
+-	certChains, err := initCerts(cfg)
+-	if err != nil {
+-		klog.Fatalf("failed to retrieve the necessary certificates: %v", err)
+-	}
++	// A worker holds no signing material: the kubelet bootstraps its client
++	// cert from the bootstrap kubeconfig and obtains its serving cert through
++	// serverTLSBootstrap, so cert init and rotation stay control plane only.
++	var certChains *certchains.CertificateChains
++	if cfg.MultiNode.Worker {
++		kubeletKubeconfigExists, err := util.PathExists(cfg.KubeConfigPath(config.Kubelet))
++		if err != nil {
++			return err
++		}
++		if !cfg.BootstrapKubeConfigExists() && !kubeletKubeconfigExists {
++			return fmt.Errorf("worker mode requires the bootstrap kubeconfig installed by 'microshift add-node --worker'")
++		}
++	} else {
++		// TODO: change to only initialize what is strictly necessary for the selected role(s)
++		var err error
++		certChains, err = initCerts(cfg)
++		if err != nil {
++			klog.Fatalf("failed to retrieve the necessary certificates: %v", err)
++		}
+ 
+-	// create kubeconfig for kube-scheduler, kubelet,controller-manager
+-	if err := initKubeconfigs(cfg, certChains); err != nil {
+-		klog.Fatalf("failed to create the necessary kubeconfigs for internal components: %v", err)
++		// create kubeconfig for kube-scheduler, kubelet,controller-manager
++		if err := initKubeconfigs(cfg, certChains); err != nil {
++			klog.Fatalf("failed to create the necessary kubeconfigs for internal components: %v", err)
++		}
+ 	}
+ 
+ 	// Establish the context we will use to control execution
+ 	runCtx, runCancel := context.WithCancel(context.Background())
+ 	m := servicemanager.NewServiceManager(startRec)
+-	util.Must(m.AddService(node.NewNetworkConfiguration(cfg)))
+-	util.Must(m.AddService(controllers.NewEtcd(cfg)))
+-	util.Must(m.AddService(sysconfwatch.NewSysConfWatchController(cfg)))
+-	util.Must(m.AddService(controllers.NewKubeAPIServer(cfg)))
+-	util.Must(m.AddService(controllers.NewKubeScheduler(cfg)))
+-	util.Must(m.AddService(controllers.NewKubeControllerManager(runCtx, cfg)))
+-	util.Must(m.AddService(controllers.NewOpenShiftCRDManager(cfg)))
+-	util.Must(m.AddService(controllers.NewRouteControllerManager(cfg)))
+-	util.Must(m.AddService(controllers.NewOpenShiftDefaultSCCManager(cfg)))
+-	util.Must(m.AddService(mdns.NewMicroShiftmDNSController(cfg)))
+-	util.Must(m.AddService(controllers.NewClusterPolicyController(cfg)))
+-	util.Must(m.AddService(controllers.NewInfrastructureServices(cfg)))
+-	util.Must(m.AddService(controllers.NewVersionManager(cfg)))
+-	util.Must(m.AddService(controllers.NewKubeletCAManager(cfg)))
+-	util.Must(m.AddService(node.NewKubeletServer(cfg)))
+-	util.Must(m.AddService(loadbalancerservice.NewLoadbalancerServiceController(cfg)))
+-	util.Must(m.AddService(controllers.NewKubeStorageVersionMigrator(cfg)))
+-	util.Must(m.AddService(controllers.NewClusterID(cfg)))
+-	util.Must(m.AddService(controllers.NewTelemetryManager(cfg)))
+-	util.Must(m.AddService(controllers.NewHostsWatcherManager(cfg)))
+-	util.Must(m.AddService(controllers.NewDNSConfigurationWatcherManager(cfg)))
+-	util.Must(m.AddService(gdp.NewGenericDevicePlugin(cfg)))
+-	util.Must(m.AddService(c2cc.NewC2CCRouteManager(cfg)))
++	if cfg.MultiNode.Worker {
++		util.Must(m.AddService(node.NewNetworkConfiguration(cfg)))
++		util.Must(m.AddService(sysconfwatch.NewSysConfWatchController(cfg)))
++		util.Must(m.AddService(node.NewKubeletServer(cfg)))
++		util.Must(m.AddService(gdp.NewGenericDevicePlugin(cfg)))
++		util.Must(m.AddService(controllers.NewKubeletClientCARefresh(cfg)))
++	} else {
++		util.Must(m.AddService(node.NewNetworkConfiguration(cfg)))
++		util.Must(m.AddService(controllers.NewEtcd(cfg)))
++		util.Must(m.AddService(sysconfwatch.NewSysConfWatchController(cfg)))
++		util.Must(m.AddService(controllers.NewKubeAPIServer(cfg)))
++		util.Must(m.AddService(controllers.NewKubeScheduler(cfg)))
++		util.Must(m.AddService(controllers.NewKubeControllerManager(runCtx, cfg)))
++		util.Must(m.AddService(controllers.NewOpenShiftCRDManager(cfg)))
++		util.Must(m.AddService(controllers.NewRouteControllerManager(cfg)))
++		util.Must(m.AddService(controllers.NewOpenShiftDefaultSCCManager(cfg)))
++		util.Must(m.AddService(mdns.NewMicroShiftmDNSController(cfg)))
++		util.Must(m.AddService(controllers.NewClusterPolicyController(cfg)))
++		util.Must(m.AddService(controllers.NewInfrastructureServices(cfg)))
++		util.Must(m.AddService(controllers.NewVersionManager(cfg)))
++		util.Must(m.AddService(controllers.NewKubeletCAManager(cfg)))
++		if cfg.MultiNode.Enabled {
++			// Workers hold no signing keys; their serving and renewal CSRs
++			// must be approved here so KCM can sign them.
++			util.Must(m.AddService(controllers.NewKubeletCSRApprover(cfg)))
++		}
++		util.Must(m.AddService(node.NewKubeletServer(cfg)))
++		util.Must(m.AddService(loadbalancerservice.NewLoadbalancerServiceController(cfg)))
++		util.Must(m.AddService(controllers.NewKubeStorageVersionMigrator(cfg)))
++		util.Must(m.AddService(controllers.NewClusterID(cfg)))
++		util.Must(m.AddService(controllers.NewTelemetryManager(cfg)))
++		util.Must(m.AddService(controllers.NewHostsWatcherManager(cfg)))
++		util.Must(m.AddService(controllers.NewDNSConfigurationWatcherManager(cfg)))
++		util.Must(m.AddService(gdp.NewGenericDevicePlugin(cfg)))
++		// Reads the kubeadmin kubeconfig, which a worker does not have.
++		util.Must(m.AddService(c2cc.NewC2CCRouteManager(cfg)))
++	}
+ 
+ 	// Storing and clearing the env, so other components don't send the READY=1 until MicroShift is fully ready
+ 	notifySocket := os.Getenv("NOTIFY_SOCKET")
+@@ -247,28 +288,32 @@ func RunMicroshift(cfg *config.Config) error {
+ 
+ 	startRec.ServicesStart(microshiftStart)
+ 
+-	_, rotationDate, err := certchains.WhenToRotateAtEarliest(certChains)
+-	if err != nil {
+-		klog.Fatalf("failed to determine when to rotate certificates: %v", err)
+-	}
+-
+-	// Establish a deadline for restarting to rotate the certificates.
+-	certCtx, certCancel := context.WithDeadline(context.Background(), rotationDate)
+-
+-	// Watch for the certificate deadline context to be done, log a
+-	// message, and cancel the run context to propagate the shutdown.
+-	go func() {
+-		select {
+-		case <-certCtx.Done():
+-			klog.Info("Stopping services for certificate rotation")
+-			runCancel()
+-			return
+-		case <-runCtx.Done():
+-			klog.Info("Certificate watcher exiting")
+-			certCancel()
+-			return
++	// The kubelet rotates its bootstrapped certs itself; only locally minted
++	// chains need the restart-to-rotate deadline.
++	if certChains != nil {
++		_, rotationDate, err := certchains.WhenToRotateAtEarliest(certChains)
++		if err != nil {
++			klog.Fatalf("failed to determine when to rotate certificates: %v", err)
+ 		}
+-	}()
++
++		// Establish a deadline for restarting to rotate the certificates.
++		certCtx, certCancel := context.WithDeadline(context.Background(), rotationDate)
++
++		// Watch for the certificate deadline context to be done, log a
++		// message, and cancel the run context to propagate the shutdown.
++		go func() {
++			select {
++			case <-certCtx.Done():
++				klog.Info("Stopping services for certificate rotation")
++				runCancel()
++				return
++			case <-runCtx.Done():
++				klog.Info("Certificate watcher exiting")
++				certCancel()
++				return
++			}
++		}()
++	}
+ 
+ 	// Start everything up
+ 	ready, stopped := make(chan struct{}), make(chan struct{})
+@@ -301,7 +346,9 @@ func RunMicroshift(cfg *config.Config) error {
+ 		}
+ 
+ 		// After MicroShift's core becomes ready, run the kustomizer (delete and/or apply manifests).
+-		kustomize.NewKustomizer(cfg).RunStandalone(runCtx)
++		if !cfg.MultiNode.Worker {
++			kustomize.NewKustomizer(cfg).RunStandalone(runCtx)
++		}
+ 
+ 		// Watch for SIGTERM or service error to exit, now that we are ready.
+ 		select {
+diff --git a/pkg/cmd/run.go.orig b/pkg/cmd/run.go.orig
+new file mode 100644
+index 00000000..f41d7552
+--- /dev/null
++++ b/pkg/cmd/run.go.orig
+@@ -0,0 +1,354 @@
++package cmd
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"os/signal"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"syscall"
++	"time"
++
++	"github.com/coreos/go-systemd/daemon"
++	"github.com/openshift/microshift/pkg/admin/data"
++	"github.com/openshift/microshift/pkg/admin/prerun"
++	"github.com/openshift/microshift/pkg/config"
++	"github.com/openshift/microshift/pkg/controllers"
++	"github.com/openshift/microshift/pkg/controllers/c2cc"
++	"github.com/openshift/microshift/pkg/gdp"
++	"github.com/openshift/microshift/pkg/kustomize"
++	"github.com/openshift/microshift/pkg/loadbalancerservice"
++	"github.com/openshift/microshift/pkg/mdns"
++	"github.com/openshift/microshift/pkg/node"
++	"github.com/openshift/microshift/pkg/release"
++	"github.com/openshift/microshift/pkg/servicemanager"
++	"github.com/openshift/microshift/pkg/servicemanager/startuprecorder"
++	"github.com/openshift/microshift/pkg/sysconfwatch"
++	"github.com/openshift/microshift/pkg/util"
++	"github.com/openshift/microshift/pkg/util/cryptomaterial/certchains"
++	"github.com/openshift/microshift/pkg/version"
++	"github.com/spf13/cobra"
++
++	logsAPIV1 "k8s.io/component-base/logs/api/v1"
++	"k8s.io/klog/v2"
++	"sigs.k8s.io/yaml"
++)
++
++const (
++	gracefulShutdownTimeout = 15
++)
++
++var (
++	preRunFailedLogPath = util.LogFilePath(filepath.Join(config.BackupsDir, "prerun_failed.log"))
++	cleanUpFileLogPaths = []util.LogFilePath{
++		preRunFailedLogPath,
++	}
++)
++
++func NewRunMicroshiftCommand() *cobra.Command {
++	cmd := &cobra.Command{
++		Use:   "run",
++		Short: "Run MicroShift",
++	}
++
++	var multinode bool
++	var worker bool
++
++	multinodeDefault := true
++	if version.Get().BuildVariant != version.BuildVariantCommunity {
++		multinodeDefault = false
++	}
++
++	flags := cmd.Flags()
++	flags.BoolVar(&multinode, "multinode", multinodeDefault, "enable multinode mode")
++	flags.BoolVar(&worker, "worker", false, "run only the node services; requires --multinode and a bootstrap kubeconfig from 'add-node --worker'")
++
++	if version.Get().BuildVariant != version.BuildVariantCommunity {
++		for _, f := range []string{"multinode", "worker"} {
++			if err := flags.MarkHidden(f); err != nil {
++				panic(err)
++			}
++		}
++	}
++
++	cmd.RunE = func(cmd *cobra.Command, args []string) error {
++		versionInfo := version.Get()
++		klog.InfoS("Version", "microshift", versionInfo.String(), "base", release.Base)
++
++		cfg, err := config.ActiveConfig()
++		if err != nil {
++			return err
++		}
++
++		// `v` is a flag registered in klog's init()
++		if vFlag := flags.Lookup("v"); vFlag != nil {
++			verbosity := strconv.Itoa(cfg.GetVerbosity())
++			if err := vFlag.Value.Set(verbosity); err != nil {
++				klog.Errorf("Failed to set log verbosity: %v", err)
++			}
++		}
++
++		// A node joined as a worker (add-node --worker wrote the marker) must
++		// run as a worker even if the unit was not started with --worker,
++		// otherwise it would initCerts a full control plane over its
++		// public-only certs. The marker is the authoritative role source; the
++		// flag is a hint. Worker mode is a multinode mode.
++		worker = worker || config.IsWorkerNode()
++		if worker {
++			multinode = true
++		}
++		cfg = config.ConfigMultiNode(cfg, multinode, worker)
++
++		for _, w := range cfg.Warnings {
++			klog.Warningf("Configuration warning: %s", w)
++		}
++
++		// Things to very badly if the node's name has changed
++		// since the last time the server started.
++		err = cfg.EnsureNodeNameHasNotChanged()
++		if err != nil {
++			return err
++		}
++		return RunMicroshift(cfg)
++	}
++
++	return cmd
++}
++
++func cleanUpPreviousLogFiles() {
++	for _, p := range cleanUpFileLogPaths {
++		if errLog := p.Remove(); errLog != nil {
++			klog.ErrorS(errLog, "Failed to remove log file", "path", p)
++		}
++	}
++}
++
++func writeLogFileError(l util.LogFilePath, err error) {
++	if errLog := l.Write([]byte(err.Error())); errLog != nil {
++		klog.ErrorS(errLog, "Failed to write log file", "path", l)
++	}
++}
++
++func logConfig(cfg *config.Config) {
++	marshalled, err := yaml.Marshal(cfg)
++	if err != nil {
++		klog.Fatal(err)
++	}
++	klog.Info("Effective configuration:")
++	for _, line := range strings.Split(string(marshalled), "\n") {
++		klog.Info(line)
++	}
++}
++
++func prerunDataManagement() error {
++	dataManager, err := data.NewManager(config.BackupsDir)
++	if err != nil {
++		return fmt.Errorf("failed to create data manager: %w", err)
++	}
++
++	return prerun.DataManagement(dataManager)
++}
++
++//nolint:cyclop
++func RunMicroshift(cfg *config.Config) error {
++	// fail early if we don't have enough privileges
++	if os.Geteuid() > 0 {
++		klog.Fatalf("MicroShift must be run privileged")
++	}
++
++	microshiftStart := time.Now()
++	startRec := startuprecorder.New()
++	startRec.MicroshiftStarts(microshiftStart)
++
++	// Tell the logging code that it's OK to receive reconfiguration
++	// instructions unless those instructions are different. This
++	// overrides the default behavior of erroring out if any
++	// instructions are received a second time. That default behavior
++	// causes issues with embedded components that all use the same
++	// logging code and are not expecting to be compiled together into
++	// the same process, as they are in MicroShift. See comments in
++	// k8s.io/component-base/logs/api/v1/options.go for details.
++	logsAPIV1.ReapplyHandling = logsAPIV1.ReapplyHandlingIgnoreUnchanged
++
++	cleanUpPreviousLogFiles()
++
++	if err := prerunDataManagement(); err != nil {
++		writeLogFileError(preRunFailedLogPath, err)
++		return err
++	}
++
++	logConfig(cfg)
++
++	// TO-DO: When multi-node is ready, we need to add the controller host-name/mDNS hostname
++	//        or VIP to this list on start
++	//        see https://github.com/openshift/microshift/pull/471
++
++	if err := util.AddToNoProxyEnv(
++		cfg.Node.NodeIP,
++		cfg.Node.HostnameOverride,
++		cfg.Network.ClusterNetwork[0],
++		cfg.Network.ServiceNetwork[0],
++		".svc",
++		".cluster.local",
++		"."+cfg.DNS.BaseDomain); err != nil {
++		klog.Fatal(err)
++	}
++
++	if err := util.MakeDir(config.DataDir); err != nil {
++		return fmt.Errorf("failed to create dir %q: %w", config.DataDir, err)
++	}
++
++	if err := prerun.VersionMetadataManagement(); err != nil {
++		writeLogFileError(preRunFailedLogPath, err)
++		return err
++	}
++
++	if err := prerun.FeatureGateLockManagement(cfg); err != nil {
++		writeLogFileError(preRunFailedLogPath, err)
++		return err
++	}
++
++	if err := prerun.WriteVersionMetadata(); err != nil {
++		writeLogFileError(preRunFailedLogPath, err)
++		return err
++	}
++
++	// TODO: change to only initialize what is strictly necessary for the selected role(s)
++	certChains, err := initCerts(cfg)
++	if err != nil {
++		klog.Fatalf("failed to retrieve the necessary certificates: %v", err)
++	}
++
++	// create kubeconfig for kube-scheduler, kubelet,controller-manager
++	if err := initKubeconfigs(cfg, certChains); err != nil {
++		klog.Fatalf("failed to create the necessary kubeconfigs for internal components: %v", err)
++	}
++
++	// Establish the context we will use to control execution
++	runCtx, runCancel := context.WithCancel(context.Background())
++	m := servicemanager.NewServiceManager(startRec)
++	util.Must(m.AddService(node.NewNetworkConfiguration(cfg)))
++	util.Must(m.AddService(controllers.NewEtcd(cfg)))
++	util.Must(m.AddService(sysconfwatch.NewSysConfWatchController(cfg)))
++	util.Must(m.AddService(controllers.NewKubeAPIServer(cfg)))
++	util.Must(m.AddService(controllers.NewKubeScheduler(cfg)))
++	util.Must(m.AddService(controllers.NewKubeControllerManager(runCtx, cfg)))
++	util.Must(m.AddService(controllers.NewOpenShiftCRDManager(cfg)))
++	util.Must(m.AddService(controllers.NewRouteControllerManager(cfg)))
++	util.Must(m.AddService(controllers.NewOpenShiftDefaultSCCManager(cfg)))
++	util.Must(m.AddService(mdns.NewMicroShiftmDNSController(cfg)))
++	util.Must(m.AddService(controllers.NewClusterPolicyController(cfg)))
++	util.Must(m.AddService(controllers.NewInfrastructureServices(cfg)))
++	util.Must(m.AddService(controllers.NewVersionManager(cfg)))
++	util.Must(m.AddService(controllers.NewKubeletCAManager(cfg)))
++	util.Must(m.AddService(node.NewKubeletServer(cfg)))
++	util.Must(m.AddService(loadbalancerservice.NewLoadbalancerServiceController(cfg)))
++	util.Must(m.AddService(controllers.NewKubeStorageVersionMigrator(cfg)))
++	util.Must(m.AddService(controllers.NewClusterID(cfg)))
++	util.Must(m.AddService(controllers.NewTelemetryManager(cfg)))
++	util.Must(m.AddService(controllers.NewHostsWatcherManager(cfg)))
++	util.Must(m.AddService(controllers.NewDNSConfigurationWatcherManager(cfg)))
++	util.Must(m.AddService(gdp.NewGenericDevicePlugin(cfg)))
++	util.Must(m.AddService(c2cc.NewC2CCRouteManager(cfg)))
++
++	// Storing and clearing the env, so other components don't send the READY=1 until MicroShift is fully ready
++	notifySocket := os.Getenv("NOTIFY_SOCKET")
++	_ = os.Unsetenv("NOTIFY_SOCKET")
++
++	startRec.ServicesStart(microshiftStart)
++
++	// The kubelet rotates its bootstrapped certs itself; only locally minted
++	// chains need the restart-to-rotate deadline.
++	if certChains != nil {
++		_, rotationDate, err := certchains.WhenToRotateAtEarliest(certChains)
++		if err != nil {
++			klog.Fatalf("failed to determine when to rotate certificates: %v", err)
++		}
++
++		// Establish a deadline for restarting to rotate the certificates.
++		certCtx, certCancel := context.WithDeadline(context.Background(), rotationDate)
++
++		// Watch for the certificate deadline context to be done, log a
++		// message, and cancel the run context to propagate the shutdown.
++		go func() {
++			select {
++			case <-certCtx.Done():
++				klog.Info("Stopping services for certificate rotation")
++				runCancel()
++				return
++			case <-runCtx.Done():
++				klog.Info("Certificate watcher exiting")
++				certCancel()
++				return
++			}
++		}()
++	}
++
++	// Start everything up
++	ready, stopped := make(chan struct{}), make(chan struct{})
++	go func() {
++		klog.Infof("Started %s", m.Name())
++		if err := m.Run(runCtx, ready, stopped); err != nil {
++			klog.Errorf("Stopped %s: %v", m.Name(), err)
++		} else {
++			klog.Infof("%s completed", m.Name())
++		}
++	}()
++
++	// Connect signal handler
++	sigTerm := make(chan os.Signal, 1)
++	signal.Notify(sigTerm, os.Interrupt, syscall.SIGTERM)
++
++	var serviceErr error
++
++	select {
++	case <-ready:
++		startRec.MicroshiftReady()
++
++		_ = os.Setenv("NOTIFY_SOCKET", notifySocket)
++		if supported, err := daemon.SdNotify(false, daemon.SdNotifyReady); err != nil {
++			klog.Warningf("error sending sd_notify readiness message: %v", err)
++		} else if supported {
++			klog.Info("sent sd_notify readiness message")
++		} else {
++			klog.Info("service does not support sd_notify readiness messages")
++		}
++
++		// After MicroShift's core becomes ready, run the kustomizer (delete and/or apply manifests).
++		if !cfg.MultiNode.Worker {
++			kustomize.NewKustomizer(cfg).RunStandalone(runCtx)
++		}
++
++		// Watch for SIGTERM or service error to exit, now that we are ready.
++		select {
++		case <-sigTerm:
++			klog.Info("Interrupt received")
++		case err := <-m.ErrChan():
++			serviceErr = err
++			klog.Infof("Service error: %v", err)
++		}
++	case <-sigTerm:
++		// A signal that comes in before we are ready is handled here.
++		klog.Info("Interrupt received")
++	case err := <-m.ErrChan():
++		// A service error that comes in before we are ready is handled here.
++		serviceErr = err
++		klog.Infof("Service error before ready: %v", err)
++	case <-runCtx.Done():
++		// We might end up here if the certificate rotation is
++		// triggered and we exit on our own, instead of via a signal.
++	}
++	klog.Info("MICROSHIFT STOPPING")
++	microshiftStop := time.Now()
++	runCancel()
++
++	select {
++	case <-stopped:
++	case <-time.After(time.Duration(gracefulShutdownTimeout) * time.Second):
++		klog.InfoS("MICROSHIFT STOP TIMED OUT", "since-stop", time.Since(microshiftStop))
++	}
++	klog.InfoS("MICROSHIFT STOPPED", "since-stop", time.Since(microshiftStop))
++	return serviceErr
++}
+diff --git a/pkg/config/multinode.go b/pkg/config/multinode.go
+index 37bd5b77..86c06cb8 100644
+--- a/pkg/config/multinode.go
++++ b/pkg/config/multinode.go
+@@ -1,14 +1,52 @@
+ package config
+ 
++import (
++	"os"
++	"path/filepath"
++
++	"k8s.io/klog/v2"
++)
++
+ type MultiNodeConfig struct {
+ 	Enabled bool `json:"enabled"`
++	// only one controlplane node is supported
++	// IP address of control plane node
++	Controlplane string `json:"controlplane"`
++	// Worker runs only the node services; the control plane is remote
++	Worker bool `json:"worker"`
+ }
+ 
+ // ConfigMultiNode populates multinode configurations to Config.MultiNode
+-func ConfigMultiNode(c *Config, enabled bool) *Config {
++func ConfigMultiNode(c *Config, enabled bool, worker bool) *Config {
+ 	if !enabled {
+ 		return c
+ 	}
+ 	c.MultiNode.Enabled = enabled
++	c.MultiNode.Controlplane = c.Node.NodeIP
++	c.MultiNode.Worker = worker
++	if worker {
++		// The advertise address on lo would blackhole in-cluster apiserver
++		// traffic on a node that serves no API.
++		c.ApiServer.SkipInterface = true
++	}
+ 	return c
+ }
++
++// WorkerMarkerPath is written by 'add-node --worker' so role-agnostic tools
++// (healthcheck, greenboot) can tell a worker from a control plane node.
++func WorkerMarkerPath() string {
++	return filepath.Join(DataDir, "multinode-worker")
++}
++
++func IsWorkerNode() bool {
++	_, err := os.Stat(WorkerMarkerPath())
++	if err == nil {
++		return true
++	}
++	if !os.IsNotExist(err) {
++		// A stat failure that is not "absent" (permission, SELinux) must not
++		// silently flip a worker to the control-plane health path.
++		klog.Warningf("cannot stat worker marker %s, assuming control-plane role: %v", WorkerMarkerPath(), err)
++	}
++	return false
++}
+diff --git a/pkg/controllers/kubelet_client_ca_refresh.go b/pkg/controllers/kubelet_client_ca_refresh.go
+new file mode 100644
+index 00000000..67365d32
+--- /dev/null
++++ b/pkg/controllers/kubelet_client_ca_refresh.go
+@@ -0,0 +1,105 @@
++/*
++Copyright © 2026 MicroShift Contributors
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++package controllers
++
++import (
++	"context"
++	"os"
++	"time"
++
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/client-go/kubernetes"
++	"k8s.io/client-go/tools/clientcmd"
++	"k8s.io/klog/v2"
++
++	"github.com/openshift/microshift/pkg/config"
++	"github.com/openshift/microshift/pkg/util/cryptomaterial"
++)
++
++// KubeletClientCARefresh keeps a worker's kubelet client CA bundle current.
++// kubelet-ca-manager on the control plane publishes the live bundle to the
++// kube-system/kubelet-client-ca configmap; a worker holds no signing keys and
++// otherwise only ever gets the copy written once at join time, so after the
++// control plane rotates its signers (ShortLived CAs are yearly) the static
++// bundle would stop trusting apiserver-to-kubelet client certs. Best-effort:
++// any failure is logged and never blocks the node.
++type KubeletClientCARefresh struct {
++	kubeconfigPath string
++	caPath         string
++}
++
++func NewKubeletClientCARefresh(cfg *config.Config) *KubeletClientCARefresh {
++	return &KubeletClientCARefresh{
++		kubeconfigPath: cfg.KubeConfigPath(config.Kubelet),
++		caPath:         cryptomaterial.KubeletClientCAPath(cryptomaterial.CertsDirectory(config.DataDir)),
++	}
++}
++
++func (r *KubeletClientCARefresh) Name() string           { return "kubelet-client-ca-refresh" }
++func (r *KubeletClientCARefresh) Dependencies() []string { return []string{"kubelet"} }
++
++func (r *KubeletClientCARefresh) Run(ctx context.Context, ready chan<- struct{}, stopped chan<- struct{}) error {
++	defer close(stopped)
++	close(ready)
++
++	ticker := time.NewTicker(time.Hour)
++	defer ticker.Stop()
++	for {
++		r.syncOnce(ctx)
++		select {
++		case <-ctx.Done():
++			return nil
++		case <-ticker.C:
++		}
++	}
++}
++
++func (r *KubeletClientCARefresh) syncOnce(ctx context.Context) {
++	restConfig, err := clientcmd.BuildConfigFromFlags("", r.kubeconfigPath)
++	if err != nil {
++		klog.V(2).Infof("kubelet-client-ca-refresh: no kubeconfig yet: %v", err)
++		return
++	}
++	client, err := kubernetes.NewForConfig(restConfig)
++	if err != nil {
++		klog.V(2).Infof("kubelet-client-ca-refresh: client: %v", err)
++		return
++	}
++	cm, err := client.CoreV1().ConfigMaps(kubeletCAConfigMapNamespace).Get(ctx, kubeletCAConfigMapName, metav1.GetOptions{})
++	if err != nil {
++		klog.V(2).Infof("kubelet-client-ca-refresh: get configmap: %v", err)
++		return
++	}
++	want := cm.Data[kubeletCAFileName]
++	if want == "" {
++		return
++	}
++	if have, err := os.ReadFile(r.caPath); err == nil && string(have) == want {
++		return
++	}
++	// Atomic replace; kubelet picks the new bundle up via its dynamic CA
++	// reload, or at the latest on the next restart.
++	tmp := r.caPath + ".tmp"
++	if err := os.WriteFile(tmp, []byte(want), 0600); err != nil {
++		klog.Warningf("kubelet-client-ca-refresh: write: %v", err)
++		return
++	}
++	if err := os.Rename(tmp, r.caPath); err != nil {
++		klog.Warningf("kubelet-client-ca-refresh: rename: %v", err)
++		return
++	}
++	klog.Infof("kubelet-client-ca-refresh: updated %s from %s/%s", r.caPath, kubeletCAConfigMapNamespace, kubeletCAConfigMapName)
++}
+diff --git a/pkg/controllers/kubelet_csr_approver.go b/pkg/controllers/kubelet_csr_approver.go
+new file mode 100644
+index 00000000..4c0f12e3
+--- /dev/null
++++ b/pkg/controllers/kubelet_csr_approver.go
+@@ -0,0 +1,192 @@
++/*
++Copyright © 2026 MicroShift Contributors
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++package controllers
++
++import (
++	"context"
++	"crypto/x509"
++	"fmt"
++	"slices"
++	"strings"
++	"time"
++
++	certsv1 "k8s.io/api/certificates/v1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/client-go/kubernetes"
++	"k8s.io/client-go/tools/clientcmd"
++	"k8s.io/klog/v2"
++	k8scert "k8s.io/kubernetes/pkg/apis/certificates"
++
++	"github.com/openshift/microshift/pkg/config"
++)
++
++const nodeUserPrefix = "system:node:"
++
++// KubeletCSRApprover approves the CSRs a worker node cannot self-sign: its
++// serving certificate (serverTLSBootstrap) and client certificate renewals.
++// The initial client CSR is created with the bootstrap kubeconfig identity
++// and auto-approved by kube-controller-manager.
++type KubeletCSRApprover struct {
++	kubeconfigPath string
++}
++
++func NewKubeletCSRApprover(cfg *config.Config) *KubeletCSRApprover {
++	return &KubeletCSRApprover{kubeconfigPath: cfg.KubeConfigPath(config.KubeAdmin)}
++}
++
++func (a *KubeletCSRApprover) Name() string           { return "kubelet-csr-approver" }
++func (a *KubeletCSRApprover) Dependencies() []string { return []string{"kube-apiserver"} }
++
++func (a *KubeletCSRApprover) Run(ctx context.Context, ready chan<- struct{}, stopped chan<- struct{}) error {
++	defer close(stopped)
++
++	restConfig, err := clientcmd.BuildConfigFromFlags("", a.kubeconfigPath)
++	if err != nil {
++		return err
++	}
++	client, err := kubernetes.NewForConfig(restConfig)
++	if err != nil {
++		return err
++	}
++	close(ready)
++
++	ticker := time.NewTicker(30 * time.Second)
++	defer ticker.Stop()
++	for {
++		a.approvePending(ctx, client)
++		select {
++		case <-ctx.Done():
++			return nil
++		case <-ticker.C:
++		}
++	}
++}
++
++func (a *KubeletCSRApprover) approvePending(ctx context.Context, client kubernetes.Interface) {
++	csrs, err := client.CertificatesV1().CertificateSigningRequests().List(ctx, metav1.ListOptions{})
++	if err != nil {
++		klog.Errorf("kubelet-csr-approver: failed to list CSRs: %v", err)
++		return
++	}
++	for i := range csrs.Items {
++		csr := &csrs.Items[i]
++		if isResolved(csr) {
++			continue
++		}
++		approve, reason := shouldApprove(ctx, client, csr)
++		if !approve {
++			if reason != "" {
++				klog.V(2).Infof("kubelet-csr-approver: not approving %s: %s", csr.Name, reason)
++			}
++			continue
++		}
++		csr.Status.Conditions = append(csr.Status.Conditions, certsv1.CertificateSigningRequestCondition{
++			Type:           certsv1.CertificateApproved,
++			Status:         corev1.ConditionTrue,
++			Reason:         "AutoApproved",
++			Message:        "auto-approved kubelet certificate for " + csr.Spec.Username,
++			LastUpdateTime: metav1.Now(),
++		})
++		if _, err := client.CertificatesV1().CertificateSigningRequests().UpdateApproval(ctx, csr.Name, csr, metav1.UpdateOptions{}); err != nil {
++			klog.Errorf("kubelet-csr-approver: failed to approve %s: %v", csr.Name, err)
++			continue
++		}
++		klog.Infof("kubelet-csr-approver: approved %s (%s) for %s", csr.Name, csr.Spec.SignerName, csr.Spec.Username)
++	}
++}
++
++func isResolved(csr *certsv1.CertificateSigningRequest) bool {
++	for _, c := range csr.Status.Conditions {
++		if c.Status == corev1.ConditionFalse {
++			continue
++		}
++		if c.Type == certsv1.CertificateApproved || c.Type == certsv1.CertificateDenied {
++			return true
++		}
++	}
++	return false
++}
++
++func shouldApprove(ctx context.Context, client kubernetes.Interface, csr *certsv1.CertificateSigningRequest) (bool, string) {
++	// Only requests made by a node about itself qualify; everything else is
++	// left for a human or another controller.
++	if !slices.Contains(csr.Spec.Groups, "system:nodes") {
++		return false, ""
++	}
++	nodeName := strings.TrimPrefix(csr.Spec.Username, nodeUserPrefix)
++	if nodeName == csr.Spec.Username {
++		return false, ""
++	}
++
++	req, err := k8scert.ParseCSR(csr.Spec.Request)
++	if err != nil {
++		return false, err.Error()
++	}
++	// Bind the certificate identity to the requesting node; the vendored
++	// validators only check the system:node: prefix, not the exact name.
++	if req.Subject.CommonName != csr.Spec.Username {
++		return false, "subject does not match requester"
++	}
++
++	usages := sets.NewString()
++	for _, u := range csr.Spec.Usages {
++		usages.Insert(string(u))
++	}
++
++	switch csr.Spec.SignerName {
++	case certsv1.KubeletServingSignerName:
++		// Enforces org, CN prefix, exact usages, and rejects email/URI SANs.
++		if err := k8scert.ValidateKubeletServingCSR(req, usages); err != nil {
++			return false, err.Error()
++		}
++		return validateServingNames(ctx, client, req, nodeName)
++	case certsv1.KubeAPIServerClientKubeletSignerName:
++		if err := k8scert.ValidateKubeletClientCSR(req, usages); err != nil {
++			return false, err.Error()
++		}
++		return true, ""
++	default:
++		return false, ""
++	}
++}
++
++// validateServingNames requires every serving SAN to be an address the node
++// reports for itself. node.Status.Addresses is self-reported by the kubelet,
++// so this bounds a node to plausible names for itself but cannot stop a node
++// that lies about its own status; a scoped signer is the deeper fix.
++func validateServingNames(ctx context.Context, client kubernetes.Interface, req *x509.CertificateRequest, nodeName string) (bool, string) {
++	node, err := client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
++	if err != nil {
++		return false, fmt.Sprintf("failed to get node %s: %v", nodeName, err)
++	}
++	allowed := sets.New[string](node.Name)
++	for _, addr := range node.Status.Addresses {
++		allowed.Insert(addr.Address)
++	}
++	for _, dns := range req.DNSNames {
++		if !allowed.Has(dns) {
++			return false, fmt.Sprintf("DNS name %q is not an address of node %s", dns, nodeName)
++		}
++	}
++	for _, ip := range req.IPAddresses {
++		if !allowed.Has(ip.String()) {
++			return false, fmt.Sprintf("IP %q is not an address of node %s", ip.String(), nodeName)
++		}
++	}
++	return true, ""
++}
+diff --git a/pkg/node/kubelet.go b/pkg/node/kubelet.go
+index 6a0c8ce6..85f66fcf 100644
+--- a/pkg/node/kubelet.go
++++ b/pkg/node/kubelet.go
+@@ -22,6 +22,7 @@ import (
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
++	"strconv"
+ 	"strings"
+ 	"text/template"
+ 
+@@ -51,6 +52,7 @@ const (
+ type KubeletServer struct {
+ 	kubeletflags *kubeletoptions.KubeletFlags
+ 	kubeconfig   *kubeletconfig.KubeletConfiguration
++	workerOnly   bool
+ }
+ 
+ func NewKubeletServer(cfg *config.Config) *KubeletServer {
+@@ -59,10 +61,16 @@ func NewKubeletServer(cfg *config.Config) *KubeletServer {
+ 	return s
+ }
+ 
+-func (s *KubeletServer) Name() string           { return componentKubelet }
+-func (s *KubeletServer) Dependencies() []string { return []string{"kube-apiserver"} }
++func (s *KubeletServer) Name() string { return componentKubelet }
++func (s *KubeletServer) Dependencies() []string {
++	if s.workerOnly {
++		return []string{}
++	}
++	return []string{"kube-apiserver"}
++}
+ 
+ func (s *KubeletServer) configure(cfg *config.Config) {
++	s.workerOnly = cfg.MultiNode.Enabled && cfg.MultiNode.Worker
+ 	if err := s.writeConfig(cfg); err != nil {
+ 		klog.Fatalf("Failed to write kubelet config %v", err)
+ 	}
+@@ -84,8 +92,10 @@ func (s *KubeletServer) configure(cfg *config.Config) {
+ 	kubeletFlags.RuntimeCgroups = "/system.slice/crio.service"
+ 	kubeletFlags.HostnameOverride = cfg.Node.HostnameOverride
+ 	kubeletFlags.NodeIP = nodeIP
+-	kubeletFlags.NodeLabels["node-role.kubernetes.io/control-plane"] = ""
+-	kubeletFlags.NodeLabels["node-role.kubernetes.io/master"] = ""
++	if !s.workerOnly {
++		kubeletFlags.NodeLabels["node-role.kubernetes.io/control-plane"] = ""
++		kubeletFlags.NodeLabels["node-role.kubernetes.io/master"] = ""
++	}
+ 	kubeletFlags.NodeLabels["node-role.kubernetes.io/worker"] = ""
+ 	kubeletFlags.NodeLabels["node.openshift.io/os_id"] = osID
+ 	kubeletFlags.NodeLabels["node.kubernetes.io/instance-type"] = "rhde"
+@@ -144,10 +154,21 @@ func (s *KubeletServer) generateConfig(cfg *config.Config) ([]byte, error) {
+ 		userProvidedConfig = string(b)
+ 	}
+ 
++	// Workers have no local signing material: the serving cert comes from a
++	// kubelet-serving CSR (serverTLSBootstrap) and the client cert rotates
++	// through CSRs instead of a restart-to-rotate of local chains.
++	tlsCertFile := cryptomaterial.ServingCertPath(servingCertDir)
++	tlsPrivateKeyFile := cryptomaterial.ServingKeyPath(servingCertDir)
++	if s.workerOnly {
++		tlsCertFile = ""
++		tlsPrivateKeyFile = ""
++	}
+ 	tplParams := map[string]string{
+ 		"clientCAFile":       cryptomaterial.KubeletClientCAPath(cryptomaterial.CertsDirectory(config.DataDir)),
+-		"tlsCertFile":        cryptomaterial.ServingCertPath(servingCertDir),
+-		"tlsPrivateKeyFile":  cryptomaterial.ServingKeyPath(servingCertDir),
++		"serverTLSBootstrap": strconv.FormatBool(s.workerOnly),
++		"rotateCertificates": strconv.FormatBool(s.workerOnly),
++		"tlsCertFile":        tlsCertFile,
++		"tlsPrivateKeyFile":  tlsPrivateKeyFile,
+ 		"volumePluginDir":    config.DataDir + "/kubelet-plugins/volume/exec",
+ 		"clusterDNSIP":       cfg.Network.DNS,
+ 		"resolvConf":         resolvConf,
+diff --git a/pkg/node/kubelet_test.go b/pkg/node/kubelet_test.go
+index a98a071c..85451858 100644
+--- a/pkg/node/kubelet_test.go
++++ b/pkg/node/kubelet_test.go
+@@ -47,4 +47,19 @@ reservedMemory:
+ 	data, err := kubelet.generateConfig(cfg)
+ 	assert.NoError(t, err)
+ 	assert.Contains(t, string(data), expectedConfigPart)
++	assert.Contains(t, string(data), "serverTLSBootstrap: false")
++	assert.Contains(t, string(data), "tlsCertFile")
++}
++
++func Test_GenerateConfigWorker(t *testing.T) {
++	cfg := config.NewDefault()
++
++	kubelet := &KubeletServer{workerOnly: true}
++	data, err := kubelet.generateConfig(cfg)
++	assert.NoError(t, err)
++	assert.Contains(t, string(data), "serverTLSBootstrap: true")
++	assert.Contains(t, string(data), "rotateCertificates: true")
++	assert.Contains(t, string(data), "RotateKubeletServerCertificate: true")
++	assert.NotContains(t, string(data), "tlsCertFile")
++	assert.NotContains(t, string(data), "tlsPrivateKeyFile")
+ }
+diff --git a/pkg/node/netconfig.go b/pkg/node/netconfig.go
+index 35a5ca66..ed338cc7 100644
+--- a/pkg/node/netconfig.go
++++ b/pkg/node/netconfig.go
+@@ -63,14 +63,18 @@ func (n *NetworkConfiguration) Run(ctx context.Context, ready chan<- struct{}, s
+ 		if err := n.addServiceIPLoopback(); err != nil {
+ 			return err
+ 		}
+-		go func() {
+-			<-ctx.Done()
++	}
++	// Always drive stopChan on cancel; skipping interface config must not
++	// leave Run blocked forever (workers force SkipInterface).
++	go func() {
++		<-ctx.Done()
++		if !n.skipInterfaceConfiguration {
+ 			if err := n.removeServiceIPLoopback(); err != nil {
+ 				klog.Warningf("failed to remove IP from interface: %v", err)
+ 			}
+-			close(stopChan)
+-		}()
+-	}
++		}
++		close(stopChan)
++	}()
+ 	klog.Infof("%q is ready", n.Name())
+ 	close(ready)
+ 	<-stopChan
+diff --git a/scripts/multinode/configure-node.sh b/scripts/multinode/configure-node.sh
+index e55d133b..90aa5931 100755
+--- a/scripts/multinode/configure-node.sh
++++ b/scripts/multinode/configure-node.sh
+@@ -4,6 +4,7 @@ set -euo pipefail
+ # Variables for node configuration
+ NODE_ADDR=""
+ BOOTSTRAP_KUBECONFIG=""
++WORKER=0
+ 
+ function usage() {
+     echo "This script configures a node to run a MicroShift cluster."
+@@ -11,6 +12,7 @@ function usage() {
+     echo "Usage: $(basename "$0") [OPTIONS]"
+     echo "Options:"
+     echo "  --bootstrap-kubeconfig PATH    Path to kubeconfig file for joining existing cluster (optional)"
++    echo "  --worker                       Join as a worker: node services only, no etcd member, no control plane"
+     echo "  -h, --help                     Show this help message"
+     exit 1
+ }
+@@ -40,12 +42,16 @@ telemetry:
+   status: Disabled
+ EOF
+ 
++    local run_args="--multinode"
++    if [ "${WORKER}" -eq 1 ]; then
++        run_args="--multinode --worker"
++    fi
+     sudo mkdir -p /etc/systemd/system/microshift.service.d
+     cat <<EOF | sudo tee /etc/systemd/system/microshift.service.d/multinode.conf &>/dev/null
+ [Service]
+ # Clear previous ExecStart, otherwise systemd would try to run both.
+ ExecStart=
+-ExecStart=microshift run --multinode
++ExecStart=microshift run ${run_args}
+ EOF
+     sudo systemctl daemon-reload
+     sudo systemctl enable microshift.service
+@@ -56,7 +62,12 @@ function start_microshift() {
+ }
+ 
+ function run_add_node_commands() {
+-    if ! sudo microshift add-node --kubeconfig="${BOOTSTRAP_KUBECONFIG}"; then
++    local add_args=""
++    if [ "${WORKER}" -eq 1 ]; then
++        add_args="--worker"
++    fi
++    # shellcheck disable=SC2086
++    if ! sudo microshift add-node --kubeconfig="${BOOTSTRAP_KUBECONFIG}" ${add_args}; then
+         echo "Error: Failed to add node using kubeconfig: ${BOOTSTRAP_KUBECONFIG}"
+         exit 1
+     fi
+@@ -114,6 +125,10 @@ while [[ $# -gt 0 ]]; do
+             BOOTSTRAP_KUBECONFIG="$2"
+             shift 2
+             ;;
++        --worker)
++            WORKER=1
++            shift
++            ;;
+         -h|--help)
+             usage
+             ;;
+@@ -124,6 +139,11 @@ while [[ $# -gt 0 ]]; do
+     esac
+ done
+ 
++if [ "${WORKER}" -eq 1 ] && [ -z "${BOOTSTRAP_KUBECONFIG}" ]; then
++    echo "Error: --worker requires --bootstrap-kubeconfig"
++    usage
++fi
++
+ # Validate BOOTSTRAP_KUBECONFIG if provided
+ if [ -n "${BOOTSTRAP_KUBECONFIG}" ]; then
+     if [ ! -f "${BOOTSTRAP_KUBECONFIG}" ]; then
+@@ -137,7 +157,11 @@ configure_system
+ configure_microshift
+ if [ -n "${BOOTSTRAP_KUBECONFIG}" ]; then
+     run_add_node_commands
+-    run_healthcheck
++    # healthcheck needs the local apiserver a worker does not run;
++    # add-node already waited for the node to be Ready
++    if [ "${WORKER}" -eq 0 ]; then
++        run_healthcheck
++    fi
+ else
+     start_microshift
+ fi

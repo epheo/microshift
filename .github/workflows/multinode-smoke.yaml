@@ -1,0 +1,132 @@
+name: multinode-smoke
+# Worker-join acceptance for the multinode-worker branch, built from the
+# branch's source. Two lanes on independent runners:
+#   smoke    two privileged containers, join mechanics + dataplane (~30m)
+#   vm-join  two QEMU VMs, bootc deploy + firewalld + greenboot (~60m)
+# Publishes nothing; build.yaml stays the only publish path.
+
+on:
+  push:
+    branches: [multinode-worker]
+  workflow_dispatch:
+
+concurrency:
+  group: multinode-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          swap-storage: false
+
+      - name: Load version pins
+        run: grep -E '^[A-Z_]+=' versions.env >> "${GITHUB_ENV}"
+
+      # Registry CDNs flake (unexpected EOF mid-blob); pull every base image
+      # with retries up front so the builds run against the local store.
+      - name: Pre-pull base images
+        run: |
+          set -euo pipefail
+          for img in \
+              quay.io/fedora/fedora:latest \
+              "${BUILDROOT_IMAGE}" \
+              "${BOOTC_IMAGE_URL}:${BOOTC_IMAGE_TAG}"; do
+            for i in $(seq 5); do
+              if sudo podman pull -q "${img}"; then break; fi
+              if [ "${i}" = "5" ]; then echo "ERROR: could not pull ${img}"; exit 1; fi
+              echo "pull failed (attempt ${i}) for ${img}, retrying"; sleep 15
+            done
+          done
+
+      - name: Build SRPM (source + patches + OKD payload swap)
+        run: make srpm PODMAN="sudo podman"
+
+      - name: Build RPMs (el10)
+        run: make rpm PODMAN="sudo podman"
+
+      - name: Build bootc image
+        run: make image PODMAN="sudo podman"
+
+      - name: Worker-join smoke test
+        run: make multinode-smoke
+
+  vm-join:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          swap-storage: false
+
+      - name: Load version pins
+        run: grep -E '^[A-Z_]+=' versions.env >> "${GITHUB_ENV}"
+
+      - name: Enable KVM for the runner
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install qemu and dnsmasq
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-x86 dnsmasq
+          # ubuntu's dnsmasq wants to run globally; the test runs its
+          # own instance on the bridge.
+          sudo systemctl stop dnsmasq 2>/dev/null || true
+          sudo systemctl disable dnsmasq 2>/dev/null || true
+
+      - name: Pre-pull base images
+        run: |
+          set -euo pipefail
+          for img in \
+              quay.io/fedora/fedora:latest \
+              "${BUILDROOT_IMAGE}" \
+              "${BOOTC_IMAGE_URL}:${BOOTC_IMAGE_TAG}" \
+              quay.io/centos-bootc/bootc-image-builder:latest; do
+            for i in $(seq 5); do
+              if sudo podman pull -q "${img}"; then break; fi
+              if [ "${i}" = "5" ]; then echo "ERROR: could not pull ${img}"; exit 1; fi
+              echo "pull failed (attempt ${i}) for ${img}, retrying"; sleep 15
+            done
+          done
+
+      - name: Build SRPM (source + patches + OKD payload swap)
+        run: make srpm PODMAN="sudo podman"
+
+      - name: Build RPMs (el10)
+        run: make rpm PODMAN="sudo podman"
+
+      - name: Build bootc image
+        run: make image PODMAN="sudo podman"
+
+      - name: Two-VM worker join test
+        run: make multinode-test
+
+      - name: Make VM console logs readable
+        if: failure()
+        run: sudo chmod -R a+rX /tmp/epheo-microshift-multinode 2>/dev/null || true
+
+      - name: Collect console logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multinode-consoles
+          path: /tmp/epheo-microshift-multinode/console*.log
+          if-no-files-found: ignore

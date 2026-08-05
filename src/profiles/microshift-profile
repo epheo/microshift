@@ -1,0 +1,68 @@
+#!/bin/bash
+# Select this node's role profile.
+#   controller  full MicroShift (the default; matches a fresh install)
+#   worker      node services only; the control plane is another node
+# The profile only shapes the machine (unit override, firewall). Joining a
+# cluster is a separate step: 'microshift add-node --worker --kubeconfig ...'.
+set -euo pipefail
+
+OVERRIDE_DIR=/etc/systemd/system/microshift.service.d
+OVERRIDE=${OVERRIDE_DIR}/50-profile-worker.conf
+
+usage() {
+    echo "Usage: microshift-profile [controller|worker]"
+    echo "Without arguments, prints the active profile."
+    exit "${1:-1}"
+}
+
+firewall_apply() {
+    # The daemon is down during image builds and early boot; permanent config
+    # is the source of truth either way.
+    if firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --quiet --permanent "$@"
+        firewall-cmd --quiet --reload
+    else
+        firewall-offline-cmd --quiet "$@"
+    fi
+}
+
+if [ "${1:-status}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    usage 0
+fi
+
+if [ "$(id -u)" -ne 0 ] && [ -n "${1:-}" ]; then
+    echo "microshift-profile must be run as root to change the profile"
+    exit 1
+fi
+
+case "${1:-}" in
+"")
+    if [ -f "${OVERRIDE}" ]; then echo worker; else echo controller; fi
+    ;;
+controller)
+    rm -f "${OVERRIDE}"
+    systemctl daemon-reload
+    firewall_apply --zone=public --add-service=microshift-controlplane
+    echo "Profile: controller."
+    echo "A previous worker join is not undone; run 'microshift-cleanup-data --all'"
+    echo "before re-purposing a joined node."
+    ;;
+worker)
+    mkdir -p "${OVERRIDE_DIR}"
+    cat > "${OVERRIDE}" <<'EOF'
+[Service]
+# Clear the packaged ExecStart, otherwise systemd would try to run both.
+ExecStart=
+ExecStart=microshift run --multinode --worker
+EOF
+    systemctl daemon-reload
+    firewall_apply --zone=public --remove-service=microshift-controlplane
+    echo "Profile: worker. Join the cluster with:"
+    echo "  microshift add-node --worker --kubeconfig /path/to/bootstrap-kubeconfig"
+    echo "The bootstrap kubeconfig is the controller's"
+    echo "/var/lib/microshift/resources/kubeadmin/<node-addr>/kubeconfig."
+    ;;
+*)
+    usage 1
+    ;;
+esac

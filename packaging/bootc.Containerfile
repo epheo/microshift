@@ -15,6 +15,9 @@
 #     embedded) but sites are expected to set ingress Removed.
 #   - greenboot health gating stays fully enabled: a broken update must roll
 #     back on its own.
+#   - Node profiles: every image can be a controller (default) or a worker
+#     (microshift-profile worker + microshift add-node --worker); workers hold
+#     no signing keys (patches/0006, 0007).
 #
 # Derived images (site/lab layers) may drop additional OCI archives + manifest
 # lines under /usr/lib/embedded-images/ — the import service picks them up.
@@ -80,10 +83,19 @@ RUN dnf -y install kernel-modules-extra && dnf clean all
 RUN test -f /etc/containers/policy.json || \
     cp /usr/share/containers/policy.json /etc/containers/policy.json
 
+# Role-scoped firewalld services; postinstall bakes the controller baseline
+# and microshift-profile switches roles post-deploy.
+COPY ./src/firewall/microshift-controlplane.xml \
+     ./src/firewall/microshift-node.xml \
+     /usr/lib/firewalld/services/
+
 # Post-install configuration (firewall, sysctl limits, kubeconfig link,
 # service enablement).
 COPY --chmod=755 ./src/rpm/postinstall.sh ${USHIFT_POSTINSTALL_SCRIPT}
 RUN ${USHIFT_POSTINSTALL_SCRIPT} && rm -vf "${USHIFT_POSTINSTALL_SCRIPT}"
+
+# Node role selector: controller (default) or worker (multinode, patches/0006).
+COPY --chmod=755 ./src/profiles/microshift-profile /usr/bin/microshift-profile
 
 # Embed the full MicroShift payload under /usr/lib/embedded-images.
 # import-embedded-images.service imports every manifest entry into cri-o's

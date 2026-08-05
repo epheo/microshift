@@ -1,8 +1,7 @@
-# Two-node multinode acceptance: dispatch-only while the joined node's
-# CNI bug stands (MULTINODE-INVESTIGATION.md); flip into the main gate
-# once green. Tests the published image by default so a run costs ~30
-# minutes, not a full source build; set image to a candidate ref to
-# test something else.
+# Two-VM worker-join acceptance against a PUBLISHED image (no source
+# build): the controller + 'microshift add-node --worker' flow with
+# firewalld and greenboot in place. Dispatch-only; branch work runs the
+# same test built from source via multinode-smoke.yaml's vm-join job.
 name: multinode
 
 on:
