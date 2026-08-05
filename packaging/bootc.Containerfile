@@ -101,6 +101,14 @@ COPY --chmod=755 ./src/embedded-images/import-embedded-images.sh /usr/bin/import
 COPY ./src/embedded-images/import-embedded-images.service /usr/lib/systemd/system/import-embedded-images.service
 RUN systemctl enable import-embedded-images.service
 
+# kubelet sandbox creation hard-fails on open /etc/resolv.conf, and nothing
+# in this image ships one: NetworkManager only writes it when DHCP hands out
+# DNS servers, which an air-gapped site (or qemu restrict=on) never does.
+# An empty file is valid ("no nameservers") and NM overwrites it when it
+# does have data.
+RUN echo 'f /etc/resolv.conf 0644 root root -' \
+        > /usr/lib/tmpfiles.d/microshift-resolv-conf.conf
+
 # bootc#1682 workaround: keep the skopeo helper privileged under the update
 # timer so hosts pulling from authenticated registries can auto-update —
 # see the drop-in for details.
