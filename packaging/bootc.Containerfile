@@ -94,6 +94,13 @@ COPY ./src/firewall/microshift-controlplane.xml \
 COPY --chmod=755 ./src/rpm/postinstall.sh ${USHIFT_POSTINSTALL_SCRIPT}
 RUN ${USHIFT_POSTINSTALL_SCRIPT} && rm -vf "${USHIFT_POSTINSTALL_SCRIPT}"
 
+# postinstall's dnf transaction above is the last one in this image (later
+# stages only run skopeo/systemctl). overlayfs makes semodule non-atomic inside
+# a build layer, and a scriptlet that fails there does not fail dnf, so the
+# store has to be repaired and asserted in its own layer after every dnf.
+COPY --chmod=755 ./src/selinux/repair-module-store.sh /tmp/repair-module-store.sh
+RUN /tmp/repair-module-store.sh && rm -vf /tmp/repair-module-store.sh
+
 # Node role selector: controller (default) or worker (multinode, patches/0006).
 COPY --chmod=755 ./src/profiles/microshift-profile /usr/bin/microshift-profile
 

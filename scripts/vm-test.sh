@@ -30,6 +30,7 @@ set -euo pipefail
 
 DIST_IMAGE="${DIST_IMAGE:-epheo-microshift}"
 UPGRADE_FROM="${UPGRADE_FROM:-}"
+. "$(dirname "$0")/lib-diag.sh"
 WORKDIR="${WORKDIR:-/tmp/epheo-microshift-vm${UPGRADE_FROM:+-upgrade}}"
 SSH_PORT="${SSH_PORT:-2222}"
 VM_MEM="${VM_MEM:-8192}"
@@ -74,9 +75,10 @@ vssh() {
 KCFG=/var/lib/microshift/resources/kubeadmin/kubeconfig
 koc() { vssh oc --kubeconfig "${KCFG}" "$@"; }
 
-# A NotReady node is usually a CNI (OVN-K) or crio failure, none of which reach
-# the serial console (they log to journald). Write the full state to a file the
-# workflow uploads as an artifact, and tail it to the job log for quick triage.
+# A NotReady node, or a microshift.service that never comes up, is usually an
+# OVS/OVN-K, crio or SELinux failure, none of which reach the serial console
+# (they log to journald). Write the full state to a file the workflow uploads
+# as an artifact, and tail it to the job log for quick triage.
 # All best-effort: the guest may be half-up, so nothing here may fail cleanup.
 dump_diag() {
     local ns=openshift-ovn-kubernetes
@@ -84,6 +86,8 @@ dump_diag() {
     {
         echo "### journalctl -u microshift (this boot) ###"
         vssh journalctl -u microshift --no-pager -b 2>&1
+        echo "### journalctl -u crio (this boot) ###"
+        vssh journalctl -u crio --no-pager -b 2>&1
         echo "### nodes ###"; koc get nodes -o wide 2>&1
         echo "### pods -A ###"; koc get pods -A -o wide 2>&1
         echo "### ${ns} describe ###"; koc -n "${ns}" describe pods 2>&1
@@ -92,11 +96,26 @@ dump_diag() {
             echo "--- ${p} ---"
             koc -n "${ns}" logs "${p}" --all-containers --prefix --tail=300 2>&1
         done
-        echo "### journalctl -u crio (this boot) ###"
-        vssh journalctl -u crio --no-pager -b 2>&1
+        diag_ovs_journals vssh
+
+        # Everything below stays short, and the highest-signal sections come
+        # last: the tail printed to the job log has to name the cause without
+        # anyone opening the artifact.
+        echo "### bootc status ###"; vssh bootc status 2>&1
+        echo "### ovs-vsctl show ###"; vssh ovs-vsctl --timeout=5 show 2>&1
+        echo "### ip -br addr ###"; vssh ip -br addr 2>&1
+        echo "### failed units ###"
+        vssh systemctl list-units --failed --no-pager 2>&1
+        # Bounded repeat of crio's errors: the full crio journal above sits
+        # under five uncapped unit journals, far out of the tail's reach, and
+        # crio-only failures (the policy.json pull break) must still show in
+        # the job log.
+        echo "### crio errors (this boot, last 40) ###"
+        vssh sh -c 'journalctl -u crio --no-pager -b | grep -E "level=(error|fatal)" | tail -40' 2>&1
+        diag_selinux vssh 30
     } > "${out}" 2>&1 || true
     log "diagnostics written to ${out} (uploaded as an artifact); tail:"
-    tail -n 150 "${out}" 2>/dev/null || true
+    tail -n 200 "${out}" 2>/dev/null || true
 }
 
 wait_ssh() {

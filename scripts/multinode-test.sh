@@ -26,6 +26,7 @@ IP2=$NET.12
 MAC1=52:54:00:45:00:01
 MAC2=52:54:00:45:00:02
 KEEP="${KEEP:-0}"
+. "$(dirname "$0")/lib-diag.sh"
 
 log() { echo "--- $*"; }
 die() { echo "FAIL: $*" >&2; exit 1; }
@@ -70,28 +71,58 @@ host_net_down() {
     sudo iptables -D FORWARD -o "${BR}" -j ACCEPT 2>/dev/null || true
 }
 
+# The bulk, per node: microshift plus the lib's OVS unit journals.
+node_journals() { # node_journals <exec-fn> <name>
+    local fn=$1 name=$2
+    echo "### ${name}: journalctl -u microshift (this boot) ###"
+    ${fn} journalctl -u microshift --no-pager -b 2>&1
+    diag_ovs_journals "${fn}" "${name}"
+}
+
+# Short enough that both nodes' worth goes to the job log verbatim.
+node_summary() { # node_summary <exec-fn> <name>
+    local fn=$1 name=$2
+    echo "### ${name}: bootc status ###"; ${fn} bootc status 2>&1
+    echo "### ${name}: br-ex, routes, cni ###"
+    ${fn} sh -c 'hostname; ip -br addr show br-ex 2>/dev/null; ip route show 10.44.0.0/32; ls /etc/cni/net.d/ 2>/dev/null' 2>&1
+    echo "### ${name}: ovs-vsctl show ###"
+    ${fn} sh -c 'ovs-vsctl --timeout=5 show | head -40' 2>&1
+    echo "### ${name}: failed units ###"
+    ${fn} systemctl list-units --failed --no-pager 2>&1
+    diag_selinux "${fn}" 20 "${name}"
+}
+
+# Two nodes' worth of journals is far too much for the job log, so the bulk goes
+# to a file the workflow uploads and only the summaries are printed. A tail would
+# not do: it can only ever reach the second node.
+# All best-effort: a guest may be half-up, so nothing here may fail cleanup.
 diagnostics() {
-    log "DIAGNOSTICS: nodes, non-running pods"
-    koc get nodes -o wide 2>&1 || true
-    koc get pods -A -o wide --no-headers 2>&1 | grep -vE 'Running|Completed' || true
-    log "DIAGNOSTICS: events"
-    koc get events -A --sort-by='.metadata.creationTimestamp' 2>&1 | tail -30 || true
-    log "DIAGNOSTICS: not-ready pod logs"
-    for p in $(koc get pods -A --no-headers 2>/dev/null \
-            | awk '$4 !~ /Running|Completed/ {print $1"/"$2}'); do
-        echo "--- ${p}"
-        koc -n "${p%/*}" logs "${p#*/}" --all-containers --tail=20 </dev/null 2>&1 || true
-    done
-    log "DIAGNOSTICS: node2 ovnkube-node containers (raw tails)"
-    p2=$(koc -n openshift-ovn-kubernetes get pods -o wide --no-headers 2>/dev/null | awk '/ovnkube-node/ && $7=="node2" {print $1}')
-    [ -n "${p2:-}" ] && koc -n openshift-ovn-kubernetes logs "${p2}" --all-containers --tail=30 </dev/null 2>&1 | tail -40 || true
-    log "DIAGNOSTICS: per-node CNI/br-ex/routes"
-    for fn in v1 v2; do
-        ${fn} sh -c 'hostname; ip -br addr show br-ex 2>/dev/null; ip route show 10.44.0.0/32; ls /etc/cni/net.d/ 2>/dev/null' 2>&1 || true
-    done
-    log "DIAGNOSTICS: node2 microshift journal errors"
-    v2 sh -c 'journalctl -u microshift --no-pager -p err -n 20' 2>&1 || true
-    log "DIAGNOSTICS: consoles (last 15 lines each)"
+    local out="${WORKDIR}/diag.log" sum="${WORKDIR}/diag-summary.log"
+    {
+        echo "### nodes ###"; koc get nodes -o wide 2>&1
+        echo "### non-running pods ###"
+        koc get pods -A -o wide --no-headers 2>&1 | grep -vE 'Running|Completed'
+        echo "### events ###"
+        koc get events -A --sort-by='.metadata.creationTimestamp' 2>&1 | tail -30
+        echo "### not-ready pod logs ###"
+        for p in $(koc get pods -A --no-headers 2>/dev/null \
+                | awk '$4 !~ /Running|Completed/ {print $1"/"$2}'); do
+            echo "--- ${p}"
+            koc -n "${p%/*}" logs "${p#*/}" --all-containers --tail=20 </dev/null 2>&1
+        done
+        echo "### node2 ovnkube-node containers ###"
+        p2=$(koc -n openshift-ovn-kubernetes get pods -o wide --no-headers 2>/dev/null \
+            | awk '/ovnkube-node/ && $7=="node2" {print $1}')
+        [ -n "${p2:-}" ] && koc -n openshift-ovn-kubernetes logs "${p2}" \
+            --all-containers --tail=30 </dev/null 2>&1
+        node_journals v1 node1
+        node_journals v2 node2
+    } > "${out}" 2>&1 || true
+    { node_summary v1 node1; node_summary v2 node2; } > "${sum}" 2>&1 || true
+    log "cluster state and journals written to ${out} (uploaded as an artifact)"
+    log "per-node summary:"
+    cat "${sum}" 2>/dev/null || true
+    log "consoles (last 15 lines each)"
     sudo tail -15 "${WORKDIR}/console1.log" 2>/dev/null || true
     sudo tail -15 "${WORKDIR}/console2.log" 2>/dev/null || true
 }
@@ -106,7 +137,10 @@ cleanup() {
     for n in 1 2; do sudo kill "$(sudo cat "${WORKDIR}/qemu${n}.pid" 2>/dev/null)" 2>/dev/null || true; done
     sleep 1
     host_net_down
-    sudo rm -rf "${WORKDIR}"
+    # On failure keep WORKDIR: the workflow uploads console*.log and diag*.log
+    # from it AFTER this script exits, and the next run starts with its own
+    # rm -rf anyway. Deleting here made every past failure artifact empty.
+    [ ${rc} -eq 0 ] && sudo rm -rf "${WORKDIR}"
     exit ${rc}
 }
 trap cleanup EXIT

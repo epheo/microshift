@@ -34,6 +34,23 @@ clean() {
     # The loopback VG is shared with the single-node smoke; leave it in place.
 }
 
+# OVS runs outside MicroShift, which only validates br-ex and exits, so an OVS
+# failure reads as a bare "microshift.service did not become active" with no
+# cause in the microshift journal. No bootc or SELinux state here: these are
+# containers, on a runner that has neither.
+ovs_diag() { # ovs_diag <cexec|wexec> <name> -- <exec-fn> <label>, same order as lib-diag.sh
+    local fn=$1 name=$2
+    log "DIAGNOSTICS: ${name} OVS units, bridge, failed units"
+    for u in openvswitch ovsdb-server ovs-vswitchd microshift-ovs-init; do
+        echo "--- ${name}: journalctl -u ${u} (last 40 lines)"
+        ${fn} journalctl -u "${u}" --no-pager -n 40 2>&1 || true
+    done
+    echo "--- ${name}: ovs-vsctl show"
+    ${fn} ovs-vsctl --timeout=5 show 2>&1 || true
+    echo "--- ${name}: failed units"
+    ${fn} systemctl list-units --failed --no-pager 2>&1 || true
+}
+
 diagnostics() {
     log "DIAGNOSTICS: nodes"
     koc get nodes -o wide 2>&1 || true
@@ -67,6 +84,8 @@ diagnostics() {
     cexec journalctl -u microshift --no-pager -n 40 2>&1 || true
     log "DIAGNOSTICS: worker microshift journal (last 80 lines)"
     wexec journalctl -u microshift --no-pager -n 80 2>&1 || true
+    ovs_diag cexec controller
+    ovs_diag wexec worker
 }
 
 if [ "${CLEAN:-0}" = "1" ]; then
