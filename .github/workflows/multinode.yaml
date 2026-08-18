@@ -47,10 +47,13 @@ jobs:
         if: failure()
         run: sudo chmod -R a+rX /tmp/epheo-microshift-multinode 2>/dev/null || true
 
-      - name: Collect console logs on failure
+      - name: Collect VM logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: multinode-consoles
-          path: /tmp/epheo-microshift-multinode/console*.log
+          name: multinode-logs
+          # console{1,2}.log are the serial consoles; multinode-test.sh writes
+          # diag.log (cluster state, per-node microshift and OVS journals) and
+          # diag-summary.log (bootc, br-ex, failed units, SELinux) on failure.
+          path: /tmp/epheo-microshift-multinode/*.log
           if-no-files-found: ignore
