@@ -151,6 +151,12 @@ COPY ./src/bootc/bootc-fetch-apply-updates-keep-skopeo-root.conf \
 COPY --from=builder ${BUILDER_RSHARED_SERVICE} /usr/lib/systemd/system/microshift-make-rshared.service
 RUN systemctl enable microshift-make-rshared.service
 
+# OKD's ovn-kubernetes needs the br-ex uplink to resolve to a real OVS
+# interface, and MicroShift's br-ex has none; see the script header.
+COPY --chmod=755 ./src/ovn/brex-uplink.sh /usr/bin/microshift-brex-uplink.sh
+COPY ./src/ovn/10-brex-uplink.conf \
+     /usr/lib/systemd/system/microshift-ovs-init.service.d/10-brex-uplink.conf
+
 # The /var directory is shared with the container as an anonymous volume to
 # enable idmap mounts under /var/lib/kubelet (also lets the image run as a
 # plain podman container for smoke tests).
