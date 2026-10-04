@@ -19,6 +19,7 @@ Published at `ghcr.io/epheo/microshift`.
 | Logs are signal, not noise | `patches/0002` (etcd logs every request at warn — missing threshold default) and `patches/0003` (router status watcher hot-loops when `ingress.status: Removed`) |
 | Every image can be controller or worker | `microshift-profile` selects the role; `patches/0006`-`0008` add a worker mode where nodes hold no signing keys and OVN runs one interconnect zone per node |
 | The firewall is on and role-scoped | firewalld enabled with `microshift-controlplane`/`microshift-node` services; etcd is never exposed |
+| Headless and quiet | `bluetooth.service`, `fwupd-refresh.timer` and `rhsmcertd.service` masked: no radio daemon, no daily LVFS fetch, no subscription-manager noise |
 | Native el10 | RPMs are built in a CentOS Stream 10 buildroot |
 
 Everything site-specific (IPs, VLANs, NADs, hardware quirks, extra embedded
