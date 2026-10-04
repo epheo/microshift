@@ -160,6 +160,13 @@ RUN if systemctl list-unit-files bootc-publish-rhsm-facts.service >/dev/null 2>&
         systemctl disable bootc-publish-rhsm-facts.service ; \
     fi
 
+# Base-image daemons a headless, air-gapped-by-default node has no use for.
+# fwupd-refresh pulls LVFS metadata from the internet daily, and fwupd's bluez
+# and UEFI plugins dbus-activate bluetoothd and udisksd along the way.
+# rhsmcertd is subscription-manager, idle on CentOS Stream. Masked, not
+# disabled: disable does not stop dbus activation.
+RUN systemctl mask bluetooth.service fwupd-refresh.timer rhsmcertd.service
+
 # Guard: a second kernel in the image breaks bootc install at deploy time —
 # fail the build here instead.
 RUN count="$(find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d | wc -l)" && \
