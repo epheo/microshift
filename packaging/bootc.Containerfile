@@ -73,6 +73,23 @@ RUN ${REPO_CONFIG_SCRIPT} -create ${USHIFT_RPM_REPO_PATH} && \
 # applies.
 RUN dnf -y install kernel-modules-extra && dnf clean all
 
+# Red Hat client stack, useless on CentOS Stream: a Lightspeed registration
+# nag on every login, insights-client-boot.service phoning home, and RHEL
+# entitlement tooling. Nothing else requires these. Must stay above the
+# SELinux store repair: rhc and insights-core-selinux drop policy modules.
+RUN dnf -y remove \
+        rhc \
+        yggdrasil \
+        yggdrasil-worker-package-manager \
+        insights-client \
+        insights-core \
+        insights-core-selinux \
+        subscription-manager \
+        python3-subscription-manager-rhsm \
+        libdnf-plugin-subscription-manager \
+        subscription-manager-rhsm-certificates && \
+    dnf clean all
+
 # containers-common 6.x moved the default signature policy to
 # /usr/share/containers/policy.json, but el10 cri-o searches only $HOME and
 # /etc/containers, so without this copy EVERY image pull fails "no policy.json
@@ -163,9 +180,8 @@ RUN if systemctl list-unit-files bootc-publish-rhsm-facts.service >/dev/null 2>&
 # Base-image daemons a headless, air-gapped-by-default node has no use for.
 # fwupd-refresh pulls LVFS metadata from the internet daily, and fwupd's bluez
 # and UEFI plugins dbus-activate bluetoothd and udisksd along the way.
-# rhsmcertd is subscription-manager, idle on CentOS Stream. Masked, not
-# disabled: disable does not stop dbus activation.
-RUN systemctl mask bluetooth.service fwupd-refresh.timer rhsmcertd.service
+# Masked, not disabled: disable does not stop dbus activation.
+RUN systemctl mask bluetooth.service fwupd-refresh.timer
 
 # Guard: a second kernel in the image breaks bootc install at deploy time —
 # fail the build here instead.
