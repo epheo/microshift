@@ -6,7 +6,9 @@ name: build
 #   workflow_dispatch     build + test (+ publish unless disabled)
 #   daily schedule        check for new z-stream / OKD payload / portail
 #                         releases within the pinned minor; if anything moved,
-#                         auto-commit the bump to main and build + publish
+#                         auto-commit the bump to main and build + publish;
+#                         with nothing to bump, still build if main's head
+#                         never built green (a failed bump stays red daily)
 #   weekly schedule       full rebuild + publish even with unchanged pins, so
 #                         the image picks up current package-level (CVE) fixes
 #
@@ -38,8 +40,10 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      actions: read
     outputs:
       changed: ${{ steps.commit.outputs.changed }}
+      rebuild: ${{ steps.head.outputs.rebuild }}
     steps:
       - uses: actions/checkout@v4
 
@@ -64,14 +68,44 @@ jobs:
             echo "changed=true" >> "${GITHUB_OUTPUT}"
           fi
 
+      # Without this, the day after a failed bump has nothing to bump, skips
+      # the build and goes green, burying the red.
+      - name: Check main's head built green
+        id: head
+        if: steps.commit.outputs.changed == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          rebuild=true
+          # A run still in flight on this sha counts: it will build or is building.
+          for run in $(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yaml/runs?head_sha=${sha}&per_page=100" \
+                  --jq ".workflow_runs[] | select(.id != ${GITHUB_RUN_ID}) | \"\(.id):\(.status)\""); do
+              if [ "${run#*:}" != completed ]; then
+                  rebuild=false; break
+              fi
+              build="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run%%:*}/jobs" \
+                  --jq '.jobs[] | select(.name == "build") | .conclusion')"
+              if [ "${build}" = success ]; then
+                  rebuild=false; break
+              fi
+          done
+          if [ "${rebuild}" = true ]; then
+              echo "::warning::main ${sha} has no green build; rebuilding"
+          fi
+          echo "rebuild=${rebuild}" >> "${GITHUB_OUTPUT}"
+
   build:
     needs: [bump]
     # Run for every non-schedule event (bump is skipped there); on the daily
-    # schedule only when something was bumped; on the weekly schedule always.
+    # schedule only when something was bumped or main's head never built
+    # green; on the weekly schedule always.
     if: |
       always() && (
         github.event_name != 'schedule' ||
         needs.bump.outputs.changed == 'true' ||
+        needs.bump.outputs.rebuild == 'true' ||
         github.event.schedule == '45 5 * * 1'
       )
     runs-on: ubuntu-24.04
