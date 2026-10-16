@@ -14,6 +14,13 @@ set -euo pipefail
 MANIFEST=/usr/lib/embedded-images/manifest
 STORE="containers-storage:[overlay@/var/lib/containers/storage+/run/containers/storage]"
 
+# Image id = digest of the raw config bytes, the same id cri-o reports.
+image_id() {
+    local sum
+    sum="$(skopeo inspect --config --raw "$1" | sha256sum)" || return
+    echo "sha256:${sum%% *}"
+}
+
 [ -f "${MANIFEST}" ] || { echo "no embedded image manifest, nothing to do"; exit 0; }
 
 while read -r src name; do
@@ -22,10 +29,28 @@ while read -r src name; do
     case "${src}" in
         /*) src="oci-archive:${src}" ;;
     esac
-    if skopeo inspect --no-tags "${STORE}${name}" >/dev/null 2>&1; then
-        echo "${name}: already present"
-        continue
-    fi
+    case "${name}" in
+    *@sha256:*)
+        # A digest ref cannot move: presence is enough, and skips the cost
+        # of reading the payload configs on every boot.
+        if skopeo inspect --no-tags "${STORE}${name}" >/dev/null 2>&1; then
+            echo "${name}: already present"
+            continue
+        fi
+        ;;
+    *)
+        # A tag can be re-pointed by a newer OS (#12): compare image ids,
+        # not names. Config digest, not manifest digest: the manifest may be
+        # rewritten on copy into containers-storage, the config is not.
+        stored="$(image_id "${STORE}${name}" 2>/dev/null || true)"
+        shipped="$(image_id "${src}")"
+        if [ "${stored}" = "${shipped}" ]; then
+            echo "${name}: up to date (${shipped})"
+            continue
+        fi
+        [ -z "${stored}" ] || echo "${name}: stored ${stored} differs from shipped ${shipped}"
+        ;;
+    esac
     echo "importing ${name} from ${src}"
     skopeo copy -q "${src}" "${STORE}${name}"
 done < "${MANIFEST}"

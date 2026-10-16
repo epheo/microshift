@@ -145,6 +145,15 @@ koc -n topolvm-system get pods --no-headers | grep -q Running
 log "assert: embedded portail image was imported into cri-o at boot"
 pexec crictl images | grep -q 'localhost/embedded/portail'
 
+# #12: an OS upgrade can ship a new image under the same tag. Simulate it by
+# re-pointing the portail tag at a payload image; the import must restore it.
+log "assert: a re-pointed embedded tag is re-imported"
+store="containers-storage:[overlay@/var/lib/containers/storage+/run/containers/storage]"
+portail_ref="$(pexec awk '/\/portail:/ {print $2; exit}' /usr/lib/embedded-images/manifest)"
+other_ref="$(pexec awk '$1 ~ /^oci:/ {print $2; exit}' /usr/lib/embedded-images/manifest)"
+pexec skopeo copy -q "${store}${other_ref}" "${store}${portail_ref}"
+pexec /usr/bin/import-embedded-images.sh | grep -F "importing ${portail_ref} from" >/dev/null
+
 # Rerunning the import must find every manifest entry already in the store:
 # proves the boot import covered the whole payload and stayed idempotent.
 log "assert: the whole embedded payload is in cri-o's store"
