@@ -271,9 +271,9 @@ ACCEL="tcg"
 NET_RESTRICT="restrict=on,"
 [ -n "${UPGRADE_FROM}" ] && NET_RESTRICT=""
 log "booting VM (accel=${ACCEL}) with a secondary disk for the TopoLVM VG"
-# The packaged lvmd device-class reserves spare-gb 10; the VG must exceed
-# that plus the PVC probe or TopoLVM reports zero allocatable capacity.
-sudo truncate --size=16G "${WORKDIR}/lvm-disk.raw"
+# Kept small on purpose: the 1Gi PVC probe only fits if lvmd renders
+# spare-gb 0. A return of the chart default (10) fails the probe here.
+sudo truncate --size=2G "${WORKDIR}/lvm-disk.raw"
 sudo qemu-system-x86_64 \
     -machine "accel=${ACCEL}" -cpu max -smp "$(nproc)" -m "${VM_MEM}" \
     -drive "file=${DISK},if=virtio,format=qcow2" \
