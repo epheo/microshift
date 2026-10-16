@@ -43,7 +43,7 @@ index be69d281..8568a7ad 100644
 +  - update
 +  - patch
 diff --git a/assets/components/ovn/common/configmap.yaml b/assets/components/ovn/common/configmap.yaml
-index 60acb823..1c0051b0 100644
+index c6abdd4c..1c0051b0 100644
 --- a/assets/components/ovn/common/configmap.yaml
 +++ b/assets/components/ovn/common/configmap.yaml
 @@ -17,7 +17,11 @@ data:
@@ -58,18 +58,6 @@ index 60acb823..1c0051b0 100644
      host-network-namespace="openshift-host-network"
      platform-type="BareMetal"
  
-@@ -35,11 +39,3 @@ data:
-     election-lease-duration=137
-     election-renew-deadline=107
-     election-retry-period=26
--{{- if .MultiNodeEnabled}}
--
--    [ovnnorth]
--    address=tcp:{{.NodeIP}}:{{.OVN_NB_PORT}}
--
--    [ovnsouth]
--    address=tcp:{{.NodeIP}}:{{.OVN_SB_PORT}}
--{{- end}}
 diff --git a/assets/components/ovn/zones/master/daemonset.yaml b/assets/components/ovn/zones/master/daemonset.yaml
 new file mode 100644
 index 00000000..45fb8786
@@ -818,7 +806,7 @@ index 7e16d79a..ecfc4138 100644
  	exists, err := util.PathExists(kubeconfigPath)
  	if err != nil {
 diff --git a/pkg/components/networking.go b/pkg/components/networking.go
-index 31606aff..e32f9c72 100644
+index 2e6ccad9..e32f9c72 100644
 --- a/pkg/components/networking.go
 +++ b/pkg/components/networking.go
 @@ -61,9 +61,12 @@ func startCNIPlugin(ctx context.Context, cfg *config.Config, kubeconfigPath stri
@@ -836,27 +824,25 @@ index 31606aff..e32f9c72 100644
  		}
  	}
  
-@@ -110,19 +113,20 @@ func startCNIPlugin(ctx context.Context, cfg *config.Config, kubeconfigPath stri
+@@ -110,17 +113,25 @@ func startCNIPlugin(ctx context.Context, cfg *config.Config, kubeconfigPath stri
  		return err
  	}
  
--	// Multinode only params: OVN_NB_PORT, OVN_SB_PORT, MultiNodeEnabled
+-	// Multinode only params: OVN_NB_PORT, OVN_SB_PORT
 +	// Multinode renders ovnkube-config with service-account auth against the
 +	// controlplane apiserver: workers hold no kubeadmin kubeconfig, and OVN
 +	// databases are local-only since central mode was removed, so the old
 +	// OVN_*_DB_LIST endpoints have nothing to point at.
  	extraParams := assets.RenderParams{
--		"OVNConfig":        ovnConfig,
--		"KubeconfigPath":   kubeconfigPath,
--		"KubeconfigDir":    filepath.Join(config.DataDir, "/resources/kubeadmin"),
--		"OVN_NB_PORT":      ovn.OVN_NB_PORT,
--		"OVN_SB_PORT":      ovn.OVN_SB_PORT,
--		"MultiNodeEnabled": cfg.MultiNode.Enabled,
+-		"OVNConfig":      ovnConfig,
+-		"KubeconfigPath": kubeconfigPath,
+-		"KubeconfigDir":  filepath.Join(config.DataDir, "/resources/kubeadmin"),
+-		"OVN_NB_PORT":    ovn.OVN_NB_PORT,
+-		"OVN_SB_PORT":    ovn.OVN_SB_PORT,
 -	}
--	// In multinode mode the configmap contains [OvnNorth]/[OvnSouth] stanzas
--	// with the primary's IP. Only the primary may write it; a worker applying
--	// the configmap would overwrite the primary IP with its own, breaking SBDB
--	// connectivity for every node that reads the configmap afterwards.
+-	if err := assets.ApplyConfigMaps(ctx, cm, renderTemplate, renderParamsFromConfig(cfg, extraParams), kubeconfigPath); err != nil {
+-		klog.Warningf("Failed to apply configMap %v %v", cm, err)
+-		return err
 +		"OVNConfig":             ovnConfig,
 +		"KubeconfigPath":        kubeconfigPath,
 +		"KubeconfigDir":         filepath.Join(config.DataDir, "/resources/kubeadmin"),
@@ -866,9 +852,14 @@ index 31606aff..e32f9c72 100644
 +	// The configmap carries the control plane's apiserver address. Only the
 +	// control plane may write it; a joined replica would overwrite that
 +	// address with its own for every node that reads the configmap afterwards.
- 	if !cfg.MultiNode.Enabled || !cfg.BootstrapKubeConfigExists() {
- 		if err := assets.ApplyConfigMaps(ctx, cm, renderTemplate, renderParamsFromConfig(cfg, extraParams), kubeconfigPath); err != nil {
- 			klog.Warningf("Failed to apply configMap %v %v", cm, err)
++	if !cfg.MultiNode.Enabled || !cfg.BootstrapKubeConfigExists() {
++		if err := assets.ApplyConfigMaps(ctx, cm, renderTemplate, renderParamsFromConfig(cfg, extraParams), kubeconfigPath); err != nil {
++			klog.Warningf("Failed to apply configMap %v %v", cm, err)
++			return err
++		}
+ 	}
+ 	if err := assets.ApplyDaemonSets(ctx, apps, renderTemplate, renderParamsFromConfig(cfg, extraParams), kubeconfigPath); err != nil {
+ 		klog.Warningf("Failed to apply apps %v %v", apps, err)
 diff --git a/pkg/config/multinode.go b/pkg/config/multinode.go
 index 86c06cb8..574acfe2 100644
 --- a/pkg/config/multinode.go
