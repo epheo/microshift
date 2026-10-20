@@ -53,9 +53,12 @@ image:
 	    --label okd.version="$(OKD_VERSION_TAG)" \
 	    --label epheo.rev="$(EPHEO_REV)" \
 	    --label portail.image="$(PORTAIL_IMAGE)" \
+	    --label gateway-api.version="$(GATEWAY_API_VERSION)" \
 	    --build-arg BOOTC_IMAGE_URL="$(BOOTC_IMAGE_URL)" \
 	    --build-arg BOOTC_IMAGE_TAG="$(BOOTC_IMAGE_TAG)" \
 	    --build-arg PORTAIL_IMAGE="$(PORTAIL_IMAGE)" \
+	    --build-arg GATEWAY_API_VERSION="$(GATEWAY_API_VERSION)" \
+	    --build-arg GATEWAY_API_SHA256="$(GATEWAY_API_SHA256)" \
 	    -f packaging/bootc.Containerfile .
 
 # Extract the version string stamped into the RPM build (used for image tags).

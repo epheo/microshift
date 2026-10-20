@@ -14,7 +14,7 @@ Published at `ghcr.io/epheo/microshift`.
 | Multus enabled | `microshift-multus` (config.d toggle + cri-o default-network drop-in) |
 | TopoLVM is the storage driver | community subpackage merged into the spec (LVMS is not in the OKD payload) |
 | Air-gapped by default | the full MicroShift payload is embedded as a shared-blob OCI layout and imported into cri-o at boot — first boot needs no registry |
-| [portail](https://github.com/epheo/portail) is the edge | its image is embedded and imported the same way |
+| [portail](https://github.com/epheo/portail) is the edge | its image is embedded and imported the same way; the router is off and the Gateway API experimental CRDs (TCPRoute, UDPRoute) ship with the image, see [The edge](#the-edge) |
 | Updates must be safe | greenboot MicroShift health gate stays enabled; bootc rollback does the rest |
 | Logs are signal, not noise | `patches/0002` (etcd logs every request at warn — missing threshold default) and `patches/0003` (router status watcher hot-loops when `ingress.status: Removed`) |
 | Every image can be controller or worker | `microshift-profile` selects the role; `patches/0006`-`0008` add a worker mode where nodes hold no signing keys and OVN runs one interconnect zone per node |
@@ -26,6 +26,18 @@ Everything site-specific (IPs, VLANs, NADs, hardware quirks, extra embedded
 images) belongs in a derived image, not here. Site layers can drop additional
 OCI archives + manifest lines under `/usr/lib/embedded-images/` and the boot
 import service picks them up.
+
+## The edge
+
+portail replaces the OpenShift router.
+`/etc/microshift/config.d/00-ingress-removed.yaml` turns the router off.
+Upgrading an install that ran the router deletes it on the next start.
+Drop-ins override `/etc/microshift/config.yaml`: to bring the router back, set `ingress.status: Managed` in a drop-in that sorts after `00-ingress-removed.yaml`.
+The router image stays embedded, so that works air-gapped.
+
+The Gateway API CRDs ship with the image, experimental channel, pinned in `versions.env`: TCPRoute and UDPRoute exist only there.
+They apply from `/usr/lib/microshift/manifests.d/000-gateway-api`, before any site kustomization, so site Gateways and routes find them.
+Site layers must not ship their own copy: MicroShift re-applies every kustomization at each start, and the last one wins.
 
 ## How it builds
 
@@ -66,7 +78,8 @@ the boot, and the air-gapped contract (the fresh-install VM has zero
 egress). Its opinion assertions are functional, not existence checks: a PVC
 is provisioned and written (TopoLVM), an OVN-K layer2 secondary network is
 attached through a NetworkAttachmentDefinition, the embedded portail
-image is started from cri-o's store with pull policy Never, and steady-state
+image is started from cri-o's store with pull policy Never, the API accepts
+TCPRoute and UDPRoute objects, and steady-state
 journal volume is capped (regression cover for the log-noise patches, which
 could silently go dead on a bump while still applying cleanly). `vm-test-upgrade`
 runs the same suite on the update path every existing install takes (boot

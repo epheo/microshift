@@ -1,0 +1,5 @@
+# portail is the edge; the router would only hold :80/:443. Drop-ins override
+# config.yaml: to bring the router back, set Managed in a drop-in sorting after
+# this one.
+ingress:
+  status: Removed

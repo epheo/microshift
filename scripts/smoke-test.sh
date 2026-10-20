@@ -7,6 +7,8 @@
 #   - multus is deployed
 #   - TopoLVM is deployed (loopback VG backend)
 #   - the embedded portail image was imported into cri-o's store at boot
+#   - the router is not deployed
+#   - the Gateway API TCPRoute and UDPRoute CRDs are established
 #   - the greenboot MicroShift health gate is enabled
 #
 # Container run flags follow microshift-io/microshift src/cluster_manager.sh.
@@ -158,6 +160,25 @@ pexec /usr/bin/import-embedded-images.sh | grep -F "importing ${portail_ref} fro
 # proves the boot import covered the whole payload and stayed idempotent.
 log "assert: the whole embedded payload is in cri-o's store"
 pexec /usr/bin/import-embedded-images.sh | { ! grep -q '^importing'; }
+
+log "assert: the router is not deployed"
+# Assigned first: a failing substitution inside [ ] would not trip set -e.
+ns="$(koc get namespace openshift-ingress --ignore-not-found -o name)"
+[ -z "${ns}" ]
+
+# The kustomizer applies them after the core is up, and wait fails at once on
+# a CRD that does not exist yet.
+log "assert: the Gateway API TCPRoute and UDPRoute CRDs are established (up to 3m)"
+ok=false
+for _ in $(seq 36); do
+    if koc wait --for=condition=Established --timeout=5s \
+            crd/tcproutes.gateway.networking.k8s.io \
+            crd/udproutes.gateway.networking.k8s.io >/dev/null 2>&1; then
+        ok=true; break
+    fi
+    sleep 5
+done
+${ok} || { echo "ERROR: TCPRoute/UDPRoute CRDs never established" >&2; exit 1; }
 
 log "assert: greenboot MicroShift health gate is enabled"
 pexec test -x /etc/greenboot/check/required.d/40_microshift_running_check.sh
