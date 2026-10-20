@@ -6,7 +6,8 @@
 # `make smoke` (privileged container, fast local iteration) cannot validate.
 # The opinion assertions are functional, not existence checks: a PVC is
 # provisioned and written, an OVN-K layer2 secondary network is attached,
-# and the embedded portail image is started with pull policy Never.
+# the embedded portail image is started with pull policy Never, and the API
+# accepts TCPRoute and UDPRoute objects.
 # The fresh-install VM runs with zero egress (restrict=on): going GREEN
 # proves the air-gapped first boot the embedded payload exists for.
 #
@@ -168,17 +169,6 @@ cat > "${WORKDIR}/config.toml" <<EOF
 [[customizations.user]]
 name = "root"
 key = "$(cat "${WORKDIR}/id.pub")"
-
-# The recommended site shape (see the Containerfile header): the router is
-# replaced by the site's own edge. Baked in before first boot so the standard
-# greenboot gate below — not bespoke assertions — is what validates it
-# (regression cover for patches 0003 and 0005).
-[[customizations.directories]]
-path = "/etc/microshift/config.d"
-
-[[customizations.files]]
-path = "/etc/microshift/config.d/10-ingress-removed.yaml"
-data = "ingress:\n  status: Removed\n"
 EOF
 
 if [ -n "${UPGRADE_FROM}" ]; then
@@ -492,6 +482,63 @@ done
 ${ok} || {
     echo "ERROR: portail container never started" >&2
     koc describe pod portail-probe >&2 || true
+    exit 1
+}
+
+# On the upgrade path the previous release may have run the router: the
+# candidate must delete it. With it gone, the greenboot gate below is the
+# regression cover for patch 0005, the quiet-journal check for 0003.
+log "assert: the router is not deployed (up to 3m)"
+ok=false
+for _ in $(seq 36); do
+    if ns="$(koc get namespace openshift-ingress --ignore-not-found -o name)" && [ -z "${ns}" ]; then
+        ok=true; break
+    fi
+    sleep 5
+done
+${ok} || {
+    echo "ERROR: openshift-ingress still exists with ingress Removed by default" >&2
+    koc -n openshift-ingress get all >&2 || true
+    exit 1
+}
+
+# The kustomizer applies the CRDs after the core is up and retries, so the
+# first attempts can race it.
+log "assert: the API accepts TCPRoute and UDPRoute (up to 3m)"
+ok=false
+for _ in $(seq 36); do
+    if koc apply -f - >/dev/null 2>&1 <<EOF
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: tcproute-probe
+spec:
+  parentRefs:
+  - name: probe
+  rules:
+  - backendRefs:
+    - name: probe
+      port: 9
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: UDPRoute
+metadata:
+  name: udproute-probe
+spec:
+  parentRefs:
+  - name: probe
+  rules:
+  - backendRefs:
+    - name: probe
+      port: 9
+EOF
+    then ok=true; break; fi
+    sleep 5
+done
+${ok} || {
+    echo "ERROR: TCPRoute/UDPRoute not served" >&2
+    koc get crd -o name | grep gateway.networking >&2 || true
+    vssh journalctl -u microshift --no-pager | grep -i kustomiz | tail -20 >&2 || true
     exit 1
 }
 

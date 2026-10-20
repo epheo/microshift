@@ -11,8 +11,9 @@
 #     installed release-info JSONs) is embedded as a shared-blob OCI layout
 #     and imported into cri-o's store at boot — first boot needs no registry.
 #   - portail is the edge/ingress component: its image is embedded and
-#     imported the same way. The openshift-router stays available (and
-#     embedded) but sites are expected to set ingress Removed.
+#     imported the same way, the router is Removed by default, and the
+#     Gateway API experimental CRDs (TCPRoute, UDPRoute) are applied at boot.
+#     The router image stays embedded so a site can turn it back on air-gapped.
 #   - greenboot health gating stays fully enabled: a broken update must roll
 #     back on its own.
 #   - Node profiles: every image can be a controller (default) or a worker
@@ -140,6 +141,20 @@ RUN mkdir -p /usr/lib/embedded-images && \
     skopeo copy --retry-times 3 \
         "docker://${PORTAIL_IMAGE}" "oci-archive:${tar}:localhost/embedded/${name}" && \
     echo "${tar} localhost/embedded/${name}" >> /usr/lib/embedded-images/manifest
+
+COPY ./src/edge/00-ingress-removed.yaml /etc/microshift/config.d/00-ingress-removed.yaml
+
+# MicroShift ships no Gateway API CRDs of its own (the OSSM subpackage that
+# would is stripped by src/image/modify-spec.py). 000 sorts first among
+# manifests.d kustomizations, which apply one at a time with a 10m retry each:
+# a site's Gateways sorting before the CRDs would be skipped until next start.
+ARG GATEWAY_API_VERSION
+ARG GATEWAY_API_SHA256
+COPY ./src/edge/gateway-api/kustomization.yaml /usr/lib/microshift/manifests.d/000-gateway-api/
+RUN crds=/usr/lib/microshift/manifests.d/000-gateway-api/experimental-install.yaml && \
+    curl -fsSL --retry 3 -o "${crds}" \
+        "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/experimental-install.yaml" && \
+    echo "${GATEWAY_API_SHA256}  ${crds}" | sha256sum -c -
 
 COPY --chmod=755 ./src/embedded-images/import-embedded-images.sh /usr/bin/import-embedded-images.sh
 COPY ./src/embedded-images/import-embedded-images.service /usr/lib/systemd/system/import-embedded-images.service
