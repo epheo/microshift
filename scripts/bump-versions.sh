@@ -58,3 +58,10 @@ update() {
 update USHIFT_GITREF   "${USHIFT_GITREF}"   "${latest_ushift}"
 update OKD_VERSION_TAG "${OKD_VERSION_TAG}" "${latest_okd}"
 update PORTAIL_IMAGE   "${PORTAIL_IMAGE}"   "${latest_portail:+${portail_repo}:${latest_portail}}"
+
+# portail is not in the image tag: alone, its bump would republish the
+# current tag with new content under images built and pinned on the old one.
+if [ "$(grep -c -e "^USHIFT_GITREF=${USHIFT_GITREF}$" -e "^OKD_VERSION_TAG=${OKD_VERSION_TAG}$" versions.env)" = 2 ] &&
+    ! grep -qx "PORTAIL_IMAGE=${PORTAIL_IMAGE}" versions.env; then
+    update EPHEO_REV "${EPHEO_REV}" "$((EPHEO_REV + 1))"
+fi
