@@ -54,6 +54,7 @@ image:
 	    --label epheo.rev="$(EPHEO_REV)" \
 	    --label portail.image="$(PORTAIL_IMAGE)" \
 	    --label gateway-api.version="$(GATEWAY_API_VERSION)" \
+	    --label org.opencontainers.image.revision="$(shell git rev-parse HEAD 2>/dev/null)" \
 	    --build-arg BOOTC_IMAGE_URL="$(BOOTC_IMAGE_URL)" \
 	    --build-arg BOOTC_IMAGE_TAG="$(BOOTC_IMAGE_TAG)" \
 	    --build-arg PORTAIL_IMAGE="$(PORTAIL_IMAGE)" \
