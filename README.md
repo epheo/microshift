@@ -17,6 +17,7 @@ Published at `ghcr.io/epheo/microshift`.
 | [portail](https://github.com/epheo/portail) is the edge | its image is embedded and imported the same way; the router is off and the Gateway API experimental CRDs (TCPRoute, UDPRoute) ship with the image, see [The edge](#the-edge) |
 | Updates must be safe | greenboot MicroShift health gate stays enabled; bootc rollback does the rest |
 | Logs are signal, not noise | `patches/0002` (etcd logs every request at warn — missing threshold default) and `patches/0003` (router status watcher hot-loops when `ingress.status: Removed`) |
+| Terminated pods do not pile up | `patches/0010` adds `kubeControllerManager.terminatedPodGCThreshold`, the pod garbage collector's threshold (default unchanged, 12500); graceful node shutdown leaves every pod it stops as a terminated pod |
 | Every image can be controller or worker | `microshift-profile` selects the role; `patches/0006`-`0008` add a worker mode where nodes hold no signing keys and OVN runs one interconnect zone per node |
 | The firewall is on and role-scoped | firewalld enabled with `microshift-controlplane`/`microshift-node` services; etcd is never exposed |
 | Headless and quiet | `bluetooth.service` and `fwupd-refresh.timer` masked; Red Hat client stack (`rhc`, `insights-client`, `subscription-manager`) removed: no radio daemon, no daily LVFS fetch, no registration nag or phone-home |

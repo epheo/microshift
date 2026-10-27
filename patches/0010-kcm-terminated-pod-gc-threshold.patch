@@ -1,0 +1,215 @@
+diff --git a/cmd/generate-config/config/config-openapi-spec.json b/cmd/generate-config/config/config-openapi-spec.json
+index 28169bcf..7a381808 100755
+--- a/cmd/generate-config/config/config-openapi-spec.json
++++ b/cmd/generate-config/config/config-openapi-spec.json
+@@ -8,6 +8,7 @@
+     "etcd",
+     "genericDevicePlugin",
+     "ingress",
++    "kubeControllerManager",
+     "kubelet",
+     "manifests",
+     "network",
+@@ -988,6 +989,21 @@
+         }
+       }
+     },
++    "kubeControllerManager": {
++      "type": "object",
++      "required": [
++        "terminatedPodGCThreshold"
++      ],
++      "properties": {
++        "terminatedPodGCThreshold": {
++          "description": "Number of terminated pods (Succeeded or Failed) kept before the pod\ngarbage collector deletes them, evicted pods first, then the oldest.\nGraceful node shutdown leaves every pod it stops as a terminated pod;\na single node rarely needs more than a few dozen of them.",
++          "type": "integer",
++          "format": "int32",
++          "default": 12500,
++          "minimum": 1
++        }
++      }
++    },
+     "kubelet": {
+       "description": "Settings specified in this section are transferred as-is into the Kubelet config."
+     },
+diff --git a/docs/user/howto_config.md b/docs/user/howto_config.md
+index a5bb49c0..eb684c34 100644
+--- a/docs/user/howto_config.md
++++ b/docs/user/howto_config.md
+@@ -138,6 +138,8 @@ ingress:
+         threadCount: 0
+         tlsInspectDelay: ""
+         tunnelTimeout: ""
++kubeControllerManager:
++    terminatedPodGCThreshold: 0
+ kubelet:
+ manifests:
+     kustomizePaths: []
+@@ -304,6 +306,8 @@ ingress:
+         threadCount: 0
+         tlsInspectDelay: 5s
+         tunnelTimeout: 1h
++kubeControllerManager:
++    terminatedPodGCThreshold: 12500
+ kubelet:
+ manifests:
+     kustomizePaths:
+diff --git a/packaging/microshift/config.yaml b/packaging/microshift/config.yaml
+index d69c68ed..ef2efa72 100644
+--- a/packaging/microshift/config.yaml
++++ b/packaging/microshift/config.yaml
+@@ -654,6 +654,12 @@ ingress:
+ 
+         # If unset, the default timeout is 1h
+         tunnelTimeout: 1h
++kubeControllerManager:
++    # Number of terminated pods (Succeeded or Failed) kept before the pod
++    # garbage collector deletes them, evicted pods first, then the oldest.
++    # Graceful node shutdown leaves every pod it stops as a terminated pod;
++    # a single node rarely needs more than a few dozen of them.
++    terminatedPodGCThreshold: 12500
+ # Settings specified in this section are transferred as-is into the Kubelet config.
+ kubelet:
+ manifests:
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index fdac17ad..bb9f19ae 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -56,6 +56,8 @@ type Config struct {
+ 	Ingress   IngressConfig `json:"ingress"`
+ 	Storage   Storage       `json:"storage"`
+ 	Telemetry Telemetry     `json:"telemetry"`
++
++	KubeControllerManager KubeControllerManagerConfig `json:"kubeControllerManager"`
+ 	// Settings specified in this section are transferred as-is into the Kubelet config.
+ 	// +kubebuilder:validation:Schemaless
+ 	Kubelet map[string]any `json:"kubelet"`
+@@ -198,6 +200,7 @@ func (c *Config) fillDefaults() error {
+ 	c.Kubelet = nil
+ 	c.GenericDevicePlugin = genericDevicePluginDefaults()
+ 	c.Telemetry = telemetryDefaults()
++	c.KubeControllerManager = kubeControllerManagerDefaults()
+ 	c.DNS = dnsDefaults()
+ 	c.C2CC = C2CC{
+ 		DNS:           C2CCDNS{CacheTTL: ptr.To(10), CacheNegativeTTL: ptr.To(10)},
+@@ -417,6 +420,10 @@ func (c *Config) incorporateUserSettings(u *Config) {
+ 	if u.Telemetry.Proxy != "" {
+ 		c.Telemetry.Proxy = u.Telemetry.Proxy
+ 	}
++
++	if u.KubeControllerManager.TerminatedPodGCThreshold != 0 {
++		c.KubeControllerManager.TerminatedPodGCThreshold = u.KubeControllerManager.TerminatedPodGCThreshold
++	}
+ 	if len(u.Ingress.ServingCertificateSecret) != 0 {
+ 		c.Ingress.ServingCertificateSecret = u.Ingress.ServingCertificateSecret
+ 	}
+@@ -708,6 +715,10 @@ func (c *Config) validate() error {
+ 		return fmt.Errorf("error validating telemetry: %v", err)
+ 	}
+ 
++	if err := c.KubeControllerManager.validate(); err != nil {
++		return fmt.Errorf("error validating kubeControllerManager: %v", err)
++	}
++
+ 	if err := c.GenericDevicePlugin.validate(); err != nil {
+ 		return fmt.Errorf("error validating Generic Device Plugin configuration: %v", err)
+ 	}
+diff --git a/pkg/config/config_test.go b/pkg/config/config_test.go
+index 523a53c6..aa4de2ea 100644
+--- a/pkg/config/config_test.go
++++ b/pkg/config/config_test.go
+@@ -214,6 +214,19 @@ func TestGetActiveConfigFromYAML(t *testing.T) {
+ 				return c
+ 			}(),
+ 		},
++		{
++			name: "kube-controller-manager",
++			config: dedent(`
++            kubeControllerManager:
++              terminatedPodGCThreshold: 25
++            `),
++			expected: func() *Config {
++				c := mkDefaultConfig()
++				c.KubeControllerManager.TerminatedPodGCThreshold = 25
++				assert.NoError(t, c.updateComputedValues())
++				return c
++			}(),
++		},
+ 		{
+ 			name: "manifests-default",
+ 			config: dedent(`
+@@ -545,6 +558,15 @@ func TestValidate(t *testing.T) {
+ 			}(),
+ 			expectErr: true,
+ 		},
++		{
++			name: "kube-controller-manager-terminated-pod-gc-threshold-negative",
++			config: func() *Config {
++				c := mkDefaultConfig()
++				c.KubeControllerManager.TerminatedPodGCThreshold = -1
++				return c
++			}(),
++			expectErr: true,
++		},
+ 		{
+ 			name: "etcd-memory-zero",
+ 			config: func() *Config {
+diff --git a/pkg/config/kubecontrollermanager.go b/pkg/config/kubecontrollermanager.go
+new file mode 100644
+index 00000000..e54d8ad3
+--- /dev/null
++++ b/pkg/config/kubecontrollermanager.go
+@@ -0,0 +1,29 @@
++package config
++
++import "fmt"
++
++// Upstream Kubernetes' default, sized for large clusters.
++const defaultTerminatedPodGCThreshold = 12500
++
++type KubeControllerManagerConfig struct {
++	// Number of terminated pods (Succeeded or Failed) kept before the pod
++	// garbage collector deletes them, evicted pods first, then the oldest.
++	// Graceful node shutdown leaves every pod it stops as a terminated pod;
++	// a single node rarely needs more than a few dozen of them.
++	// +kubebuilder:default=12500
++	// +kubebuilder:validation:Minimum=1
++	TerminatedPodGCThreshold int32 `json:"terminatedPodGCThreshold"`
++}
++
++func kubeControllerManagerDefaults() KubeControllerManagerConfig {
++	return KubeControllerManagerConfig{
++		TerminatedPodGCThreshold: defaultTerminatedPodGCThreshold,
++	}
++}
++
++func (k *KubeControllerManagerConfig) validate() error {
++	if k.TerminatedPodGCThreshold < 1 {
++		return fmt.Errorf("terminatedPodGCThreshold must be at least 1, got %d", k.TerminatedPodGCThreshold)
++	}
++	return nil
++}
+diff --git a/pkg/controllers/kube-controller-manager.go b/pkg/controllers/kube-controller-manager.go
+index 373e2855..44fbdb46 100644
+--- a/pkg/controllers/kube-controller-manager.go
++++ b/pkg/controllers/kube-controller-manager.go
+@@ -96,6 +96,7 @@ func configure(ctx context.Context, cfg *config.Config) (args []string, applyFn
+ 			"cluster-signing-cert-file":        {clusterSigningCert},
+ 			"cluster-signing-key-file":         {clusterSigningKey},
+ 			"v":                                {strconv.Itoa(cfg.GetVerbosity())},
++			"terminated-pod-gc-threshold":      {strconv.Itoa(int(cfg.KubeControllerManager.TerminatedPodGCThreshold))},
+ 			"tls-cipher-suites":                {strings.Join(cfg.ApiServer.TLS.CipherSuites, ",")},
+ 			"tls-min-version":                  {cfg.ApiServer.TLS.MinVersion},
+ 			// Use the same certificates as the apiserver for localhost communication
+diff --git a/pkg/controllers/kube-controller-manager_test.go b/pkg/controllers/kube-controller-manager_test.go
+index 1bcf5126..e100251d 100644
+--- a/pkg/controllers/kube-controller-manager_test.go
++++ b/pkg/controllers/kube-controller-manager_test.go
+@@ -72,6 +72,7 @@ func TestConfigure(t *testing.T) {
+ 		"--secure-port=10257",
+ 		fmt.Sprintf("--service-account-private-key-file=%s", kcmServiceAccountPrivateKeyFile()),
+ 		fmt.Sprintf("--service-cluster-ip-range=%s", cfg.Network.ServiceNetwork[0]),
++		"--terminated-pod-gc-threshold=12500",
+ 		fmt.Sprintf("--tls-cert-file=%s", cryptomaterial.ServingCertPath(cryptomaterial.KubeAPIServerLocalhostServingCertDir(cryptomaterial.CertsDirectory(config.DataDir)))),
+ 		fmt.Sprintf("--tls-cipher-suites=%s", strings.Join(crypto.OpenSSLToIANACipherSuites(fixedTLSProfile.Ciphers), ",")),
+ 		fmt.Sprintf("--tls-min-version=%s", string(fixedTLSProfile.MinTLSVersion)),
