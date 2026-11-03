@@ -6,8 +6,9 @@
 # `make smoke` (privileged container, fast local iteration) cannot validate.
 # The opinion assertions are functional, not existence checks: a PVC is
 # provisioned and written, an OVN-K layer2 secondary network is attached,
-# the embedded portail image is started with pull policy Never, and the API
-# accepts TCPRoute and UDPRoute objects.
+# a MultiNetworkPolicy cuts a pod off that network and its removal restores
+# it, the embedded portail image is started with pull policy Never, and the
+# API accepts TCPRoute and UDPRoute objects.
 # The fresh-install VM runs with zero egress (restrict=on): going GREEN
 # proves the air-gapped first boot the embedded payload exists for.
 #
@@ -353,6 +354,13 @@ koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkub
         exit 1
     }
 
+log "assert: enable-multi-networkpolicy=true is native in ovnkube-config"
+koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkube\.conf}' \
+    | grep -q 'enable-multi-networkpolicy=true' || {
+        echo "ERROR: enable-multi-networkpolicy missing from ovnkube-config" >&2
+        exit 1
+    }
+
 log "assert: multus is deployed"
 koc -n openshift-multus get daemonset multus --no-headers >/dev/null
 
@@ -449,6 +457,62 @@ koc exec l2test-probe -- ip -o addr show dev net1 | grep -q 'inet 10\.100\.200\.
     koc describe pod l2test-probe >&2 || true
     exit 1
 }
+
+# Reachable, cut by the policy, reachable again once it is gone: proves OVN
+# enforces it, not that the API merely stores it.
+log "assert: a MultiNetworkPolicy isolates a pod on the l2test network"
+koc apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: l2test-server
+  labels:
+    app: l2test-server
+  annotations:
+    k8s.v1.cni.cncf.io/networks: l2test
+spec:
+  restartPolicy: Never
+  containers:
+  - name: server
+    image: ${util_img}
+    command: ["python3", "-m", "http.server", "8080"]
+EOF
+wait_pod_running l2test-server
+server_ip="$(koc exec l2test-server -- ip -o -4 addr show dev net1 | awk '{print $4}' | cut -d/ -f1)"
+[ -n "${server_ip}" ] || { echo "ERROR: l2test-server got no net1 address" >&2; exit 1; }
+l2_reach() {
+    koc exec l2test-probe -- python3 -c \
+        'import socket, sys; socket.create_connection((sys.argv[1], 8080), 3)' "${server_ip}" \
+        >/dev/null 2>&1
+}
+# Retries cover the server starting and OVN programming or removing ACLs.
+l2_expect() {
+    local want=$1 got
+    for _ in $(seq 20); do
+        if l2_reach; then got=yes; else got=no; fi
+        [ "${got}" = "${want}" ] && return 0
+        sleep 3
+    done
+    echo "ERROR: l2test-server reachable=${got}, want ${want} ($2)" >&2
+    return 1
+}
+l2_expect yes "before any policy"
+koc apply -f - <<EOF
+apiVersion: k8s.cni.cncf.io/v1beta1
+kind: MultiNetworkPolicy
+metadata:
+  name: l2test-deny
+  annotations:
+    k8s.v1.cni.cncf.io/policy-for: default/l2test
+spec:
+  podSelector:
+    matchLabels:
+      app: l2test-server
+  policyTypes: [Ingress]
+EOF
+l2_expect no "under a deny-all MultiNetworkPolicy"
+koc delete multi-networkpolicy l2test-deny >/dev/null
+l2_expect yes "after the policy is deleted"
 
 log "assert: the embedded portail image starts from cri-o's store (pull policy Never)"
 portail_ref="$(vssh awk '{print $2}' /usr/lib/embedded-images/manifest | grep '/portail:' | head -1)"
