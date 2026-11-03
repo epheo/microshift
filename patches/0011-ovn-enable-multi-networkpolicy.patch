@@ -1,3 +1,20 @@
+diff --git a/assets/components/ovn/common/clusterrole-controller.yaml b/assets/components/ovn/common/clusterrole-controller.yaml
+index 8568a7a..f4781f6 100644
+--- a/assets/components/ovn/common/clusterrole-controller.yaml
++++ b/assets/components/ovn/common/clusterrole-controller.yaml
+@@ -144,3 +144,12 @@ rules:
+   - create
+   - update
+   - patch
++# enable-multi-networkpolicy adds these to the same startup list: forbidden
++# here crash-loops ovnkube-controller and the node never goes Ready.
++- apiGroups: ["k8s.cni.cncf.io"]
++  resources:
++  - multi-networkpolicies
++  verbs:
++  - get
++  - list
++  - watch
 diff --git a/assets/components/ovn/common/configmap.yaml b/assets/components/ovn/common/configmap.yaml
 index 1c0051b..3a709b7 100644
 --- a/assets/components/ovn/common/configmap.yaml
