@@ -4,6 +4,8 @@
 #   - MicroShift comes up healthy with OVN-Kubernetes as the CNI
 #   - ovnkube-config carries enable-multi-network=true (patches/0001, applied
 #     at the source — no runtime ConfigMap patching)
+#   - MultiNetworkPolicy is on: enable-multi-networkpolicy=true and its CRD
+#     (patches/0011)
 #   - multus is deployed
 #   - TopoLVM is deployed (loopback VG backend)
 #   - the embedded portail image was imported into cri-o's store at boot
@@ -137,6 +139,14 @@ koc -n openshift-ovn-kubernetes get pods --no-headers | grep -q Running
 log "assert: enable-multi-network=true is native in ovnkube-config"
 koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkube\.conf}' \
     | grep -q 'enable-multi-network=true'
+
+# OVN waits for this CRD at start: Running ovnkube pods above already prove
+# the CRD manager applied it first.
+log "assert: MultiNetworkPolicy is on (flag and CRD)"
+koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkube\.conf}' \
+    | grep -q 'enable-multi-networkpolicy=true'
+koc wait --for=condition=Established --timeout=60s \
+    crd/multi-networkpolicies.k8s.cni.cncf.io >/dev/null
 
 log "assert: multus is deployed"
 koc -n openshift-multus get daemonset multus --no-headers >/dev/null
