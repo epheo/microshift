@@ -6,6 +6,8 @@
 #     at the source — no runtime ConfigMap patching)
 #   - MultiNetworkPolicy is on: enable-multi-networkpolicy=true and its CRD
 #     (patches/0011)
+#   - AdminNetworkPolicy is on: enable-admin-network-policy=true and both
+#     CRDs (patches/0012)
 #   - multus is deployed
 #   - TopoLVM is deployed (loopback VG backend)
 #   - the embedded portail image was imported into cri-o's store at boot
@@ -147,6 +149,13 @@ koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkub
     | grep -q 'enable-multi-networkpolicy=true'
 koc wait --for=condition=Established --timeout=60s \
     crd/multi-networkpolicies.k8s.cni.cncf.io >/dev/null
+
+log "assert: AdminNetworkPolicy is on (flag and CRDs)"
+koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkube\.conf}' \
+    | grep -q 'enable-admin-network-policy=true'
+koc wait --for=condition=Established --timeout=60s \
+    crd/adminnetworkpolicies.policy.networking.k8s.io \
+    crd/baselineadminnetworkpolicies.policy.networking.k8s.io >/dev/null
 
 log "assert: multus is deployed"
 koc -n openshift-multus get daemonset multus --no-headers >/dev/null
