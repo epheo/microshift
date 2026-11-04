@@ -7,8 +7,9 @@
 # The opinion assertions are functional, not existence checks: a PVC is
 # provisioned and written, an OVN-K layer2 secondary network is attached,
 # a MultiNetworkPolicy cuts a pod off that network and its removal restores
-# it, the embedded portail image is started with pull policy Never, and the
-# API accepts TCPRoute and UDPRoute objects.
+# it, an AdminNetworkPolicy does the same on the cluster network, the
+# embedded portail image is started with pull policy Never, and the API
+# accepts TCPRoute and UDPRoute objects.
 # The fresh-install VM runs with zero egress (restrict=on): going GREEN
 # proves the air-gapped first boot the embedded payload exists for.
 #
@@ -361,6 +362,13 @@ koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkub
         exit 1
     }
 
+log "assert: enable-admin-network-policy=true is native in ovnkube-config"
+koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkube\.conf}' \
+    | grep -q 'enable-admin-network-policy=true' || {
+        echo "ERROR: enable-admin-network-policy missing from ovnkube-config" >&2
+        exit 1
+    }
+
 log "assert: multus is deployed"
 koc -n openshift-multus get daemonset multus --no-headers >/dev/null
 
@@ -482,7 +490,7 @@ server_ip="$(koc exec l2test-server -- ip -o -4 addr show dev net1 | awk '{print
 [ -n "${server_ip}" ] || { echo "ERROR: l2test-server got no net1 address" >&2; exit 1; }
 l2_reach() {
     koc exec l2test-probe -- python3 -c \
-        'import socket, sys; socket.create_connection((sys.argv[1], 8080), 3)' "${server_ip}" \
+        'import socket, sys; socket.create_connection((sys.argv[1], 8080), 3)' "${target_ip}" \
         >/dev/null 2>&1
 }
 # Retries cover the server starting and OVN programming or removing ACLs.
@@ -496,6 +504,7 @@ l2_expect() {
     echo "ERROR: l2test-server reachable=${got}, want ${want} ($2)" >&2
     return 1
 }
+target_ip="${server_ip}"
 l2_expect yes "before any policy"
 koc apply -f - <<EOF
 apiVersion: k8s.cni.cncf.io/v1beta1
@@ -513,6 +522,37 @@ EOF
 l2_expect no "under a deny-all MultiNetworkPolicy"
 koc delete multi-networkpolicy l2test-deny >/dev/null
 l2_expect yes "after the policy is deleted"
+
+# The same on the cluster network: an admin Deny holds with no NetworkPolicy
+# in the namespace, and its removal restores the path.
+log "assert: an AdminNetworkPolicy isolates a pod on the cluster network"
+target_ip="$(koc get pod l2test-server -o jsonpath='{.status.podIP}')"
+[ -n "${target_ip}" ] || { echo "ERROR: l2test-server has no pod IP" >&2; exit 1; }
+l2_expect yes "on the cluster network, before any policy"
+koc apply -f - <<EOF
+apiVersion: policy.networking.k8s.io/v1alpha1
+kind: AdminNetworkPolicy
+metadata:
+  name: anptest-deny
+spec:
+  priority: 10
+  subject:
+    pods:
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: default
+      podSelector:
+        matchLabels:
+          app: l2test-server
+  ingress:
+  - name: deny-all
+    action: Deny
+    from:
+    - namespaces: {}
+EOF
+l2_expect no "under an AdminNetworkPolicy Deny"
+koc delete adminnetworkpolicy anptest-deny >/dev/null
+l2_expect yes "after the AdminNetworkPolicy is deleted"
 
 log "assert: the embedded portail image starts from cri-o's store (pull policy Never)"
 portail_ref="$(vssh awk '{print $2}' /usr/lib/embedded-images/manifest | grep '/portail:' | head -1)"

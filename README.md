@@ -12,6 +12,7 @@ Published at `ghcr.io/epheo/microshift`.
 | OVN-Kubernetes is the CNI | `microshift-networking` installed; no kindnet |
 | OVN secondary networks work out of the box | `patches/0001` adds `enable-multi-network=true` to the ovnkube-config template at the source |
 | Secondary networks take policies | `patches/0011` adds `enable-multi-networkpolicy=true` and the MultiNetworkPolicy CRD (copied from cluster-network-operator) to MicroShift's own CRD list, applied before OVN starts: OVN-Kubernetes waits for it at start |
+| Cluster-wide policies | `patches/0012` adds `enable-admin-network-policy=true`, the AdminNetworkPolicy and BaselineAdminNetworkPolicy CRDs (copied from cluster-network-operator) to MicroShift's CRD list, and the OVN controller's rights to read them and write their status: a namespace's NetworkPolicy cannot override an admin Deny |
 | Multus enabled | `microshift-multus` (config.d toggle + cri-o default-network drop-in) |
 | TopoLVM is the storage driver | community subpackage merged into the spec (LVMS is not in the OKD payload) |
 | Air-gapped by default | the full MicroShift payload is embedded as a shared-blob OCI layout and imported into cri-o at boot — first boot needs no registry |
