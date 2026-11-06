@@ -140,45 +140,13 @@ jobs:
           # build main's head, not the sha the schedule fired on.
           ref: ${{ needs.bump.outputs.sha || (github.event_name == 'schedule' && 'main' || '') }}
 
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+      - name: Build the image
+        uses: ./.github/actions/build-image
         with:
-          preinstalled-runtimes: true
+          pull-also: quay.io/centos-bootc/bootc-image-builder:latest quay.io/libpod/registry:2.8
 
-      - name: Load version pins
-        run: grep -E '^[A-Z_]+=' versions.env >> "${GITHUB_ENV}"
-
-      # Registry CDNs flake (unexpected EOF mid-blob); pull every base image
-      # with retries up front so the builds run against the local store.
-      - name: Pre-pull base images
-        run: |
-          set -euo pipefail
-          for img in \
-              quay.io/fedora/fedora:latest \
-              "${BUILDROOT_IMAGE}" \
-              "${BOOTC_IMAGE_URL}:${BOOTC_IMAGE_TAG}" \
-              quay.io/centos-bootc/bootc-image-builder:latest \
-              quay.io/libpod/registry:2.8; do
-            for i in $(seq 5); do
-              if sudo podman pull -q "${img}"; then break; fi
-              if [ "${i}" = "5" ]; then echo "ERROR: could not pull ${img}"; exit 1; fi
-              echo "pull failed (attempt ${i}) for ${img}, retrying"; sleep 15
-            done
-          done
-
-      - name: Build SRPM (source + patches + OKD payload swap)
-        run: make srpm PODMAN="sudo podman"
-
-      - name: Build RPMs (el10)
-        run: make rpm PODMAN="sudo podman"
-
-      - name: Build bootc image
-        run: make image PODMAN="sudo podman"
-
-      - name: Install qemu
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q qemu-system-x86
+      - name: Prepare the runner for VMs
+        uses: ./.github/actions/vm-host
 
       - name: VM boot test (bootc-image-builder -> qcow2 -> QEMU)
         run: make vm-test PODMAN="sudo podman"
