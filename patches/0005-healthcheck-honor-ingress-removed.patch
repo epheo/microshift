@@ -1,7 +1,8 @@
 diff --git a/pkg/healthcheck/microshift_core_workloads.go b/pkg/healthcheck/microshift_core_workloads.go
+index c84d5c49..1282e312 100644
 --- a/pkg/healthcheck/microshift_core_workloads.go
 +++ b/pkg/healthcheck/microshift_core_workloads.go
-@@ -22,9 +22,6 @@ func getCoreMicroShiftWorkloads() (map[string]NamespaceWorkloads, error) {
+@@ -23,9 +23,6 @@ func getCoreMicroShiftWorkloads() (map[string]NamespaceWorkloads, error) {
  		"openshift-service-ca": {
  			Deployments: []string{"service-ca"},
  		},
@@ -11,14 +12,14 @@ diff --git a/pkg/healthcheck/microshift_core_workloads.go b/pkg/healthcheck/micr
  		"openshift-dns": {
  			DaemonSets: []string{
  				"dns-default",
-@@ -37,6 +34,15 @@ func getCoreMicroShiftWorkloads() (map[string]NamespaceWorkloads, error) {
+@@ -38,6 +35,15 @@ func getCoreMicroShiftWorkloads() (map[string]NamespaceWorkloads, error) {
  			DaemonSets: []string{"ovnkube-master", "ovnkube-node"},
  		}
  	}
 +	// Upstream arms this expectation unconditionally, but the router is never
-+	// deployed when the config sets ingress.status: Removed — the healthcheck
-+	// then waits out its whole timeout on a namespace that does not exist and
-+	// greenboot fails an otherwise healthy boot (companion of patch 0003).
++	// deployed when the config sets ingress.status: Removed. The healthcheck
++	// would wait out its whole timeout on a namespace that does not exist and
++	// greenboot would fail an otherwise healthy boot.
 +	if cfg.Ingress.Status != config.StatusRemoved {
 +		workloads["openshift-ingress"] = NamespaceWorkloads{
 +			Deployments: []string{"router-default"},
