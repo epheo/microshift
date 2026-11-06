@@ -53,5 +53,5 @@ nor a Service CA serving cert.
 
 Chart 15.x installed a `topolvm-hook` MutatingWebhookConfiguration with
 `failurePolicy: Fail`. On an upgraded node it would reject every PVC create,
-so `assets/delete/` ships a delete kustomization that removes it and its
-serving cert secret on every MicroShift start.
+so `assets/delete/` ships a delete kustomization that removes it on every
+MicroShift start. Its serving cert secret is left in place.

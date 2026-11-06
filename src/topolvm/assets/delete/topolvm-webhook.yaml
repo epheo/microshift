@@ -6,10 +6,6 @@ apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
   name: topolvm-hook
----
-# Serving cert service-ca minted for that webhook.
-apiVersion: v1
-kind: Secret
-metadata:
-  name: topolvm-mutatingwebhook
-  namespace: topolvm-system
+# Its serving cert secret, topolvm-mutatingwebhook, stays: the old controller
+# pod mounts it, and deleting it before the Deployment rolls leaves that pod
+# unable to start after the upgrade reboot.

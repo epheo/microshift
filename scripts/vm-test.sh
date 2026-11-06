@@ -348,10 +348,17 @@ wait_node_ready
 log "waiting for all pods to be Running/Completed (up to 15m)"
 ok=false
 total=0 bad=0
-for _ in $(seq 180); do
+for i in $(seq 180); do
     total="$(koc get pods -A --no-headers 2>/dev/null | wc -l)"
     bad="$(koc get pods -A --no-headers 2>/dev/null | grep -cvE 'Running|Completed' || true)"
     if [ "${total}" -ge 8 ] && [ "${bad}" -eq 0 ]; then ok=true; break; fi
+    # On the upgrade boot greenboot reboots the VM after about 10m, before
+    # this wait ends and before dump_diag can reach it: report as it goes.
+    if [ $((i % 12)) -eq 0 ]; then
+        log "still waiting: ${bad} of ${total} pods not Running/Completed"
+        koc get pods -A --no-headers 2>/dev/null | grep -vE 'Running|Completed' | head -20 || true
+        vssh journalctl -u microshift -b --no-pager 2>/dev/null | grep -i 'kustomiz' | tail -3 || true
+    fi
     sleep 5
 done
 ${ok} || { echo "ERROR: pods did not settle (total=${total} not-ready=${bad})" >&2; koc get pods -A || true; exit 1; }
