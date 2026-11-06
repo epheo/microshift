@@ -170,8 +170,10 @@ copies only public CA certs, so a worker never holds signing material.
 `patches/0008` replaces the multinode OVN manifests with its own to match
 the shipped binary: every node runs its own interconnect zone (local OVN
 databases, northd, ovn-controller, zone controller), the control plane keeps only
-the cluster manager, and ovnkube authenticates with its service account
-instead of a mounted kubeadmin kubeconfig. Workers boot from the same
+the cluster manager, and ovnkube authenticates with a service account
+instead of a mounted kubeadmin kubeconfig. Zone pods get OpenShift's
+node-limited role, not the controller's: a worker can write pod and node
+status, and ConfigMaps only in `openshift-ovn-kubernetes`. Workers boot from the same
 embedded payload, so joins are air-gapped too. One image serves both
 roles:
 
