@@ -12,11 +12,12 @@
 # MAX_VERSION_SKEW (2) minors older than its binary. The CI gate (patch
 # series applies, RPMs build, the VM boots green through greenboot on the
 # recommended shape) is what actually guards a crossing; a crossing that
-# breaks the patch series leaves main red until the series is rebased by
-# hand. Never downgrades.
+# breaks the patch series stays on auto/bump, and main keeps the last green
+# pins, until the series is rebased by hand. Never downgrades.
 #
-# Exits 0 whether or not anything changed; the workflow commits a dirty
-# versions.env and the same run builds, VM-tests and publishes it.
+# Exits 0 whether or not anything changed; scripts/ci-bump.sh commits a
+# dirty versions.env to auto/bump, and the same run builds, VM-tests,
+# promotes and publishes it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
