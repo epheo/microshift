@@ -17,13 +17,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
-          tool-cache: true
-          swap-storage: false
+          preinstalled-runtimes: true
 
       - name: Load version pins
         run: grep -E '^[A-Z_]+=' versions.env >> "${GITHUB_ENV}"
@@ -62,13 +61,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
-          tool-cache: true
-          swap-storage: false
+          preinstalled-runtimes: true
 
       - name: Load version pins
         run: grep -E '^[A-Z_]+=' versions.env >> "${GITHUB_ENV}"
@@ -122,7 +120,7 @@ jobs:
 
       - name: Collect VM logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: multinode-logs
           # console{1,2}.log are the serial consoles; multinode-test.sh writes
