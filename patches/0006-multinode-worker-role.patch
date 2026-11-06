@@ -16,6 +16,11 @@ networking only, and `microshift add-node --worker` joins it.
   current after control plane CA rotation.
 - add-node removes its copy of the join credential on every exit, and
   records the control plane IP in the worker marker.
+- The Kubernetes version skew policy: a worker never runs a kubelet newer
+  than the control plane's apiserver. An update boot that would is refused
+  before the version file is written, so greenboot rolls it back and the
+  next update retries once the control plane caught up; add-node refuses
+  such a join. A kubelet more than three minors behind only warns.
 
 Layout: the worker lives in its own files, pkg/cmd/run_worker.go and
 pkg/cmd/addnode_worker.go. Upstream's run.go and addnode.go only gain the
@@ -30,19 +35,23 @@ and multinode-test (join, certs, restart without bootstrap kubeconfig).
 ---
  assets/core/kubelet.yaml                     |  10 +-
  pkg/cmd/addnode.go                           |   6 +-
- pkg/cmd/addnode_worker.go                    | 243 +++++++++++++++++++
+ pkg/cmd/addnode_worker.go                    | 249 +++++++++++++++++++
  pkg/cmd/run.go                               |  34 ++-
- pkg/cmd/run_worker.go                        | 127 ++++++++++
+ pkg/cmd/run_worker.go                        | 133 ++++++++++
+ pkg/cmd/worker_skew.go                       | 112 +++++++++
+ pkg/cmd/worker_skew_test.go                  |  37 +++
  pkg/config/multinode.go                      |  40 ++-
  pkg/controllers/kubelet_client_ca_refresh.go | 105 ++++++++
- pkg/controllers/kubelet_csr_approver.go      | 192 +++++++++++++++
+ pkg/controllers/kubelet_csr_approver.go      | 192 ++++++++++++++
  pkg/controllers/kubelet_csr_approver_test.go | 171 +++++++++++++
  pkg/node/kubelet.go                          |  37 ++-
  pkg/node/kubelet_test.go                     |  15 ++
  pkg/node/netconfig.go                        |  14 +-
- 12 files changed, 973 insertions(+), 21 deletions(-)
+ 14 files changed, 1134 insertions(+), 21 deletions(-)
  create mode 100644 pkg/cmd/addnode_worker.go
  create mode 100644 pkg/cmd/run_worker.go
+ create mode 100644 pkg/cmd/worker_skew.go
+ create mode 100644 pkg/cmd/worker_skew_test.go
  create mode 100644 pkg/controllers/kubelet_client_ca_refresh.go
  create mode 100644 pkg/controllers/kubelet_csr_approver.go
  create mode 100644 pkg/controllers/kubelet_csr_approver_test.go
@@ -112,10 +121,10 @@ index 864876e8920d4e3840cab5e9e945da62fe1adf65..a209751af59ba6707bb2da341a2607b2
  		cmd.Hidden = true
 diff --git a/pkg/cmd/addnode_worker.go b/pkg/cmd/addnode_worker.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..58e3e866de9abd0b4c760c55e594a1991ffd3eee
+index 0000000000000000000000000000000000000000..e0d7c17c9d8c87bd68e76058131b225c7a7e5dac
 --- /dev/null
 +++ b/pkg/cmd/addnode_worker.go
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,249 @@
 +package cmd
 +
 +import (
@@ -176,6 +185,12 @@ index 0000000000000000000000000000000000000000..58e3e866de9abd0b4c760c55e594a199
 +			return nil
 +		}
 +		klog.Infof("Node %s exists in the cluster but local worker state is missing; re-materializing bootstrap materials", nodeName)
++	}
++
++	// A worker newer than the control plane would join outside the version
++	// skew policy: refuse before anything on this node is wiped.
++	if err := checkWorkerSkew(opts.KubeconfigPath, true); err != nil {
++		return err
 +	}
 +
 +	if err := cleanupMicroShiftData(cfg); err != nil {
@@ -443,10 +458,10 @@ index e21fba4c5b5da3035dfa7cacb34680f0bbbf8690..bd4f177cfb2add7b8560136e83f14856
  	notifySocket := os.Getenv("NOTIFY_SOCKET")
 diff --git a/pkg/cmd/run_worker.go b/pkg/cmd/run_worker.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..9d22ba508dd493675b8eadcde7787a6fe91c206c
+index 0000000000000000000000000000000000000000..dac9ba0c797eb92f9d2f2f0369506cd6bc76c623
 --- /dev/null
 +++ b/pkg/cmd/run_worker.go
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,133 @@
 +package cmd
 +
 +import (
@@ -494,6 +509,12 @@ index 0000000000000000000000000000000000000000..9d22ba508dd493675b8eadcde7787a6f
 +		return fmt.Errorf("worker mode requires the bootstrap kubeconfig installed by 'microshift add-node --worker'")
 +	}
 +
++	// Before anything is written: a refused update must roll back onto the
++	// data as the previous deployment left it.
++	if err := checkWorkerSkew(workerKubeconfig(cfg), isUpdateBoot()); err != nil {
++		writeLogFileError(preRunFailedLogPath, err)
++		return err
++	}
 +	if err := prerun.VersionMetadataManagement(); err != nil {
 +		writeLogFileError(preRunFailedLogPath, err)
 +		return err
@@ -573,6 +594,167 @@ index 0000000000000000000000000000000000000000..9d22ba508dd493675b8eadcde7787a6f
 +	}
 +	klog.InfoS("MICROSHIFT STOPPED", "since-stop", time.Since(microshiftStop))
 +	return serviceErr
++}
+diff --git a/pkg/cmd/worker_skew.go b/pkg/cmd/worker_skew.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..a0b9270e961048795ed256d39a6668b819b2647f
+--- /dev/null
++++ b/pkg/cmd/worker_skew.go
+@@ -0,0 +1,112 @@
++package cmd
++
++import (
++	"context"
++	"fmt"
++	"time"
++
++	"github.com/openshift/microshift/pkg/admin/prerun"
++	"github.com/openshift/microshift/pkg/config"
++	"github.com/openshift/microshift/pkg/util"
++	utilversion "k8s.io/apimachinery/pkg/util/version"
++	"k8s.io/apimachinery/pkg/util/wait"
++	"k8s.io/client-go/discovery"
++	"k8s.io/client-go/tools/clientcmd"
++	componentversion "k8s.io/component-base/version"
++	"k8s.io/klog/v2"
++)
++
++// The Kubernetes version skew policy: a kubelet must never be newer than the
++// kube-apiserver, and may be up to three minors older. Updates go control
++// plane first, then nodes.
++// https://kubernetes.io/releases/version-skew-policy/
++const maxKubeletMinorsBehind = 3
++
++// skewVerdict says whether a worker whose kubelet is at kubelet may start
++// against an apiserver at apiserver. Only an update boot is refused: its
++// version file is not written yet, so greenboot rolls back onto untouched
++// data and the next update attempt retries once the control plane has
++// caught up. Refusing an already running version would only take the node
++// down, so that only warns.
++func skewVerdict(kubelet, apiserver *utilversion.Version, updateBoot bool) (refuse bool, warning string) {
++	switch {
++	case kubelet.Major() != apiserver.Major():
++		return false, fmt.Sprintf("kubelet %s and apiserver %s differ in major version", kubelet, apiserver)
++	case kubelet.Minor() > apiserver.Minor():
++		msg := fmt.Sprintf("kubelet %s is newer than the control plane's apiserver %s; the Kubernetes version skew policy needs the control plane updated first", kubelet, apiserver)
++		return updateBoot, msg
++	case apiserver.Minor()-kubelet.Minor() > maxKubeletMinorsBehind:
++		return false, fmt.Sprintf("kubelet %s is more than %d minors older than the apiserver %s, outside the version skew policy", kubelet, maxKubeletMinorsBehind, apiserver)
++	}
++	return false, ""
++}
++
++// checkWorkerSkew applies skewVerdict with the control plane reached through
++// kubeconfig. An unreachable control plane does not block: it may be
++// rebooting on the same update timer, and the healthcheck gates the worker
++// on its Node being Ready anyway.
++func checkWorkerSkew(kubeconfig string, updateBoot bool) error {
++	kubelet, err := utilversion.ParseGeneric(componentversion.Get().GitVersion)
++	if err != nil {
++		klog.Warningf("Version skew check skipped: kubelet version %q: %v", componentversion.Get().GitVersion, err)
++		return nil
++	}
++	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
++	if err != nil {
++		klog.Warningf("Version skew check skipped: %v", err)
++		return nil
++	}
++	client, err := discovery.NewDiscoveryClientForConfig(restConfig)
++	if err != nil {
++		klog.Warningf("Version skew check skipped: %v", err)
++		return nil
++	}
++	var gitVersion string
++	err = wait.PollUntilContextTimeout(context.Background(), 5*time.Second, 2*time.Minute, true,
++		func(context.Context) (bool, error) {
++			info, err := client.ServerVersion()
++			if err != nil {
++				klog.V(2).Infof("Waiting for the control plane's version: %v", err)
++				return false, nil
++			}
++			gitVersion = info.GitVersion
++			return true, nil
++		})
++	if err != nil {
++		klog.Warningf("Version skew check skipped: control plane unreachable for 2m")
++		return nil
++	}
++	apiserver, err := utilversion.ParseGeneric(gitVersion)
++	if err != nil {
++		klog.Warningf("Version skew check skipped: apiserver version %q: %v", gitVersion, err)
++		return nil
++	}
++	refuse, warning := skewVerdict(kubelet, apiserver, updateBoot)
++	if refuse {
++		return fmt.Errorf("%s: refusing to start this update", warning)
++	}
++	if warning != "" {
++		klog.Warning(warning)
++	}
++	return nil
++}
++
++// workerKubeconfig is the credential a worker reaches the control plane with:
++// the kubelet's own once it bootstrapped, the bootstrap one before.
++func workerKubeconfig(cfg *config.Config) string {
++	if exists, err := util.PathExists(cfg.KubeConfigPath(config.Kubelet)); err == nil && exists {
++		return cfg.KubeConfigPath(config.Kubelet)
++	}
++	return cfg.BootstrapKubeConfigPath()
++}
++
++// isUpdateBoot is true when this binary is not the version that last wrote
++// the data, i.e. the node is booting a new deployment.
++func isUpdateBoot() bool {
++	execVersion, err := prerun.GetVersionOfExecutable()
++	if err != nil {
++		return false
++	}
++	data := prerun.GetVersionStringOfData()
++	return data != "unknown" && data != execVersion.String()
++}
+diff --git a/pkg/cmd/worker_skew_test.go b/pkg/cmd/worker_skew_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac612d6fb4ddf15a336223341c607ed536a24d17
+--- /dev/null
++++ b/pkg/cmd/worker_skew_test.go
+@@ -0,0 +1,37 @@
++package cmd
++
++import (
++	"strings"
++	"testing"
++
++	utilversion "k8s.io/apimachinery/pkg/util/version"
++)
++
++func TestSkewVerdict(t *testing.T) {
++	tests := []struct {
++		name       string
++		kubelet    string
++		apiserver  string
++		updateBoot bool
++		refuse     bool
++		warning    string
++	}{
++		{"same minor", "v1.36.5", "v1.36.2", true, false, ""},
++		{"kubelet one minor older", "v1.35.8", "v1.36.5", true, false, ""},
++		{"kubelet three minors older", "v1.33.0", "v1.36.5", false, false, ""},
++		{"kubelet four minors older", "v1.32.0", "v1.36.5", false, false, "more than 3 minors older"},
++		{"kubelet newer on an update boot", "v1.36.5", "v1.35.8", true, true, "newer than the control plane"},
++		{"kubelet newer on a regular boot", "v1.36.5", "v1.35.8", false, false, "newer than the control plane"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			refuse, warning := skewVerdict(utilversion.MustParseGeneric(tt.kubelet), utilversion.MustParseGeneric(tt.apiserver), tt.updateBoot)
++			if refuse != tt.refuse {
++				t.Fatalf("refuse = %v, want %v (%q)", refuse, tt.refuse, warning)
++			}
++			if tt.warning == "" && warning != "" || !strings.Contains(warning, tt.warning) {
++				t.Fatalf("warning %q, want it to contain %q", warning, tt.warning)
++			}
++		})
++	}
 +}
 diff --git a/pkg/config/multinode.go b/pkg/config/multinode.go
 index 37bd5b773fae5fdb1796b6d7ffb5f9cdf05ca47b..86c06cb8425d0bc9f82b6b5a0588068d06fde374 100644

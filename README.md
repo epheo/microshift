@@ -193,6 +193,12 @@ from the CA the control plane publishes, so control-plane CA rotation does not
 require a re-join. The greenboot gate stays enabled on workers: `microshift
 healthcheck` detects the role and gates on the node being Ready in the cluster.
 
+Updates follow the Kubernetes version skew policy: update the controller
+first, then the workers. A worker never runs a kubelet newer than the
+controller's apiserver: an update that would is refused before it touches the
+node's data, greenboot rolls it back, and the next update timer run retries
+once the controller has moved.
+
 The firewall follows the profile (workers expose only kubelet and Geneve).
 Note that upgrading a pre-existing install to this revision enables firewalld
 if it was inactive: a site relying on previously open ports must add explicit
