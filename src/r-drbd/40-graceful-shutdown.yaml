@@ -1,0 +1,6 @@
+# Pods stop and release their volumes before the node goes down, so the
+# r-drbd agent, stopped last, holds no Primary. Without it a volume in use
+# leaves its peers Outdated until the node is back.
+kubelet:
+  shutdownGracePeriod: 90s
+  shutdownGracePeriodCriticalPods: 30s

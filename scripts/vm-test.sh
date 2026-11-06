@@ -46,7 +46,7 @@ REG_PORT="${REG_PORT:-5000}"
 REG_NAME=epheo-microshift-upgrade-registry
 # 10.0.2.2 is the QEMU user-network alias for the host loopback.
 CANDIDATE_REF="10.0.2.2:${REG_PORT}/epheo-microshift:candidate"
-VG_NAME="myvg1" # must match the device-class in the packaged lvmd config
+VG_NAME="myvg1" # the VG microshift-r-drbd-default-pool turns into a Pool
 
 log() { echo "--- $*"; }
 
@@ -269,9 +269,7 @@ ACCEL="tcg"
 # IPv4; keep the test VM IPv4-only.
 NET_RESTRICT="restrict=on,"
 [ -n "${UPGRADE_FROM}" ] && NET_RESTRICT=""
-log "booting VM (accel=${ACCEL}) with a secondary disk for the TopoLVM VG"
-# Kept small on purpose: the 1Gi PVC probe only fits if lvmd renders
-# spare-gb 0. A return of the chart default (10) fails the probe here.
+log "booting VM (accel=${ACCEL}) with a secondary disk for the storage VG"
 sudo truncate --size=2G "${WORKDIR}/lvm-disk.raw"
 sudo qemu-system-x86_64 \
     -machine "accel=${ACCEL}" -cpu max -smp "$(nproc)" -m "${VM_MEM}" \
@@ -286,8 +284,12 @@ QEMU_PID="$(sudo cat "${WORKDIR}/qemu.pid")"
 
 wait_ssh
 
-log "provisioning the TopoLVM volume group on the secondary disk"
+# VG myvg1 with a thin pool named thin is the shape this image turns into an
+# r-drbd Pool and default StorageClass by itself. In upgrade mode it is made
+# on the previous release, whose TopoLVM uses the same VG.
+log "provisioning the storage volume group and thin pool on the secondary disk"
 vssh vgcreate -f -y "${VG_NAME}" /dev/vdb
+vssh lvcreate -q -y --type thin-pool -l 90%FREE -n thin "${VG_NAME}"
 
 # --- 4b. Upgrade mode: switch to the candidate and reboot ---------------------
 if [ -n "${UPGRADE_FROM}" ]; then
@@ -400,8 +402,9 @@ koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkub
 log "assert: multus is deployed"
 koc -n openshift-multus get daemonset multus --no-headers >/dev/null
 
-log "assert: TopoLVM is running"
-koc -n topolvm-system get pods --no-headers | grep -q Running
+log "assert: the DRBD module is loaded and r-drbd is running"
+vssh grep -q '^drbd ' /proc/modules
+koc -n r-drbd-system get pods --no-headers | grep -q Running
 
 log "assert: embedded portail image was imported into cri-o at boot"
 vssh crictl images | grep -q 'localhost/embedded/portail'
@@ -424,22 +427,32 @@ vssh /usr/bin/import-embedded-images.sh | { ! grep -q '^importing'; }
 # no extra registry pull, no docker.io rate limits.
 util_img="$(koc -n openshift-ovn-kubernetes get pods -o jsonpath='{.items[0].spec.containers[0].image}')"
 
-# Separates a controller that never gets Ready from a PVC that never binds,
-# and keeps the pod wait below for provisioning alone.
-log "waiting for the TopoLVM controller endpoints (up to 3m)"
+# Separates a Pool that never comes up from a PVC that never binds, and
+# keeps the pod wait below for provisioning alone.
+log "waiting for the default r-drbd Pool to be Available (up to 5m)"
 ok=false
-for _ in $(seq 36); do
-    ep="$(koc -n topolvm-system get endpoints topolvm-controller -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)"
-    if [ -n "${ep}" ]; then ok=true; break; fi
+for _ in $(seq 60); do
+    avail="$(koc get pools -o jsonpath='{range .items[*]}{.spec.vg}={.status.conditions[?(@.type=="Available")].status}{"\n"}{end}' 2>/dev/null || true)"
+    if echo "${avail}" | grep -qx "${VG_NAME}=True"; then ok=true; break; fi
     sleep 5
 done
 ${ok} || {
-    echo "ERROR: topolvm-controller endpoints never appeared" >&2
-    koc -n topolvm-system get pods >&2 || true
+    echo "ERROR: no Available r-drbd Pool for ${VG_NAME}" >&2
+    vssh systemctl status microshift-r-drbd-default-pool --no-pager >&2 || true
+    koc get pools -o yaml >&2 || true
+    koc -n r-drbd-system get pods >&2 || true
     exit 1
 }
 
-log "assert: TopoLVM provisions and mounts a PVC (write + read back)"
+log "assert: r-drbd-local is the only default StorageClass"
+defaults="$(koc get storageclass -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}{.metadata.name}{"\n"}{end}')"
+[ "${defaults}" = "r-drbd-local" ] || {
+    echo "ERROR: default StorageClasses are '${defaults}', expected r-drbd-local alone" >&2
+    exit 1
+}
+
+# No storageClassName: the claim must land on the default class.
+log "assert: the default class provisions and mounts a PVC (write + read back)"
 koc apply -f - <<EOF
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -450,7 +463,6 @@ spec:
   resources:
     requests:
       storage: 1Gi
-  storageClassName: topolvm-provisioner
 ---
 apiVersion: v1
 kind: Pod

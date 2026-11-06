@@ -9,7 +9,7 @@
 #   - AdminNetworkPolicy is on: enable-admin-network-policy=true and both
 #     CRDs (patches/0012)
 #   - multus is deployed
-#   - TopoLVM is deployed (loopback VG backend)
+#   - r-drbd is deployed (loopback VG + thin pool backend)
 #   - the embedded portail image was imported into cri-o's store at boot
 #   - the router is not deployed
 #   - the Gateway API TCPRoute and UDPRoute CRDs are established
@@ -25,7 +25,7 @@ set -euo pipefail
 DIST_IMAGE="${DIST_IMAGE:-epheo-microshift}"
 NAME="${NAME:-epheo-microshift-smoke}"
 LVM_DISK="${LVM_DISK:-/var/lib/epheo-microshift-smoke/lvmdisk.image}"
-VG_NAME="myvg1" # must match the device-class in the packaged lvmd config
+VG_NAME="myvg1" # the VG microshift-r-drbd-default-pool turns into a Pool
 KUBECONFIG_IN_CONTAINER="/var/lib/microshift/resources/kubeadmin/kubeconfig"
 
 log() { echo "--- $*"; }
@@ -77,11 +77,12 @@ fi
 sudo modprobe openvswitch || true
 
 if [ ! -f "${LVM_DISK}" ]; then
-    log "creating loopback VG '${VG_NAME}' for TopoLVM"
+    log "creating loopback VG '${VG_NAME}' and thin pool thin for r-drbd"
     sudo mkdir -p "$(dirname "${LVM_DISK}")"
     sudo truncate --size=2G "${LVM_DISK}"
     dev="$(sudo losetup --find --show --nooverlap "${LVM_DISK}")"
     sudo vgcreate -f -y "${VG_NAME}" "${dev}"
+    sudo lvcreate -q -y --type thin-pool -l 90%FREE -n thin "${VG_NAME}"
 fi
 
 # --- 3. Boot the image as a container ---------------------------------------
@@ -160,8 +161,8 @@ koc wait --for=condition=Established --timeout=60s \
 log "assert: multus is deployed"
 koc -n openshift-multus get daemonset multus --no-headers >/dev/null
 
-log "assert: TopoLVM is running"
-koc -n topolvm-system get pods --no-headers | grep -q Running
+log "assert: r-drbd is running"
+koc -n r-drbd-system get pods --no-headers | grep -q Running
 
 log "assert: embedded portail image was imported into cri-o at boot"
 pexec crictl images | grep -q 'localhost/embedded/portail'

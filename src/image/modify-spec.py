@@ -105,8 +105,8 @@ def open_specfile(path):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <primary_specfile> <specfile_to_merge>...", file=sys.stderr)
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <primary_specfile> [<specfile_to_merge>...]", file=sys.stderr)
         sys.exit(1)
     specfiles = sys.argv[1:]
     primary_specfile = specfiles[0]

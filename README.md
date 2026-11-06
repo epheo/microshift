@@ -14,7 +14,7 @@ Published at `ghcr.io/epheo/microshift`.
 | Secondary networks take policies | `patches/0011` adds `enable-multi-networkpolicy=true` and the MultiNetworkPolicy CRD (copied from cluster-network-operator) to MicroShift's own CRD list, applied before OVN starts: OVN-Kubernetes waits for it at start |
 | Cluster-wide policies | `patches/0012` adds `enable-admin-network-policy=true`, the AdminNetworkPolicy and BaselineAdminNetworkPolicy CRDs (copied from cluster-network-operator) to MicroShift's CRD list, and the OVN controller's rights to read them and write their status: a namespace's NetworkPolicy cannot override an admin Deny |
 | Multus enabled | `microshift-multus` (config.d toggle + cri-o default-network drop-in) |
-| TopoLVM is the storage driver | community subpackage merged into the spec (LVMS is not in the OKD payload) |
+| r-drbd is the storage driver | [r-drbd](https://github.com/epheo/r-drbd) (DRBD 9 on thin LVM) with its DRBD module built for the image kernel; local volumes on one node, replicated ones on three. See [Storage](#storage) |
 | Air-gapped by default | the full MicroShift payload is embedded as a shared-blob OCI layout and imported into cri-o at boot — first boot needs no registry |
 | [portail](https://github.com/epheo/portail) is the edge | its image is embedded and imported the same way; the router is off and the Gateway API experimental CRDs (TCPRoute, UDPRoute) ship with the image, see [The edge](#the-edge) |
 | Updates must be safe | greenboot MicroShift health gate stays enabled; bootc rollback does the rest |
@@ -29,6 +29,31 @@ Everything site-specific (IPs, VLANs, NADs, hardware quirks, extra embedded
 images) belongs in a derived image, not here. Site layers can drop additional
 OCI archives + manifest lines under `/usr/lib/embedded-images/` and the boot
 import service picks them up.
+
+## Storage
+
+[r-drbd](https://github.com/epheo/r-drbd) provides block storage: local
+volumes (`r-drbd-local`, one replica) on any node, synchronously replicated
+ones (`r-drbd-replicated`) on three nodes, snapshots, and expansion. Its
+manifests (`src/r-drbd/base`) and the DRBD module are pinned in `versions.env`.
+
+Storage works out of the box on the same shape TopoLVM used: create volume
+group `myvg1` with a thin pool named `thin`, and on its next start the node
+declares it as an r-drbd Pool and makes `r-drbd-local` the default
+StorageClass. Any other layout is declared as a Pool by the site; see r-drbd's
+[pools](https://github.com/epheo/r-drbd/blob/main/docs/pools.md). Workers'
+Pools are always declared by the site.
+
+```sh
+vgcreate myvg1 /dev/sdb
+lvcreate --type thin-pool -l 90%FREE -n thin myvg1
+```
+
+Upgrading a node that ran TopoLVM changes nothing on its own: without a thin
+pool in `myvg1`, no Pool is declared, TopoLVM keeps running and serving its
+volumes, and stays the default class. To move, back up the volumes, create the
+thin pool, restore onto `r-drbd-local`, then remove TopoLVM
+(`oc delete namespace topolvm-system`, its CSIDriver and StorageClass).
 
 ## The edge
 
@@ -49,10 +74,11 @@ Three container stages, driven by `make` and pinned by `versions.env`:
 1. **`packaging/srpm.Containerfile`** — clone `openshift/microshift` at the
    pinned ART tag, apply `patches/*.patch`, swap the pinned OCP payload image
    digests for the public OKD SCOS payload (`quay.io/okd/scos-release`),
-   merge the TopoLVM subpackage, build the SRPM.
+   drop the subpackages it cannot build, build the SRPM.
 2. **`packaging/rpm.Containerfile`** — rebuild the SRPM into el10 RPMs in a
    CentOS Stream 10 buildroot (`microshift_variant community`).
-3. **`packaging/bootc.Containerfile`** — install the RPM selection onto
+3. **`packaging/bootc.Containerfile`** — build the DRBD module for the base
+   kernel, install the RPM selection and r-drbd onto
    `centos-bootc:stream10`, embed the MicroShift payload and portail, enable
    the boot import service and greenboot.
 
@@ -79,7 +105,7 @@ make version               # print the version string of the built RPMs
 bootloader, ostree deployment, boot ordering, greenboot actually gating
 the boot, and the air-gapped contract (the fresh-install VM has zero
 egress). Its opinion assertions are functional, not existence checks:
-- a PVC is provisioned and written (TopoLVM);
+- the default r-drbd Pool comes up and a PVC with no class is provisioned and written;
 - an OVN-K layer2 secondary network is attached through a
   NetworkAttachmentDefinition, a MultiNetworkPolicy cuts a pod off it, and
   removing the policy restores it;

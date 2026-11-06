@@ -1,0 +1,15 @@
+[Unit]
+Description=Declare the default r-drbd Pool (VG myvg1, thin pool thin)
+Wants=microshift.service
+After=microshift.service
+# Control plane only: workers hold no admin credentials, their Pools are
+# declared by the admin.
+ConditionPathExists=/var/lib/microshift/resources/kubeadmin/kubeconfig
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/microshift-r-drbd-default-pool
+
+[Install]
+WantedBy=multi-user.target

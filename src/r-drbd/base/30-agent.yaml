@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: r-drbd-agent
+  namespace: r-drbd-system
+spec:
+  selector:
+    matchLabels: {app: r-drbd-agent}
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels: {app: r-drbd-agent}
+    spec:
+      serviceAccountName: r-drbd-agent
+      priorityClassName: system-node-critical
+      # Above the agent's shutdown (29 s shutdown guard, 60 s drain, 90 s LVM change wait, 5 s CSI); the only hard stop for a stuck LVM change.
+      terminationGracePeriodSeconds: 200
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: agent
+          image: ghcr.io/epheo/r-drbd:sha-33dc051
+          imagePullPolicy: IfNotPresent
+          args: ["agent"]
+          securityContext:
+            privileged: true
+          env:
+            # lvm, mkfs and mount run in the host mount namespace, drbd-utils
+            # from the image; the agent itself stays in the container and
+            # reads host paths through the mounts below.
+            - name: R_DRBD_HOST_NS
+              value: /proc/1/ns
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: CSI_ENDPOINT
+              value: unix:///csi/csi.sock
+            - name: RUST_LOG
+              value: info
+            # Read at shutdown on hosts without systemd. Kept last: overlays patch the entries above by index.
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+          # No memory limit: the page cache of mkfs and lvm writes by the
+          # host tools is charged to this cgroup, and an OOM kill mid mkfs
+          # leaves a half-made file system (seen at 96Mi).
+          resources:
+            requests: {cpu: 20m, memory: 24Mi}
+          volumeMounts:
+            - {name: plugin-dir, mountPath: /csi}
+            - {name: kubelet-dir, mountPath: /var/lib/kubelet, mountPropagation: HostToContainer}
+            - {name: dev, mountPath: /dev, mountPropagation: HostToContainer}
+            - {name: res-dir, mountPath: /var/lib/r-drbd}
+            - {name: drbd-d, mountPath: /etc/drbd.d}
+            # drbd-utils state and locks, shared with any host drbd-utils.
+            - {name: drbd-lib, mountPath: /var/lib/drbd}
+            - {name: drbd-run, mountPath: /var/run/drbd}
+        - name: csi-node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/r-drbd.io/csi.sock
+            - --v=2
+          volumeMounts:
+            - {name: plugin-dir, mountPath: /csi}
+            - {name: registration-dir, mountPath: /registration}
+      volumes:
+        - name: plugin-dir
+          hostPath: {path: /var/lib/kubelet/plugins/r-drbd.io, type: DirectoryOrCreate}
+        - name: registration-dir
+          hostPath: {path: /var/lib/kubelet/plugins_registry, type: Directory}
+        - name: kubelet-dir
+          hostPath: {path: /var/lib/kubelet, type: Directory}
+        - name: dev
+          hostPath: {path: /dev, type: Directory}
+        - name: res-dir
+          hostPath: {path: /var/lib/r-drbd, type: DirectoryOrCreate}
+        - name: drbd-d
+          hostPath: {path: /etc/drbd.d, type: DirectoryOrCreate}
+        - name: drbd-lib
+          hostPath: {path: /var/lib/drbd, type: DirectoryOrCreate}
+        - name: drbd-run
+          hostPath: {path: /run/drbd, type: DirectoryOrCreate}

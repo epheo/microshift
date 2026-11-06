@@ -2,7 +2,7 @@
 #
 # Clones openshift/microshift at the pinned ref, applies this distribution's
 # patch series, swaps the pinned OCP payload images for the (fully public)
-# OKD SCOS payload, merges the TopoLVM add-on subpackage into the spec, and
+# OKD SCOS payload, drops the subpackages it cannot build, and
 # builds the SRPM. Adapted from microshift-io/microshift packaging/srpm.Containerfile.
 #
 # x86_64 only: the aarch64 release JSONs keep their upstream (OCP) references —
@@ -55,17 +55,11 @@ COPY --chmod=755 ./src/image/prebuild.sh /tmp/prebuild.sh
 RUN ARCH="x86_64" /tmp/prebuild.sh --replace        "${OKD_RELEASE_IMAGE}" "${OKD_VERSION_TAG}" && \
     ARCH="x86_64" /tmp/prebuild.sh --replace-multus "${OKD_RELEASE_IMAGE}" "${OKD_VERSION_TAG}"
 
-# Merge the TopoLVM subpackage (community LVMS replacement — the LVMS operator
-# is not part of the OKD payload) and drop subpackages not buildable upstream.
-ARG SPEC_TOPOLVM=/tmp/topolvm.spec
-COPY ./src/topolvm/topolvm.spec "${SPEC_TOPOLVM}"
-COPY ./src/topolvm/assets/  ./assets/optional/topolvm/
-COPY ./src/topolvm/greenboot/ ./packaging/greenboot/
-COPY ./src/topolvm/release/ ./assets/optional/topolvm/
-
+# Drop subpackages not buildable from the OKD payload. Storage (r-drbd) is
+# not an RPM: the bootc stage installs it.
 COPY --chmod=755 ./src/image/modify-spec.py /tmp/modify-spec.py
 RUN sed -i -e 's,CHECK_RPMS="y",,g' -e 's,CHECK_SRPMS="y",,g' ./packaging/rpm/make-rpm.sh && \
-    /tmp/modify-spec.py ./packaging/rpm/microshift.spec "${SPEC_TOPOLVM}"
+    /tmp/modify-spec.py ./packaging/rpm/microshift.spec
 
 COPY --chmod=755 ./src/image/build-rpms.sh /tmp/build-rpms.sh
 RUN USHIFT_GITREF="${USHIFT_GITREF}" OKD_VERSION_TAG="${OKD_VERSION_TAG}" \
