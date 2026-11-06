@@ -166,7 +166,8 @@ role instead (`patches/0006`, `0007`): `microshift run --worker` starts
 only the node services, the kubelet bootstraps its client cert from the
 bootstrap kubeconfig and obtains its serving cert through a CSR approved
 by a small controller on the control plane, and `add-node --worker`
-copies only public CA certs, so a worker never holds signing material.
+takes only the kubelet client CA bundle the control plane publishes, so a
+worker never holds signing material.
 `patches/0008` replaces the multinode OVN manifests with its own to match
 the shipped binary: every node runs its own interconnect zone (local OVN
 databases, northd, ovn-controller, zone controller), the control plane keeps only
@@ -178,18 +179,21 @@ embedded payload, so joins are air-gapped too. One image serves both
 roles:
 
 ```sh
-# on the controller (default profile): nothing to do; copy the bootstrap
-# kubeconfig from /var/lib/microshift/resources/kubeadmin/<node-addr>/kubeconfig
+# on the controller (default profile): a join kubeconfig, valid 1h
+# (--duration); --address is a name its apiserver certificate covers
+microshift worker-join-kubeconfig --address <controller-addr> > join.kubeconfig
 
 # on each worker
 microshift-profile worker
-microshift add-node --worker --kubeconfig /path/to/bootstrap-kubeconfig
+microshift add-node --worker --kubeconfig /path/to/join.kubeconfig
 ```
 
-`add-node` removes its copy of the join credential when it exits, whether the
-join succeeded or not (a failed join is simply re-run). Delete the file you
-passed with `--kubeconfig` yourself: it is the controller's cluster-admin
-kubeconfig. After the join the kubelet holds only its own rotating cert, and
+The join kubeconfig holds a token for `kube-system/microshift-worker-join`:
+it can request node client certificates and read the kubelet client CA
+bundle, nothing else. Until it expires it can request a certificate for any
+node name, so delete it after the join. `add-node` removes its own copy when
+it exits, whether the join succeeded or not (a failed join is simply
+re-run). After the join the kubelet holds only its own rotating cert, and
 workers keep their kubelet client CA current
 from the CA the control plane publishes, so control-plane CA rotation does not
 require a re-join. The greenboot gate stays enabled on workers: `microshift
@@ -205,9 +209,7 @@ The firewall follows the profile (workers expose only kubelet and Geneve).
 Note that upgrading a pre-existing install to this revision enables firewalld
 if it was inactive: a site relying on previously open ports must add explicit
 firewalld rules. Multinode remains upstream-unsupported and single-controller:
-losing the controller means losing the cluster, and the join credential is
-still the cluster-admin kubeconfig for its short lifetime (a scoped bootstrap
-token is the planned follow-up). Cluster-to-cluster (C2CC) routes reach pods
+losing the controller means losing the cluster. Cluster-to-cluster (C2CC) routes reach pods
 on the controller only: each worker is its own OVN zone, and the route manager
 programs the controller's.
 

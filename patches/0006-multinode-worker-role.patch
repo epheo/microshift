@@ -7,7 +7,14 @@ A worker role for multinode: `microshift run --worker` starts kubelet and
 networking only, and `microshift add-node --worker` joins it.
 
 - Workers hold no signing material: no initCerts, no CA keys, no SA keys,
-  no etcd member. They fetch public CA certs only.
+  no etcd member. They take only the kubelet client CA bundle the control
+  plane publishes in kube-system/kubelet-client-ca.
+- They join without cluster-admin: `microshift worker-join-kubeconfig`, on
+  the control plane, prints a kubeconfig with a short-lived token for
+  kube-system/microshift-worker-join, which may create node CSRs (and have
+  client ones auto-approved), get nodes and read that bundle, nothing
+  else. The control plane applies that RBAC; the controller's kubeadmin
+  kubeconfig still works as --kubeconfig.
 - The kubelet bootstraps its client cert and gets its serving cert through
   serverTLSBootstrap; a kubelet-csr-approver controller on the control
   plane approves serving CSRs whose SANs match the node, and client
@@ -33,29 +40,88 @@ Carried by decision, not proposed upstream.
 Covered by: unit tests (CSR approver, kubelet config), multinode-smoke
 and multinode-test (join, certs, restart without bootstrap kubeconfig).
 ---
- assets/core/kubelet.yaml                     |  10 +-
- pkg/cmd/addnode.go                           |   6 +-
- pkg/cmd/addnode_worker.go                    | 249 +++++++++++++++++++
- pkg/cmd/run.go                               |  34 ++-
- pkg/cmd/run_worker.go                        | 133 ++++++++++
- pkg/cmd/worker_skew.go                       | 112 +++++++++
- pkg/cmd/worker_skew_test.go                  |  37 +++
- pkg/config/multinode.go                      |  40 ++-
- pkg/controllers/kubelet_client_ca_refresh.go | 105 ++++++++
- pkg/controllers/kubelet_csr_approver.go      | 192 ++++++++++++++
- pkg/controllers/kubelet_csr_approver_test.go | 171 +++++++++++++
- pkg/node/kubelet.go                          |  37 ++-
- pkg/node/kubelet_test.go                     |  15 ++
- pkg/node/netconfig.go                        |  14 +-
- 14 files changed, 1134 insertions(+), 21 deletions(-)
+ .../core/kubelet-client-ca-reader-role.yaml   |  12 +
+ .../kubelet-client-ca-reader-rolebinding.yaml |  16 ++
+ assets/core/kubelet.yaml                      |  10 +-
+ assets/core/worker-join-clusterrole.yaml      |  10 +
+ ...-clusterrolebinding-node-bootstrapper.yaml |  13 +
+ ...er-join-clusterrolebinding-nodeclient.yaml |  14 ++
+ .../core/worker-join-clusterrolebinding.yaml  |  12 +
+ assets/core/worker-join-serviceaccount.yaml   |   8 +
+ cmd/microshift/main.go                        |   1 +
+ pkg/cmd/addnode.go                            |   6 +-
+ pkg/cmd/addnode_worker.go                     | 175 ++++++++++++++
+ pkg/cmd/addnode_worker_test.go                |  50 ++++
+ pkg/cmd/run.go                                |  34 ++-
+ pkg/cmd/run_worker.go                         | 133 ++++++++++
+ pkg/cmd/worker_join_kubeconfig.go             | 114 +++++++++
+ pkg/cmd/worker_skew.go                        | 112 +++++++++
+ pkg/cmd/worker_skew_test.go                   |  37 +++
+ pkg/config/multinode.go                       |  40 ++-
+ pkg/controllers/kubelet_client_ca_refresh.go  | 105 ++++++++
+ pkg/controllers/kubelet_csr_approver.go       | 227 ++++++++++++++++++
+ pkg/controllers/kubelet_csr_approver_test.go  | 171 +++++++++++++
+ pkg/node/kubelet.go                           |  37 ++-
+ pkg/node/kubelet_test.go                      |  15 ++
+ pkg/node/netconfig.go                         |  14 +-
+ 24 files changed, 1345 insertions(+), 21 deletions(-)
+ create mode 100644 assets/core/kubelet-client-ca-reader-role.yaml
+ create mode 100644 assets/core/kubelet-client-ca-reader-rolebinding.yaml
+ create mode 100644 assets/core/worker-join-clusterrole.yaml
+ create mode 100644 assets/core/worker-join-clusterrolebinding-node-bootstrapper.yaml
+ create mode 100644 assets/core/worker-join-clusterrolebinding-nodeclient.yaml
+ create mode 100644 assets/core/worker-join-clusterrolebinding.yaml
+ create mode 100644 assets/core/worker-join-serviceaccount.yaml
  create mode 100644 pkg/cmd/addnode_worker.go
+ create mode 100644 pkg/cmd/addnode_worker_test.go
  create mode 100644 pkg/cmd/run_worker.go
+ create mode 100644 pkg/cmd/worker_join_kubeconfig.go
  create mode 100644 pkg/cmd/worker_skew.go
  create mode 100644 pkg/cmd/worker_skew_test.go
  create mode 100644 pkg/controllers/kubelet_client_ca_refresh.go
  create mode 100644 pkg/controllers/kubelet_csr_approver.go
  create mode 100644 pkg/controllers/kubelet_csr_approver_test.go
 
+diff --git a/assets/core/kubelet-client-ca-reader-role.yaml b/assets/core/kubelet-client-ca-reader-role.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..492da0c3905f766c926b563f9b75e229080b73ce
+--- /dev/null
++++ b/assets/core/kubelet-client-ca-reader-role.yaml
+@@ -0,0 +1,12 @@
++# Workers hold no signing keys: they take the kubelet client CA bundle from
++# the configmap KubeletCAManager publishes, at join and after CA rotation.
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: microshift-kubelet-client-ca-reader
++  namespace: kube-system
++rules:
++- apiGroups: [""]
++  resources: ["configmaps"]
++  resourceNames: ["kubelet-client-ca"]
++  verbs: ["get", "list", "watch"]
+diff --git a/assets/core/kubelet-client-ca-reader-rolebinding.yaml b/assets/core/kubelet-client-ca-reader-rolebinding.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f1b56dfbe207960d9f93c9ef9e5f5adc63e80a4
+--- /dev/null
++++ b/assets/core/kubelet-client-ca-reader-rolebinding.yaml
+@@ -0,0 +1,16 @@
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: microshift-kubelet-client-ca-reader
++  namespace: kube-system
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: Role
++  name: microshift-kubelet-client-ca-reader
++subjects:
++- kind: Group
++  name: system:nodes
++  apiGroup: rbac.authorization.k8s.io
++- kind: ServiceAccount
++  name: microshift-worker-join
++  namespace: kube-system
 diff --git a/assets/core/kubelet.yaml b/assets/core/kubelet.yaml
 index 988f071e0b7b2afa6f89679f847bd47617025a02..5ef9a18e91b46d30fedf701c2ab042859c4fe9a6 100644
 --- a/assets/core/kubelet.yaml
@@ -88,6 +154,105 @@ index 988f071e0b7b2afa6f89679f847bd47617025a02..5ef9a18e91b46d30fedf701c2ab04285
  volumePluginDir: "{{ .volumePluginDir }}"
  {{- if .resolvConf }}
  resolvConf: "{{ .resolvConf }}"
+diff --git a/assets/core/worker-join-clusterrole.yaml b/assets/core/worker-join-clusterrole.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..39f2e2c1b6622f9063567d586949ee2d3e1eda6d
+--- /dev/null
++++ b/assets/core/worker-join-clusterrole.yaml
+@@ -0,0 +1,10 @@
++# add-node checks whether the node already joined and waits for it to be
++# Ready.
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRole
++metadata:
++  name: microshift-worker-join
++rules:
++- apiGroups: [""]
++  resources: ["nodes"]
++  verbs: ["get"]
+diff --git a/assets/core/worker-join-clusterrolebinding-node-bootstrapper.yaml b/assets/core/worker-join-clusterrolebinding-node-bootstrapper.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..84d5c2536c7baffa8376de262af026bc4df4c821
+--- /dev/null
++++ b/assets/core/worker-join-clusterrolebinding-node-bootstrapper.yaml
+@@ -0,0 +1,13 @@
++# The kubelet creates its first client CSR with the join token.
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRoleBinding
++metadata:
++  name: microshift-worker-join-node-bootstrapper
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: ClusterRole
++  name: system:node-bootstrapper
++subjects:
++- kind: ServiceAccount
++  name: microshift-worker-join
++  namespace: kube-system
+diff --git a/assets/core/worker-join-clusterrolebinding-nodeclient.yaml b/assets/core/worker-join-clusterrolebinding-nodeclient.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..f14eb12a146f7fe8bdc5f5022cefeafefc4fad21
+--- /dev/null
++++ b/assets/core/worker-join-clusterrolebinding-nodeclient.yaml
+@@ -0,0 +1,14 @@
++# kube-controller-manager auto-approves a node client CSR only when its
++# requester may create certificatesigningrequests/nodeclient.
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRoleBinding
++metadata:
++  name: microshift-worker-join-nodeclient
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: ClusterRole
++  name: system:certificates.k8s.io:certificatesigningrequests:nodeclient
++subjects:
++- kind: ServiceAccount
++  name: microshift-worker-join
++  namespace: kube-system
+diff --git a/assets/core/worker-join-clusterrolebinding.yaml b/assets/core/worker-join-clusterrolebinding.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..65d8af6fd182c72e41e914178735b784a9d1481a
+--- /dev/null
++++ b/assets/core/worker-join-clusterrolebinding.yaml
+@@ -0,0 +1,12 @@
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRoleBinding
++metadata:
++  name: microshift-worker-join
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: ClusterRole
++  name: microshift-worker-join
++subjects:
++- kind: ServiceAccount
++  name: microshift-worker-join
++  namespace: kube-system
+diff --git a/assets/core/worker-join-serviceaccount.yaml b/assets/core/worker-join-serviceaccount.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..60d11ae67cd15ea9c2feb9b3cfa8e86ba7d5d860
+--- /dev/null
++++ b/assets/core/worker-join-serviceaccount.yaml
+@@ -0,0 +1,8 @@
++# The identity behind `microshift worker-join-kubeconfig` tokens. A token
++# can request any node's client certificate until it expires, as a kubeadm
++# bootstrap token can; it holds nothing else.
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: microshift-worker-join
++  namespace: kube-system
+diff --git a/cmd/microshift/main.go b/cmd/microshift/main.go
+index a35978c32b9f4a9442e0b6747e34020db239fffe..1190685adb551f70f48c050744090b7e1e1b7077 100644
+--- a/cmd/microshift/main.go
++++ b/cmd/microshift/main.go
+@@ -42,6 +42,7 @@ func newCommand() *cobra.Command {
+ 	cmd.AddCommand(cmds.NewRestoreCommand())
+ 	cmd.AddCommand(cmds.NewHealthcheckCommand())
+ 	cmd.AddCommand(cmds.NewAddNodeCommand())
++	cmd.AddCommand(cmds.NewWorkerJoinKubeconfigCommand())
+ 	cmd.AddCommand(cmds.NewC2CCProbeCommand())
+ 	return cmd
+ }
 diff --git a/pkg/cmd/addnode.go b/pkg/cmd/addnode.go
 index 864876e8920d4e3840cab5e9e945da62fe1adf65..a209751af59ba6707bb2da341a2607b224f22ade 100644
 --- a/pkg/cmd/addnode.go
@@ -121,10 +286,10 @@ index 864876e8920d4e3840cab5e9e945da62fe1adf65..a209751af59ba6707bb2da341a2607b2
  		cmd.Hidden = true
 diff --git a/pkg/cmd/addnode_worker.go b/pkg/cmd/addnode_worker.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..e0d7c17c9d8c87bd68e76058131b225c7a7e5dac
+index 0000000000000000000000000000000000000000..8ea05a0d6160a5c346504677792f025711a81212
 --- /dev/null
 +++ b/pkg/cmd/addnode_worker.go
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,175 @@
 +package cmd
 +
 +import (
@@ -135,13 +300,10 @@ index 0000000000000000000000000000000000000000..e0d7c17c9d8c87bd68e76058131b225c
 +	"os"
 +	"path/filepath"
 +
-+	"github.com/openshift/microshift/pkg/components"
 +	"github.com/openshift/microshift/pkg/config"
 +	"github.com/openshift/microshift/pkg/util"
 +	"github.com/openshift/microshift/pkg/util/cryptomaterial"
 +
-+	rbacv1 "k8s.io/api/rbac/v1"
-+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 +	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 +	"k8s.io/client-go/kubernetes"
 +	"k8s.io/client-go/tools/clientcmd"
@@ -197,30 +359,22 @@ index 0000000000000000000000000000000000000000..e0d7c17c9d8c87bd68e76058131b225c
 +		return fmt.Errorf("failed to cleanup MicroShift data directories: %w", err)
 +	}
 +
-+	// Public CA certs only: no keys, no service-account signing material.
-+	for _, resource := range components.CertificateAuthorityResources {
-+		if err := fetchCertificateAuthorityCert(ctx, client, resource.Name, resource.Dir); err != nil {
-+			return fmt.Errorf("failed to fetch certificate authority %s: %w", resource.Name, err)
-+		}
++	// The kubelet's client CA bundle is the only CA material a worker needs:
++	// the apiserver's CA comes with the join kubeconfig, and the kubelet
++	// gets its own certificates through CSRs.
++	caPath := cryptomaterial.KubeletClientCAPath(cryptomaterial.CertsDirectory(config.DataDir))
++	if err := fetchKubeletClientCA(ctx, client, caPath); err != nil {
++		return fmt.Errorf("failed to fetch the kubelet client CA bundle: %w", err)
 +	}
-+	if err := writeKubeletClientCABundle(); err != nil {
-+		return fmt.Errorf("failed to assemble kubelet client CA bundle: %w", err)
-+	}
-+	// Workers refresh that bundle themselves after control plane CA rotation
-+	// (KubeletClientCARefresh); they hold no admin credentials, so the node
-+	// group gets read on just the published CA configmap.
-+	if err := ensureKubeletCAReaderRBAC(ctx, client); err != nil {
-+		return fmt.Errorf("failed to ensure kubelet CA reader RBAC: %w", err)
-+	}
-+	klog.Info("Certificate authorities fetched")
++	klog.Info("Kubelet client CA bundle fetched")
 +
 +	if err := configureBootstrapKubeconfig(cfg, opts.KubeconfigPath); err != nil {
 +		return fmt.Errorf("failed to configure bootstrap kubeconfig: %w", err)
 +	}
-+	// The bootstrap kubeconfig is a copy of the passed-in cluster-admin
-+	// credential: remove it however the join ends. On success the kubelet
-+	// holds its own rotating client cert; a failed join is re-run with
-+	// add-node, which copies it again.
++	// The bootstrap kubeconfig is a copy of the passed-in credential (a join
++	// token, or cluster-admin): remove it however the join ends. On success
++	// the kubelet holds its own rotating client cert; a failed join is
++	// re-run with add-node, which copies it again.
 +	defer func() {
 +		if err := os.Remove(cfg.BootstrapKubeConfigPath()); err != nil && !os.IsNotExist(err) {
 +			klog.Warningf("failed to remove the bootstrap kubeconfig: %v", err)
@@ -251,7 +405,7 @@ index 0000000000000000000000000000000000000000..e0d7c17c9d8c87bd68e76058131b225c
 +	klog.Info("Node successfully joined the cluster")
 +	// add-node does not delete a file it was handed, but this one should not
 +	// outlive the join.
-+	klog.Warningf("%s is the controller's cluster-admin kubeconfig and is no longer needed: delete it", opts.KubeconfigPath)
++	klog.Warningf("%s is no longer needed: delete it", opts.KubeconfigPath)
 +	return nil
 +}
 +
@@ -295,84 +449,77 @@ index 0000000000000000000000000000000000000000..e0d7c17c9d8c87bd68e76058131b225c
 +	return addrs[0], nil
 +}
 +
-+// fetchCertificateAuthorityCert writes a CA's public certificate (and bundle,
-+// when present) for a worker; upstream's fetchCertificateAuthority also
-+// writes the private key.
-+func fetchCertificateAuthorityCert(ctx context.Context, client kubernetes.Interface, name, dir string) error {
-+	secret, err := client.CoreV1().Secrets("kube-system").Get(ctx, name, metav1.GetOptions{})
++// fetchKubeletClientCA writes the bundle KubeletCAManager publishes on the
++// control plane; KubeletClientCARefresh keeps it current afterwards.
++func fetchKubeletClientCA(ctx context.Context, client kubernetes.Interface, path string) error {
++	cm, err := client.CoreV1().ConfigMaps("kube-system").Get(ctx, "kubelet-client-ca", metav1.GetOptions{})
 +	if err != nil {
-+		return fmt.Errorf("failed to get %s secret: %w", name, err)
-+	}
-+	caCert, exists := secret.Data["ca.crt"]
-+	if !exists {
-+		return fmt.Errorf("ca.crt not found in secret")
-+	}
-+	if err := os.MkdirAll(dir, 0750); err != nil {
-+		return fmt.Errorf("failed to create destination directory: %w", err)
-+	}
-+	if err := os.WriteFile(cryptomaterial.CACertPath(dir), caCert, 0600); err != nil {
-+		return fmt.Errorf("failed to write ca.crt: %w", err)
-+	}
-+	if caBundle, ok := secret.Data["ca-bundle.crt"]; ok {
-+		if err := os.WriteFile(cryptomaterial.CABundlePath(dir), caBundle, 0600); err != nil {
-+			return fmt.Errorf("failed to write ca-bundle.crt: %w", err)
-+		}
-+	}
-+	return nil
-+}
-+
-+func ensureKubeletCAReaderRBAC(ctx context.Context, client kubernetes.Interface) error {
-+	const name = "microshift-kubelet-client-ca-reader"
-+	role := &rbacv1.Role{
-+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "kube-system"},
-+		Rules: []rbacv1.PolicyRule{{
-+			APIGroups:     []string{""},
-+			Resources:     []string{"configmaps"},
-+			ResourceNames: []string{"kubelet-client-ca"},
-+			Verbs:         []string{"get", "list", "watch"},
-+		}},
-+	}
-+	if _, err := client.RbacV1().Roles("kube-system").Create(ctx, role, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
 +		return err
 +	}
-+	binding := &rbacv1.RoleBinding{
-+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "kube-system"},
-+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: name},
-+		Subjects:   []rbacv1.Subject{{Kind: "Group", Name: "system:nodes", APIGroup: rbacv1.GroupName}},
++	bundle := cm.Data["ca.crt"]
++	if bundle == "" {
++		return fmt.Errorf("kube-system/kubelet-client-ca has no ca.crt yet")
 +	}
-+	if _, err := client.RbacV1().RoleBindings("kube-system").Create(ctx, binding, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-+		return err
-+	}
-+	return nil
-+}
-+
-+// writeKubeletClientCABundle assembles the bundle the kubelet uses to verify
-+// client certs, from the public CA certs fetched above.
-+func writeKubeletClientCABundle() error {
-+	certsDir := cryptomaterial.CertsDirectory(config.DataDir)
-+	members := []string{
-+		cryptomaterial.KubeControlPlaneSignerCertDir(certsDir),
-+		cryptomaterial.KubeAPIServerToKubeletSignerCertDir(certsDir),
-+		cryptomaterial.AdminKubeconfigSignerDir(certsDir),
-+		cryptomaterial.KubeletCSRSignerSignerCertDir(certsDir),
-+		cryptomaterial.CSRSignerCertDir(certsDir),
-+	}
-+	bundle := []byte{}
-+	for _, dir := range members {
-+		pemBytes, err := os.ReadFile(cryptomaterial.CACertPath(dir))
-+		if err != nil {
-+			return err
-+		}
-+		bundle = append(bundle, pemBytes...)
-+		if len(pemBytes) > 0 && pemBytes[len(pemBytes)-1] != '\n' {
-+			bundle = append(bundle, '\n')
-+		}
-+	}
-+	path := cryptomaterial.KubeletClientCAPath(certsDir)
 +	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
 +		return err
 +	}
-+	return os.WriteFile(path, bundle, 0600)
++	return os.WriteFile(path, []byte(bundle), 0600)
++}
+diff --git a/pkg/cmd/addnode_worker_test.go b/pkg/cmd/addnode_worker_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..725849da12f0d29a7573b402e55489426e6119f6
+--- /dev/null
++++ b/pkg/cmd/addnode_worker_test.go
+@@ -0,0 +1,50 @@
++package cmd
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"testing"
++
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/client-go/kubernetes/fake"
++)
++
++func TestFetchKubeletClientCA(t *testing.T) {
++	cm := func(data string) runtime.Object {
++		return &corev1.ConfigMap{
++			ObjectMeta: metav1.ObjectMeta{Name: "kubelet-client-ca", Namespace: "kube-system"},
++			Data:       map[string]string{"ca.crt": data},
++		}
++	}
++	tests := []struct {
++		name    string
++		objects []runtime.Object
++		wantErr bool
++	}{
++		{name: "not published", wantErr: true},
++		{name: "published empty", objects: []runtime.Object{cm("")}, wantErr: true},
++		{name: "published", objects: []runtime.Object{cm("-----BEGIN CERTIFICATE-----\n")}},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "kubelet", "ca.crt")
++			err := fetchKubeletClientCA(context.Background(), fake.NewSimpleClientset(tt.objects...), path)
++			if (err != nil) != tt.wantErr {
++				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
++			}
++			got, readErr := os.ReadFile(path)
++			if tt.wantErr {
++				if readErr == nil {
++					t.Fatalf("wrote %q on error", got)
++				}
++				return
++			}
++			if string(got) != "-----BEGIN CERTIFICATE-----\n" {
++				t.Fatalf("wrote %q", got)
++			}
++		})
++	}
 +}
 diff --git a/pkg/cmd/run.go b/pkg/cmd/run.go
 index e21fba4c5b5da3035dfa7cacb34680f0bbbf8690..bd4f177cfb2add7b8560136e83f148565a3cc3e7 100644
@@ -594,6 +741,126 @@ index 0000000000000000000000000000000000000000..dac9ba0c797eb92f9d2f2f0369506cd6
 +	}
 +	klog.InfoS("MICROSHIFT STOPPED", "since-stop", time.Since(microshiftStop))
 +	return serviceErr
++}
+diff --git a/pkg/cmd/worker_join_kubeconfig.go b/pkg/cmd/worker_join_kubeconfig.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..1688bee621ca3e5943e09c3625526c35506bd06d
+--- /dev/null
++++ b/pkg/cmd/worker_join_kubeconfig.go
+@@ -0,0 +1,114 @@
++package cmd
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"os"
++	"time"
++
++	"github.com/openshift/microshift/pkg/config"
++	"github.com/openshift/microshift/pkg/version"
++	"github.com/spf13/cobra"
++
++	authenticationv1 "k8s.io/api/authentication/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/client-go/kubernetes"
++	"k8s.io/client-go/tools/clientcmd"
++	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
++)
++
++const workerJoinServiceAccount = "microshift-worker-join"
++
++// NewWorkerJoinKubeconfigCommand prints, on the control plane, the kubeconfig
++// `add-node --worker` takes: the apiserver's external address and CA, and a
++// short-lived token for the microshift-worker-join service account, in place
++// of the cluster-admin kubeconfig.
++func NewWorkerJoinKubeconfigCommand() *cobra.Command {
++	var address string
++	duration := time.Hour
++
++	cmd := &cobra.Command{
++		Use:   "worker-join-kubeconfig",
++		Short: "Print a short-lived kubeconfig for 'add-node --worker' (run on the control plane)",
++		RunE: func(cmd *cobra.Command, args []string) error {
++			return printWorkerJoinKubeconfig(cmd.Context(), cmd.OutOrStdout(), address, duration)
++		},
++	}
++	cmd.Flags().StringVar(&address, "address", "",
++		"Control plane address the worker reaches; one of its kubeconfigs under resources/kubeadmin (default: the node IP)")
++	cmd.Flags().DurationVar(&duration, "duration", duration,
++		"Token lifetime, 10m or more")
++
++	if version.Get().BuildVariant != version.BuildVariantCommunity {
++		cmd.Hidden = true
++	}
++	return cmd
++}
++
++func printWorkerJoinKubeconfig(ctx context.Context, out io.Writer, address string, duration time.Duration) error {
++	// The apiserver refuses shorter service account tokens.
++	if duration < 10*time.Minute {
++		return fmt.Errorf("--duration must be at least 10m")
++	}
++	if config.IsWorkerNode() {
++		return fmt.Errorf("run this on the control plane, not on a worker")
++	}
++	cfg, err := config.ActiveConfig()
++	if err != nil {
++		return fmt.Errorf("failed to load MicroShift configuration: %w", err)
++	}
++	if address == "" {
++		address = cfg.Node.NodeIP
++	}
++
++	// MicroShift writes one kubeconfig per name its serving certificate
++	// covers: reusing its cluster entry keeps the server and CA right.
++	external, err := clientcmd.LoadFromFile(cfg.KubeConfigAdminPath(address))
++	if err != nil {
++		return fmt.Errorf("no kubeconfig for address %q (its apiserver certificate may not cover it): %w", address, err)
++	}
++	kctx, ok := external.Contexts[external.CurrentContext]
++	if !ok {
++		return fmt.Errorf("%s has no current context", cfg.KubeConfigAdminPath(address))
++	}
++	cluster, ok := external.Clusters[kctx.Cluster]
++	if !ok {
++		return fmt.Errorf("%s: context %q names no cluster", cfg.KubeConfigAdminPath(address), external.CurrentContext)
++	}
++
++	restConfig, err := clientcmd.BuildConfigFromFlags("", cfg.KubeConfigPath(config.KubeAdmin))
++	if err != nil {
++		return err
++	}
++	client, err := kubernetes.NewForConfig(restConfig)
++	if err != nil {
++		return err
++	}
++	seconds := int64(duration.Seconds())
++	tr, err := client.CoreV1().ServiceAccounts("kube-system").CreateToken(ctx, workerJoinServiceAccount,
++		&authenticationv1.TokenRequest{Spec: authenticationv1.TokenRequestSpec{ExpirationSeconds: &seconds}},
++		metav1.CreateOptions{})
++	if err != nil {
++		return fmt.Errorf("failed to create a token for kube-system/%s: %w", workerJoinServiceAccount, err)
++	}
++
++	kubeconfig := clientcmdapi.NewConfig()
++	kubeconfig.Clusters["microshift"] = cluster
++	kubeconfig.AuthInfos[workerJoinServiceAccount] = &clientcmdapi.AuthInfo{Token: tr.Status.Token}
++	kubeconfig.Contexts["microshift-worker-join"] = &clientcmdapi.Context{
++		Cluster:  "microshift",
++		AuthInfo: workerJoinServiceAccount,
++	}
++	kubeconfig.CurrentContext = "microshift-worker-join"
++	data, err := clientcmd.Write(*kubeconfig)
++	if err != nil {
++		return err
++	}
++	if _, err := out.Write(data); err != nil {
++		return err
++	}
++	fmt.Fprintf(os.Stderr, "Join kubeconfig for %s, valid until %s\n",
++		cluster.Server, tr.Status.ExpirationTimestamp.Format(time.RFC3339))
++	return nil
 +}
 diff --git a/pkg/cmd/worker_skew.go b/pkg/cmd/worker_skew.go
 new file mode 100644
@@ -927,10 +1194,10 @@ index 0000000000000000000000000000000000000000..67365d32236f45904aa75ea1353bb202
 +}
 diff --git a/pkg/controllers/kubelet_csr_approver.go b/pkg/controllers/kubelet_csr_approver.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..4c0f12e325c5930d8b49b15e309ff3f1feb8553b
+index 0000000000000000000000000000000000000000..fafa39d42ccfeab95a668c57aaf72dbc7c9b6895
 --- /dev/null
 +++ b/pkg/controllers/kubelet_csr_approver.go
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,227 @@
 +/*
 +Copyright © 2026 MicroShift Contributors
 +
@@ -965,6 +1232,7 @@ index 0000000000000000000000000000000000000000..4c0f12e325c5930d8b49b15e309ff3f1
 +	"k8s.io/klog/v2"
 +	k8scert "k8s.io/kubernetes/pkg/apis/certificates"
 +
++	"github.com/openshift/microshift/pkg/assets"
 +	"github.com/openshift/microshift/pkg/config"
 +)
 +
@@ -974,6 +1242,9 @@ index 0000000000000000000000000000000000000000..4c0f12e325c5930d8b49b15e309ff3f1
 +// serving certificate (serverTLSBootstrap) and client certificate renewals.
 +// The initial client CSR is created with the bootstrap kubeconfig identity
 +// and auto-approved by kube-controller-manager.
++//
++// It also applies the RBAC worker joins rely on: the join token's identity
++// and read access to the kubelet client CA configmap.
 +type KubeletCSRApprover struct {
 +	kubeconfigPath string
 +}
@@ -995,6 +1266,9 @@ index 0000000000000000000000000000000000000000..4c0f12e325c5930d8b49b15e309ff3f1
 +	client, err := kubernetes.NewForConfig(restConfig)
 +	if err != nil {
 +		return err
++	}
++	if err := applyWorkerJoinRBAC(ctx, a.kubeconfigPath); err != nil {
++		return fmt.Errorf("kubelet-csr-approver: worker join RBAC: %w", err)
 +	}
 +	close(ready)
 +
@@ -1122,6 +1396,34 @@ index 0000000000000000000000000000000000000000..4c0f12e325c5930d8b49b15e309ff3f1
 +		}
 +	}
 +	return true, ""
++}
++
++func applyWorkerJoinRBAC(ctx context.Context, kubeconfigPath string) error {
++	if err := assets.ApplyServiceAccounts(ctx, []string{
++		"core/worker-join-serviceaccount.yaml",
++	}, kubeconfigPath); err != nil {
++		return err
++	}
++	if err := assets.ApplyClusterRoles(ctx, []string{
++		"core/worker-join-clusterrole.yaml",
++	}, kubeconfigPath); err != nil {
++		return err
++	}
++	if err := assets.ApplyClusterRoleBindings(ctx, []string{
++		"core/worker-join-clusterrolebinding.yaml",
++		"core/worker-join-clusterrolebinding-node-bootstrapper.yaml",
++		"core/worker-join-clusterrolebinding-nodeclient.yaml",
++	}, kubeconfigPath); err != nil {
++		return err
++	}
++	if err := assets.ApplyRoles(ctx, []string{
++		"core/kubelet-client-ca-reader-role.yaml",
++	}, kubeconfigPath); err != nil {
++		return err
++	}
++	return assets.ApplyRoleBindings(ctx, []string{
++		"core/kubelet-client-ca-reader-rolebinding.yaml",
++	}, kubeconfigPath)
 +}
 diff --git a/pkg/controllers/kubelet_csr_approver_test.go b/pkg/controllers/kubelet_csr_approver_test.go
 new file mode 100644
