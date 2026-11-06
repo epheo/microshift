@@ -31,7 +31,7 @@ index 988f071e..5ef9a18e 100644
  {{- if .resolvConf }}
  resolvConf: "{{ .resolvConf }}"
 diff --git a/pkg/cmd/addnode.go b/pkg/cmd/addnode.go
-index 864876e8..7e16d79a 100644
+index 864876e8..b4a8571d 100644
 --- a/pkg/cmd/addnode.go
 +++ b/pkg/cmd/addnode.go
 @@ -26,6 +26,8 @@ import (
@@ -78,7 +78,7 @@ index 864876e8..7e16d79a 100644
  		klog.Info("Will add etcd node as learner")
  	}
  
-@@ -100,8 +113,16 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
+@@ -100,8 +113,21 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
  
  	nodeName := cfg.CanonicalNodeName()
  	if isNodeAlreadyInCluster(ctx, client, nodeName) {
@@ -86,10 +86,15 @@ index 864876e8..7e16d79a 100644
 -		return nil
 +		// For a worker the join is the only thing that writes local state (CA
 +		// certs, kubelet CA bundle, bootstrap kubeconfig, marker). If that
-+		// state is gone (node re-provisioned) re-run the join to restore it,
-+		// even though the Node object still exists. A fully provisioned worker
-+		// still carries the marker, so it short-circuits as before.
-+		if !opts.Worker || config.IsWorkerNode() {
++		// state is gone (node re-provisioned, or a failed join that already
++		// removed its bootstrap kubeconfig) re-run the join to restore it,
++		// even though the Node object still exists. Only a worker whose
++		// kubelet finished bootstrapping short-circuits.
++		bootstrapped, err := util.PathExists(cfg.KubeConfigPath(config.Kubelet))
++		if err != nil {
++			return fmt.Errorf("failed to check the kubelet kubeconfig: %w", err)
++		}
++		if !opts.Worker || (config.IsWorkerNode() && bootstrapped) {
 +			klog.Infof("Node %s is already part of the cluster. Skipping join process.", nodeName)
 +			return nil
 +		}
@@ -97,7 +102,7 @@ index 864876e8..7e16d79a 100644
  	}
  
  	if err := cleanupMicroShiftData(cfg); err != nil {
-@@ -109,36 +130,69 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
+@@ -109,35 +135,79 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
  	}
  	klog.Info("MicroShift data directories cleaned up successfully")
  
@@ -166,7 +171,18 @@ index 864876e8..7e16d79a 100644
  	if err := configureBootstrapKubeconfig(cfg, opts.KubeconfigPath); err != nil {
  		return fmt.Errorf("failed to configure bootstrap kubeconfig: %w", err)
  	}
- 
++	// The bootstrap kubeconfig is a copy of the passed-in cluster-admin
++	// credential: remove it however the join ends. On success the kubelet
++	// holds its own rotating client cert; a failed join is re-run with
++	// add-node, which copies it again.
++	if opts.Worker {
++		defer func() {
++			if err := os.Remove(cfg.BootstrapKubeConfigPath()); err != nil && !os.IsNotExist(err) {
++				klog.Warningf("failed to remove the bootstrap kubeconfig: %v", err)
++			}
++		}()
++	}
++
 +	// Role marker for role-agnostic tools (healthcheck, greenboot); a
 +	// re-join with a different role must not leave a stale marker behind.
 +	if opts.Worker {
@@ -176,29 +192,22 @@ index 864876e8..7e16d79a 100644
 +	} else if err := os.Remove(config.WorkerMarkerPath()); err != nil && !os.IsNotExist(err) {
 +		return fmt.Errorf("failed to remove worker marker: %w", err)
 +	}
-+
+ 
  	if err := restartMicroShift(); err != nil {
  		return fmt.Errorf("failed to restart MicroShift service: %w", err)
- 	}
-@@ -148,6 +202,17 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
- 		return fmt.Errorf("node failed to become ready: %w", err)
+@@ -149,6 +219,11 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
  	}
  
-+	// The join credential (the passed-in kubeconfig, today cluster-admin) must
-+	// not linger on a worker: once the node is Ready its kubelet holds its own
-+	// rotating client cert and no longer needs the bootstrap kubeconfig. A
-+	// scoped bootstrap token is the deeper fix; this bounds the exposure to the
-+	// join window meanwhile.
-+	if opts.Worker {
-+		if err := os.Remove(cfg.BootstrapKubeConfigPath()); err != nil && !os.IsNotExist(err) {
-+			klog.Warningf("failed to remove bootstrap kubeconfig after join: %v", err)
-+		}
-+	}
-+
  	klog.Info("Node successfully joined the cluster")
++	if opts.Worker {
++		// add-node does not delete a file it was handed, but this one should
++		// not outlive the join.
++		klog.Warningf("%s is the controller's cluster-admin kubeconfig and is no longer needed: delete it", opts.KubeconfigPath)
++	}
  	return nil
  }
-@@ -217,6 +282,92 @@ func fetchCertificateAuthority(ctx context.Context, client kubernetes.Interface,
+ 
+@@ -217,6 +292,92 @@ func fetchCertificateAuthority(ctx context.Context, client kubernetes.Interface,
  	return nil
  }
  
