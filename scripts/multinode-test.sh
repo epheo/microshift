@@ -394,4 +394,24 @@ log "assert: the worker restarts without the bootstrap kubeconfig"
 v2 systemctl restart microshift || die "worker microshift failed to restart after the join"
 retry 300 "both nodes Ready after the worker restart" both_ready
 
+# --- 9. A down worker does not fail the control plane's greenboot ---------------
+# Counting the worker's unavailable DaemonSet pods would turn the control
+# plane red and roll it back over another machine's outage.
+log "assert: the controller stays green while the worker is down"
+v2 systemctl stop microshift
+node2_notready() { koc get node node2 --no-headers 2>/dev/null | grep -q 'NotReady'; }
+retry 300 "node2 NotReady" node2_notready
+# Node NotReady comes first; the DaemonSet only counts the worker's pod as
+# unavailable a moment later. Checking before that proves nothing.
+ovnk_short() {
+    local s
+    s="$(koc -n openshift-ovn-kubernetes get ds ovnkube-node \
+        -o jsonpath='{.status.numberAvailable}/{.status.desiredNumberScheduled}')"
+    [ "${s%/*}" -lt "${s#*/}" ]
+}
+retry 300 "ovnkube-node counts the worker's pod unavailable" ovnk_short
+greenboot_checks v1 controller
+v2 systemctl start microshift
+retry 300 "both nodes Ready after the worker comes back" both_ready
+
 log "MULTINODE TEST PASSED"
