@@ -292,10 +292,10 @@ index 864876e8..7e16d79a 100644
  	secret, err := client.CoreV1().Secrets("kube-system").Get(ctx, name, metav1.GetOptions{})
  	if err != nil {
 diff --git a/pkg/cmd/run.go b/pkg/cmd/run.go
-index 12bc989e..ed4abd80 100644
+index e21fba4c..310eb310 100644
 --- a/pkg/cmd/run.go
 +++ b/pkg/cmd/run.go
-@@ -54,6 +54,7 @@ func NewRunMicroshiftCommand() *cobra.Command {
+@@ -55,6 +55,7 @@ func NewRunMicroshiftCommand() *cobra.Command {
  	}
  
  	var multinode bool
@@ -303,7 +303,7 @@ index 12bc989e..ed4abd80 100644
  
  	multinodeDefault := true
  	if version.Get().BuildVariant != version.BuildVariantCommunity {
-@@ -62,11 +63,13 @@ func NewRunMicroshiftCommand() *cobra.Command {
+@@ -63,11 +64,13 @@ func NewRunMicroshiftCommand() *cobra.Command {
  
  	flags := cmd.Flags()
  	flags.BoolVar(&multinode, "multinode", multinodeDefault, "enable multinode mode")
@@ -320,7 +320,7 @@ index 12bc989e..ed4abd80 100644
  		}
  	}
  
-@@ -87,7 +90,16 @@ func NewRunMicroshiftCommand() *cobra.Command {
+@@ -88,7 +91,16 @@ func NewRunMicroshiftCommand() *cobra.Command {
  			}
  		}
  
@@ -338,7 +338,7 @@ index 12bc989e..ed4abd80 100644
  
  		for _, w := range cfg.Warnings {
  			klog.Warningf("Configuration warning: %s", w)
-@@ -203,43 +215,72 @@ func RunMicroshift(cfg *config.Config) error {
+@@ -204,43 +216,72 @@ func RunMicroshift(cfg *config.Config) error {
  		return err
  	}
  
@@ -442,7 +442,7 @@ index 12bc989e..ed4abd80 100644
  
  	// Storing and clearing the env, so other components don't send the READY=1 until MicroShift is fully ready
  	notifySocket := os.Getenv("NOTIFY_SOCKET")
-@@ -247,28 +288,32 @@ func RunMicroshift(cfg *config.Config) error {
+@@ -248,28 +289,32 @@ func RunMicroshift(cfg *config.Config) error {
  
  	startRec.ServicesStart(microshiftStart)
  
@@ -450,10 +450,19 @@ index 12bc989e..ed4abd80 100644
 -	if err != nil {
 -		klog.Fatalf("failed to determine when to rotate certificates: %v", err)
 -	}
--
++	// The kubelet rotates its bootstrapped certs itself; only locally minted
++	// chains need the restart-to-rotate deadline.
++	if certChains != nil {
++		_, rotationDate, err := certchains.WhenToRotateAtEarliest(certChains)
++		if err != nil {
++			klog.Fatalf("failed to determine when to rotate certificates: %v", err)
++		}
+ 
 -	// Establish a deadline for restarting to rotate the certificates.
 -	certCtx, certCancel := context.WithDeadline(context.Background(), rotationDate)
--
++		// Establish a deadline for restarting to rotate the certificates.
++		certCtx, certCancel := context.WithDeadline(context.Background(), rotationDate)
+ 
 -	// Watch for the certificate deadline context to be done, log a
 -	// message, and cancel the run context to propagate the shutdown.
 -	go func() {
@@ -466,18 +475,8 @@ index 12bc989e..ed4abd80 100644
 -			klog.Info("Certificate watcher exiting")
 -			certCancel()
 -			return
-+	// The kubelet rotates its bootstrapped certs itself; only locally minted
-+	// chains need the restart-to-rotate deadline.
-+	if certChains != nil {
-+		_, rotationDate, err := certchains.WhenToRotateAtEarliest(certChains)
-+		if err != nil {
-+			klog.Fatalf("failed to determine when to rotate certificates: %v", err)
- 		}
+-		}
 -	}()
-+
-+		// Establish a deadline for restarting to rotate the certificates.
-+		certCtx, certCancel := context.WithDeadline(context.Background(), rotationDate)
-+
 +		// Watch for the certificate deadline context to be done, log a
 +		// message, and cancel the run context to propagate the shutdown.
 +		go func() {
@@ -496,13 +495,45 @@ index 12bc989e..ed4abd80 100644
  
  	// Start everything up
  	ready, stopped := make(chan struct{}), make(chan struct{})
-@@ -301,7 +346,9 @@ func RunMicroshift(cfg *config.Config) error {
+@@ -302,22 +347,26 @@ func RunMicroshift(cfg *config.Config) error {
  		}
  
  		// After MicroShift's core becomes ready, run the kustomizer (delete and/or apply manifests).
 -		kustomize.NewKustomizer(cfg).RunStandalone(runCtx)
+-
+-		// Provision certs for optional components after kustomize creates their namespaces.
+-		// Runs concurrently because it polls for the namespace created by kustomize.
+-		go func() {
+-			if err := components.ProvisionMetricsServerCerts(runCtx, cfg); err != nil {
+-				klog.Errorf("Failed to provision metrics-server certs: %v", err)
+-			}
+-		}()
+-		// Provision shared resources for optional monitoring components.
+-		// Runs concurrently because it polls for the namespace created by kustomize.
+-		go func() {
+-			if err := components.ProvisionMetricsClientCA(runCtx, cfg); err != nil {
+-				klog.Errorf("Failed to provision metrics-client-ca: %v", err)
+-			}
+-		}()
++		// Workers hold no kubeadmin kubeconfig and no CA keys, both of which
++		// the kustomizer and the metrics provisioning below need.
 +		if !cfg.MultiNode.Worker {
 +			kustomize.NewKustomizer(cfg).RunStandalone(runCtx)
++
++			// Provision certs for optional components after kustomize creates their namespaces.
++			// Runs concurrently because it polls for the namespace created by kustomize.
++			go func() {
++				if err := components.ProvisionMetricsServerCerts(runCtx, cfg); err != nil {
++					klog.Errorf("Failed to provision metrics-server certs: %v", err)
++				}
++			}()
++			// Provision shared resources for optional monitoring components.
++			// Runs concurrently because it polls for the namespace created by kustomize.
++			go func() {
++				if err := components.ProvisionMetricsClientCA(runCtx, cfg); err != nil {
++					klog.Errorf("Failed to provision metrics-client-ca: %v", err)
++				}
++			}()
 +		}
  
  		// Watch for SIGTERM or service error to exit, now that we are ready.
