@@ -56,6 +56,11 @@ COPY --chmod=755 ./src/image/prebuild.sh /tmp/prebuild.sh
 RUN ARCH="x86_64" /tmp/prebuild.sh --replace        "${OKD_RELEASE_IMAGE}" "${OKD_VERSION_TAG}" && \
     ARCH="x86_64" /tmp/prebuild.sh --replace-multus "${OKD_RELEASE_IMAGE}" "${OKD_VERSION_TAG}"
 
+# The policy CRDs patches/0010 and 0011 register, from the same payload's
+# cluster-network-operator, so they match the OVN-Kubernetes beside them.
+COPY --chmod=755 ./src/image/payload-crds.sh /tmp/payload-crds.sh
+RUN /tmp/payload-crds.sh "${OKD_RELEASE_IMAGE}" "${OKD_VERSION_TAG}" "${HOME}/microshift"
+
 # Drop subpackages not buildable from the OKD payload. Storage (r-drbd) is
 # not an RPM: the bootc stage installs it.
 COPY --chmod=755 ./src/image/modify-spec.py /tmp/modify-spec.py
