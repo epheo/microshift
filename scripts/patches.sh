@@ -60,7 +60,13 @@ cmd_export() {
     local base
     base="$(git -C "${dir}" rev-parse "${USHIFT_GITREF}^{commit}")"
     rm -f "${PATCHES}"/*.patch
+    # Copies: zones/node/daemonset.yaml is upstream's single-node master
+    # DaemonSet plus hunks, so upstream fixes to it reach the zones at apply
+    # time and only edits under a hunk conflict. 75% keeps the narrow zone
+    # RBAC from becoming a copy of the controller role, whose upstream
+    # additions would then widen it silently.
     git -C "${dir}" format-patch -q --full-index --zero-commit --no-signature \
+        --find-copies-harder -C75% \
         --base="${base}" -o "${PATCHES}" "${base}"
     ls "${PATCHES}"
 }

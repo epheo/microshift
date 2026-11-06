@@ -241,6 +241,12 @@ applies (`git am --3way`, with the old base fetched for the 3-way merge):
 resolve, `git am --continue`, then `export`. CI keeps applying with plain
 `git apply`, so a patch that only applies by 3-way still fails the build.
 
+`export` writes a file that is mostly an upstream file as a copy plus hunks
+(`--find-copies-harder -C75%`): the zones DaemonSet in `patches/0008` is
+upstream's single-node master DaemonSet with the zone changes on top, so
+upstream fixes to that file reach it on the next pin, and only a change
+under one of the hunks needs a hand rebase.
+
 ## Credits
 
 The build approach and several scripts under `src/` are adapted from
