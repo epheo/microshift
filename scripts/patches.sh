@@ -68,7 +68,9 @@ cmd_export() {
 cmd_check() {
     local dir
     dir="$(mktemp -d)"
-    trap 'rm -rf "${dir}"' EXIT
+    # Expanded now: the trap runs after this function's locals are gone.
+    # shellcheck disable=SC2064
+    trap "rm -rf '${dir}'" EXIT
     clone_at "${dir}/src"
     for p in "${PATCHES}"/*.patch; do
         echo "Applying $(basename "${p}")"
