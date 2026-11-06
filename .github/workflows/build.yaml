@@ -33,7 +33,9 @@ on:
 
 concurrency:
   group: build-${{ github.ref }}-${{ github.event_name == 'pull_request' && github.event.number || 'main' }}
-  cancel-in-progress: false
+  # A PR push supersedes the run in flight; on main every run publishes and
+  # must finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   bump:
@@ -46,7 +48,7 @@ jobs:
       changed: ${{ steps.commit.outputs.changed }}
       rebuild: ${{ steps.head.outputs.rebuild }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Check for newer pinned inputs
         run: ./scripts/bump-versions.sh
@@ -105,29 +107,34 @@ jobs:
     # Run for every non-schedule event (bump is skipped there); on the daily
     # schedule only when something was bumped or :latest was not built from
     # main's head; on the weekly schedule always.
+    # !cancelled(), not always(): the bump job is skipped outside the
+    # schedule, and always() would also ignore a cancel request.
     if: |
-      always() && (
+      !cancelled() && (
         github.event_name != 'schedule' ||
         needs.bump.outputs.changed == 'true' ||
         needs.bump.outputs.rebuild == 'true' ||
         github.event.schedule == '45 5 * * 1'
       )
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # PR code runs make with packages: write; keep the token out of
+          # .git/config.
+          persist-credentials: false
           # Scheduled runs must build the just-bumped main, not the sha the
           # schedule fired on.
           ref: ${{ github.event_name == 'schedule' && 'main' || '' }}
 
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
-          tool-cache: true
-          swap-storage: false
+          preinstalled-runtimes: true
 
       - name: Load version pins
         run: grep -E '^[A-Z_]+=' versions.env >> "${GITHUB_ENV}"
@@ -209,7 +216,7 @@ jobs:
 
       - name: Upload VM logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vm-logs
           # console.log is the serial console; diag.log is the MicroShift,
@@ -222,13 +229,14 @@ jobs:
         run: |
           set -euo pipefail
           version="$(make --silent version PODMAN='sudo podman')"
+          [ -n "${version}" ] || { echo "::error::empty version string"; exit 1; }
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "minor=$(echo "${USHIFT_GITREF}" | cut -d. -f1,2)" >> "${GITHUB_OUTPUT}"
 
       - name: Login to ghcr.io
         if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.push-image)
         run: |
-          sudo podman login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Push image
         if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.push-image)
@@ -241,3 +249,26 @@ jobs:
             sudo podman push "${image}:${tag}"
           done
           echo "pushed ${image}:${full}"
+
+      # Reads back what a fresh client pulls: all three tags one image,
+      # labelled with the pins and the commit it was built from.
+      - name: Verify the published tags
+        if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.push-image)
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${{ github.repository_owner }}/microshift"
+          full="${{ steps.version.outputs.version }}_epheo.${EPHEO_REV}"
+          inspect() { skopeo inspect --retry-times 3 --no-tags "docker://${image}:$1"; }
+          ref="$(inspect "${full}")"
+          digest="$(echo "${ref}" | jq -r .Digest)"
+          for tag in "${{ steps.version.outputs.minor }}" latest; do
+            got="$(inspect "${tag}" | jq -r .Digest)"
+            [ "${got}" = "${digest}" ] || { echo "::error:::${tag} is ${got}, :${full} is ${digest}"; exit 1; }
+          done
+          label() { echo "${ref}" | jq -r --arg k "$1" '.Labels[$k] // ""'; }
+          for pair in "microshift.ref=${USHIFT_GITREF}" "okd.version=${OKD_VERSION_TAG}" \
+              "epheo.rev=${EPHEO_REV}" "org.opencontainers.image.revision=$(git rev-parse HEAD)"; do
+            key="${pair%%=*}"; want="${pair#*=}"
+            [ "$(label "${key}")" = "${want}" ] || { echo "::error::label ${key} is '$(label "${key}")', want '${want}'"; exit 1; }
+          done
+          echo "verified ${image}:${full} (${digest}) as :${{ steps.version.outputs.minor }} and :latest"
