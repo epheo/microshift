@@ -6,7 +6,7 @@
 #
 #   make srpm    clone upstream @ pin, apply patches, swap payload to OKD, build SRPM
 #   make rpm     rebuild the SRPM into native el10 RPMs (stream10 buildroot)
-#   make image   assemble the bootc OS image (OVN + multus + topolvm + portail)
+#   make image   assemble the bootc OS image (OVN + multus + r-drbd + portail)
 #   make smoke   boot the image as a privileged container and assert the opinions
 #   make vm-test qcow2 + QEMU boot, full assertion suite (the CI gate)
 #   make vm-test-upgrade  the same suite after bootc switch from the last release
@@ -57,12 +57,16 @@ image:
 	    --label okd.version="$(OKD_VERSION_TAG)" \
 	    --label epheo.rev="$(EPHEO_REV)" \
 	    --label portail.image="$(PORTAIL_IMAGE)" \
+	    --label r-drbd.commit="$(R_DRBD_COMMIT)" \
+	    --label drbd.version="$(DRBD_VERSION)" \
 	    --label gateway-api.version="$(GATEWAY_API_VERSION)" \
 	    --label org.opencontainers.image.revision="$(shell git rev-parse HEAD 2>/dev/null)" \
 	    --build-arg RPM_IMAGE="localhost/$(RPM_IMAGE):latest" \
 	    --build-arg BOOTC_IMAGE_URL="$(BOOTC_IMAGE_URL)" \
 	    --build-arg BOOTC_IMAGE_TAG="$(BOOTC_IMAGE_TAG)" \
 	    --build-arg PORTAIL_IMAGE="$(PORTAIL_IMAGE)" \
+	    --build-arg DRBD_VERSION="$(DRBD_VERSION)" \
+	    --build-arg DRBD_SHA256="$(DRBD_SHA256)" \
 	    --build-arg GATEWAY_API_VERSION="$(GATEWAY_API_VERSION)" \
 	    --build-arg GATEWAY_API_SHA256="$(GATEWAY_API_SHA256)" \
 	    -f packaging/bootc.Containerfile .

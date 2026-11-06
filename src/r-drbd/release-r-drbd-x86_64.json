@@ -1,0 +1,10 @@
+{
+  "images": {
+    "r-drbd": "ghcr.io/epheo/r-drbd:sha-33dc051",
+    "csi-attacher": "registry.k8s.io/sig-storage/csi-attacher:v4.13.0",
+    "csi-node-driver-registrar": "registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0",
+    "csi-provisioner": "registry.k8s.io/sig-storage/csi-provisioner:v6.3.0",
+    "csi-resizer": "registry.k8s.io/sig-storage/csi-resizer:v2.2.1",
+    "csi-snapshotter": "registry.k8s.io/sig-storage/csi-snapshotter:v8.6.0"
+  }
+}

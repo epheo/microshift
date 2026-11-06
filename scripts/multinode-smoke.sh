@@ -19,7 +19,7 @@ NET="${NET:-epheo-microshift-mn}"
 CTRL="${CTRL:-epheo-mn-controller}"
 WORKER="${WORKER:-epheo-mn-worker}"
 LVM_DISK="${LVM_DISK:-/var/lib/epheo-microshift-smoke/lvmdisk.image}"
-VG_NAME="myvg1" # must match the device-class in the packaged lvmd config
+VG_NAME="myvg1" # the VG microshift-r-drbd-default-pool turns into a Pool
 KUBECONFIG_IN_CONTAINER="/var/lib/microshift/resources/kubeadmin/kubeconfig"
 
 log() { echo "--- $*"; }
@@ -112,11 +112,12 @@ sudo modprobe openvswitch || true
 sudo modprobe geneve || true
 
 if [ ! -f "${LVM_DISK}" ]; then
-    log "creating loopback VG '${VG_NAME}' for TopoLVM"
+    log "creating loopback VG '${VG_NAME}' and thin pool thin for r-drbd"
     sudo mkdir -p "$(dirname "${LVM_DISK}")"
     sudo truncate --size=2G "${LVM_DISK}"
     dev="$(sudo losetup --find --show --nooverlap "${LVM_DISK}")"
     sudo vgcreate -f -y "${VG_NAME}" "${dev}"
+    sudo lvcreate -q -y --type thin-pool -l 90%FREE -n thin "${VG_NAME}"
 fi
 
 # --- 3. Boot the two nodes --------------------------------------------------

@@ -6,7 +6,9 @@
 #     secondary localnet networks work without any runtime ConfigMap hack.
 #   - Multus is installed and enabled (microshift-multus ships the config.d
 #     toggle and the cri-o default-network drop-in).
-#   - TopoLVM replaces LVMS as the storage driver (community subpackage).
+#   - r-drbd (DRBD 9 on thin LVM) is the storage driver, with its DRBD module
+#     built for the image kernel. A node with VG myvg1 and a thin pool named
+#     thin gets a Pool and a default StorageClass by itself.
 #   - Air-gapped by default: the full MicroShift payload (every ref in the
 #     installed release-info JSONs) is embedded as a shared-blob OCI layout
 #     and imported into cri-o's store at boot — first boot needs no registry.
@@ -28,6 +30,33 @@ ARG RPM_IMAGE=localhost/epheo-microshift-rpm:latest
 
 FROM ${RPM_IMAGE} AS builder
 
+# DRBD 9 for r-drbd is not in CentOS repos: built here against the base's own
+# kernel, so a base kernel bump rebuilds it. KDIR pins the kmp build to that
+# kernel (the spec takes the build host's uname -r otherwise). No debuginfo:
+# the debug-source scan finds nothing under %_builddir and fails rpmbuild.
+# kernel-devel comes from the very compose the base was built from (its
+# buildinfo names it): the mirrors can trail a fresh base kernel by days.
+FROM ${BOOTC_IMAGE_URL}:${BOOTC_IMAGE_TAG} AS drbd-kmod
+ARG DRBD_VERSION
+ARG DRBD_SHA256
+RUN test -n "${DRBD_VERSION}" -a -n "${DRBD_SHA256}" && \
+    kver="$(ls /usr/lib/modules)" && \
+    compose="$(sed -n 's/.*"redhat.compose-id": "\([^"]*\)".*/\1/p' /usr/share/buildinfo/labels.json)" && \
+    test -n "${compose}" && \
+    printf '%s\n' '[base-compose-appstream]' \
+        "name=AppStream of ${compose}, the compose this base was built from" \
+        "baseurl=https://composes.stream.centos.org/stream-10/production/${compose}/compose/AppStream/\$basearch/os/" \
+        'gpgcheck=1' 'gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial-SHA256' \
+        > /etc/yum.repos.d/base-compose.repo && \
+    dnf -y install "kernel-devel-${kver}" gcc make rpm-build kernel-rpm-macros \
+        redhat-rpm-config elfutils-libelf-devel patch diffutils perl-interpreter && \
+    curl -fsSL --retry 3 -o /tmp/drbd.tar.gz \
+        "https://pkg.linbit.com/downloads/drbd/9/drbd-${DRBD_VERSION}.tar.gz" && \
+    echo "${DRBD_SHA256}  /tmp/drbd.tar.gz" | sha256sum -c - && \
+    tar -C /tmp -xzf /tmp/drbd.tar.gz && \
+    make -C "/tmp/drbd-${DRBD_VERSION}" kmp-rpm KDIR="/usr/src/kernels/${kver}" \
+        RPMOPT='--define "debug_package %{nil}"'
+
 FROM ${BOOTC_IMAGE_URL}:${BOOTC_IMAGE_TAG}
 
 # Pinned in versions.env; the Makefile passes it.
@@ -46,11 +75,15 @@ ARG BUILDER_RSHARED_SERVICE=/home/microshift/microshift/packaging/imagemode/syst
 # every dnf transaction in this image and in derived/site images.
 RUN echo 'excludepkgs=kernel-debug*' >> /etc/dnf/dnf.conf
 
-# Install MicroShift with the OVN + multus + topolvm + greenboot selection.
-# Runtime dependencies (cri-o, openvswitch, ...) come from the public
-# mirror.openshift.com dependencies repo configured by create_repos.sh.
+# Install MicroShift with the OVN + multus + greenboot selection, and the
+# DRBD module built above. Runtime dependencies (cri-o, openvswitch, ...) come
+# from the public mirror.openshift.com dependencies repo configured by
+# create_repos.sh. drbd-utils stays off the host: the r-drbd agent image
+# carries its own, and the package's units would disconnect r-drbd's
+# resources at shutdown.
 COPY --chmod=755 ./src/rpm/create_repos.sh ${REPO_CONFIG_SCRIPT}
 COPY --from=builder ${BUILDER_RPM_REPO_PATH} ${USHIFT_RPM_REPO_PATH}
+COPY --from=drbd-kmod /root/rpmbuild/RPMS/ /tmp/drbd-kmod/
 RUN ${REPO_CONFIG_SCRIPT} -create ${USHIFT_RPM_REPO_PATH} && \
     dnf install -y \
         microshift \
@@ -59,14 +92,13 @@ RUN ${REPO_CONFIG_SCRIPT} -create ${USHIFT_RPM_REPO_PATH} && \
         microshift-networking \
         microshift-multus \
         microshift-multus-release-info \
-        microshift-topolvm \
-        microshift-topolvm-release-info \
         microshift-greenboot \
+        /tmp/drbd-kmod/*/kmod-drbd-[0-9]*.rpm \
         skopeo \
         jq && \
     ${REPO_CONFIG_SCRIPT} -delete && \
     rm -vf  ${REPO_CONFIG_SCRIPT} && \
-    rm -rvf ${USHIFT_RPM_REPO_PATH} && \
+    rm -rvf ${USHIFT_RPM_REPO_PATH} /tmp/drbd-kmod && \
     dnf clean all
 
 # OVN-K hard-fails without xt_CT/nft_compat (ovnkube-node's geneve NOTRACK
@@ -140,6 +172,30 @@ RUN /tmp/repair-module-store.sh && rm -vf /tmp/repair-module-store.sh
 
 # Node role selector: controller (default) or worker (multinode, patches/0006).
 COPY --chmod=755 ./src/profiles/microshift-profile /usr/bin/microshift-profile
+
+# r-drbd, the storage plane. Its manifests apply from manifests.d like the
+# rest of the payload; its images are listed in a release-info JSON so the
+# payload embed below carries them.
+# - Storage modules load at boot, not on demand: the agent reports DRBD
+#   unsupported while the module is absent. usermode_helper=disabled: SELinux
+#   confines kernel-spawned helpers, each resync handler then exits 1 and DRBD
+#   drops the fresh connection; the agent follows DRBD events itself.
+# - The host's LVM must never scan DRBD devices or LVs: they may hold guest VGs.
+# - Graceful node shutdown lets pods release their volumes first.
+# - microshift-r-drbd-default-pool declares the Pool for VG myvg1 with thin
+#   pool thin when it exists, and leaves any other node as it is.
+RUN printf '%s\n' drbd drbd_transport_tcp dm-snapshot dm-thin-pool \
+        > /usr/lib/modules-load.d/r-drbd.conf && \
+    echo 'options drbd usermode_helper=disabled' > /usr/lib/modprobe.d/r-drbd.conf
+COPY ./src/r-drbd/lvmlocal.conf /etc/lvm/lvmlocal.conf
+COPY ./src/r-drbd/40-graceful-shutdown.yaml /etc/microshift/config.d/40-graceful-shutdown.yaml
+COPY ./src/r-drbd/kustomization.yaml /usr/lib/microshift/manifests.d/000-r-drbd/kustomization.yaml
+COPY ./src/r-drbd/base/ /usr/lib/microshift/manifests.d/000-r-drbd/base/
+COPY ./src/r-drbd/release-r-drbd-x86_64.json /usr/share/microshift/release/release-r-drbd-x86_64.json
+COPY --chmod=755 ./src/r-drbd/greenboot-check.sh /etc/greenboot/check/required.d/50_microshift_r_drbd_check.sh
+COPY --chmod=755 ./src/r-drbd/default-pool.sh /usr/libexec/microshift-r-drbd-default-pool
+COPY ./src/r-drbd/microshift-r-drbd-default-pool.service /usr/lib/systemd/system/microshift-r-drbd-default-pool.service
+RUN systemctl enable microshift-r-drbd-default-pool.service
 
 # Embed the full MicroShift payload under /usr/lib/embedded-images.
 # import-embedded-images.service imports every manifest entry into cri-o's
@@ -219,6 +275,14 @@ RUN count="$(find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d | wc -l)" && 
         ls /usr/lib/modules; \
         exit 1; \
     fi
+
+# Guard: the DRBD module is the pinned version and built for the one kernel
+# this image boots; TopoLVM did not come back through a dependency.
+ARG DRBD_VERSION
+RUN kver="$(ls /usr/lib/modules)" && \
+    [ "$(modinfo -k "${kver}" -F version drbd)" = "${DRBD_VERSION}" ] && \
+    modinfo -k "${kver}" -F vermagic drbd | grep -q "^${kver} " && \
+    ! rpm -q microshift-topolvm drbd-utils
 
 # Guard: last step, after every package operation — cri-o reads the signature
 # policy from /etc/containers only, and a base or package bump that loses the

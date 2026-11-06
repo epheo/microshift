@@ -1,5 +1,0 @@
-{
-  "images": {
-    "topolvm-with-sidecar": "ghcr.io/topolvm/topolvm-with-sidecar:0.42.1"
-  }
-}

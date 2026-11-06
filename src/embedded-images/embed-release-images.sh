@@ -23,7 +23,7 @@ mkdir -p "${DEST_DIR}"
 jq -r '.images | to_entries[] | "\(.key) \(.value)"' \
         "${RELEASE_DIR}"/release-*"${ARCH}".json \
 | while read -r key ref; do
-    # Not deployed by this distribution: TopoLVM replaces LVMS (and the LVMS
+    # Not deployed by this distribution: r-drbd replaces LVMS (and the LVMS
     # ref needs registry.redhat.io auth).
     if [ "${key}" = "lvms_operator" ]; then
         continue
