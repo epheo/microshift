@@ -280,6 +280,12 @@ scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERRO
     -i "${WORKDIR}/id" "${WORKDIR}/bootstrap-kubeconfig" "root@${IP2}:/root/bootstrap-kubeconfig"
 v2 microshift add-node --worker --kubeconfig /root/bootstrap-kubeconfig
 
+log "assert: the join left no copy of the cluster-admin kubeconfig"
+if v2 test -e /var/lib/microshift/bootstrap/kubeconfig; then
+    die "add-node left its bootstrap kubeconfig on the worker"
+fi
+v2 rm -f /root/bootstrap-kubeconfig
+
 # --- 5. The multinode contract ------------------------------------------------
 both_ready() { [ "$(koc get nodes --no-headers 2>/dev/null | grep -c ' Ready')" -eq 2 ]; }
 retry 900 "both nodes Ready" both_ready
@@ -382,5 +388,10 @@ greenboot_checks() { # greenboot_checks <vssh-fn> <label>
 }
 greenboot_checks v1 controller
 greenboot_checks v2 worker
+
+# --- 8. A joined worker restarts on its kubelet kubeconfig alone ---------------
+log "assert: the worker restarts without the bootstrap kubeconfig"
+v2 systemctl restart microshift || die "worker microshift failed to restart after the join"
+retry 300 "both nodes Ready after the worker restart" both_ready
 
 log "MULTINODE TEST PASSED"

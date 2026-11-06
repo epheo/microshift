@@ -135,8 +135,11 @@ microshift-profile worker
 microshift add-node --worker --kubeconfig /path/to/bootstrap-kubeconfig
 ```
 
-The join credential is removed once the node is Ready (the kubelet then holds
-only its own rotating cert), and workers keep their kubelet client CA current
+`add-node` removes its copy of the join credential when it exits, whether the
+join succeeded or not (a failed join is simply re-run). Delete the file you
+passed with `--kubeconfig` yourself: it is the controller's cluster-admin
+kubeconfig. After the join the kubelet holds only its own rotating cert, and
+workers keep their kubelet client CA current
 from the CA the control plane publishes, so control-plane CA rotation does not
 require a re-join. The greenboot gate stays enabled on workers: `microshift
 healthcheck` detects the role and gates on the node being Ready in the cluster.

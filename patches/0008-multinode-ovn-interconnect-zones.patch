@@ -733,7 +733,7 @@ index 00000000..f4728d4e
 +      tolerations:
 +      - operator: "Exists"
 diff --git a/pkg/cmd/addnode.go b/pkg/cmd/addnode.go
-index 7e16d79a..ecfc4138 100644
+index b4a8571d..d6e3fb19 100644
 --- a/pkg/cmd/addnode.go
 +++ b/pkg/cmd/addnode.go
 @@ -6,6 +6,7 @@ import (
@@ -744,7 +744,7 @@ index 7e16d79a..ecfc4138 100644
  	"os"
  	"os/exec"
  	"path/filepath"
-@@ -185,8 +186,15 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
+@@ -201,8 +202,15 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
  
  	// Role marker for role-agnostic tools (healthcheck, greenboot); a
  	// re-join with a different role must not leave a stale marker behind.
@@ -761,7 +761,7 @@ index 7e16d79a..ecfc4138 100644
  			return fmt.Errorf("failed to write worker marker: %w", err)
  		}
  	} else if err := os.Remove(config.WorkerMarkerPath()); err != nil && !os.IsNotExist(err) {
-@@ -217,6 +225,43 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
+@@ -227,6 +235,43 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
  	return nil
  }
  

@@ -201,6 +201,12 @@ rm -f "${boot_kc}"
 log "joining the worker (microshift add-node --worker, up to 10m)"
 wexec microshift add-node --worker --kubeconfig /tmp/bootstrap-kubeconfig
 
+log "assert: the join left no copy of the cluster-admin kubeconfig"
+if wexec test -e /var/lib/microshift/bootstrap/kubeconfig; then
+    echo "ERROR: add-node left its bootstrap kubeconfig on the worker" >&2; exit 1
+fi
+wexec rm -f /tmp/bootstrap-kubeconfig
+
 # --- 5. Assert the worker's shape --------------------------------------------
 log "assert: worker node is Ready"
 koc get node "${WORKER}" --no-headers | grep -q ' Ready '
