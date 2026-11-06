@@ -12,7 +12,7 @@ FROM ${BUILDROOT_IMAGE}
 
 RUN dnf install -y \
         --setopt=install_weak_deps=False \
-        rpm-build which git cpio createrepo_c \
+        rpm-build which git cpio createrepo_c hostname \
         gcc gettext golang jq make policycoreutils selinux-policy selinux-policy-devel systemd && \
     dnf clean all
 
@@ -32,6 +32,10 @@ RUN \
     rpm2cpio ./microshift-*.src.rpm | cpio -idm && \
     mkdir -p /home/microshift/microshift && \
     tar xf ./microshift-*.tar.gz -C /home/microshift/microshift --strip-components=1 && \
+    \
+    echo "# Unit tests of the packages the patch series changes" && \
+    (cd /home/microshift/microshift && go test \
+        ./pkg/cmd/ ./pkg/config/... ./pkg/controllers/... ./pkg/healthcheck/... ./pkg/node/...) && \
     \
     echo "# Build the RPMs from the SRPM" && \
     rpmbuild --quiet --define 'microshift_variant community' --rebuild ./microshift-*.src.rpm && \

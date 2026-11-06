@@ -914,6 +914,183 @@ index 00000000..4c0f12e3
 +	}
 +	return true, ""
 +}
+diff --git a/pkg/controllers/kubelet_csr_approver_test.go b/pkg/controllers/kubelet_csr_approver_test.go
+new file mode 100644
+index 00000000..9121445b
+--- /dev/null
++++ b/pkg/controllers/kubelet_csr_approver_test.go
+@@ -0,0 +1,171 @@
++package controllers
++
++import (
++	"context"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/pem"
++	"net"
++	"strings"
++	"testing"
++
++	certsv1 "k8s.io/api/certificates/v1"
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/client-go/kubernetes/fake"
++)
++
++func csrPEM(t *testing.T, cn string, org []string, dns []string, ips []string, emails []string) []byte {
++	t.Helper()
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tmpl := &x509.CertificateRequest{
++		Subject:        pkix.Name{CommonName: cn, Organization: org},
++		DNSNames:       dns,
++		EmailAddresses: emails,
++	}
++	for _, ip := range ips {
++		tmpl.IPAddresses = append(tmpl.IPAddresses, net.ParseIP(ip))
++	}
++	der, err := x509.CreateCertificateRequest(rand.Reader, tmpl, key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der})
++}
++
++func TestShouldApprove(t *testing.T) {
++	nodes := []string{"system:nodes"}
++	serving := []certsv1.KeyUsage{certsv1.UsageDigitalSignature, certsv1.UsageServerAuth}
++	client := []certsv1.KeyUsage{certsv1.UsageDigitalSignature, certsv1.UsageClientAuth}
++
++	tests := []struct {
++		name       string
++		username   string
++		groups     []string
++		signer     string
++		usages     []certsv1.KeyUsage
++		request    []byte
++		want       bool
++		wantReason string
++	}{
++		{
++			name: "serving cert for own addresses", username: "system:node:node1", groups: nodes,
++			signer: certsv1.KubeletServingSignerName, usages: serving,
++			request: csrPEM(t, "system:node:node1", nodes, []string{"node1"}, []string{"192.168.1.11"}, nil),
++			want:    true,
++		},
++		{
++			name: "serving cert for another node's name", username: "system:node:node1", groups: nodes,
++			signer: certsv1.KubeletServingSignerName, usages: serving,
++			request:    csrPEM(t, "system:node:node2", nodes, []string{"node2"}, nil, nil),
++			wantReason: "subject does not match requester",
++		},
++		{
++			name: "serving cert with a foreign IP SAN", username: "system:node:node1", groups: nodes,
++			signer: certsv1.KubeletServingSignerName, usages: serving,
++			request:    csrPEM(t, "system:node:node1", nodes, []string{"node1"}, []string{"192.168.1.12"}, nil),
++			wantReason: "is not an address of node node1",
++		},
++		{
++			name: "serving cert with a foreign DNS SAN", username: "system:node:node1", groups: nodes,
++			signer: certsv1.KubeletServingSignerName, usages: serving,
++			request:    csrPEM(t, "system:node:node1", nodes, []string{"kubernetes.default.svc"}, nil, nil),
++			wantReason: "is not an address of node node1",
++		},
++		{
++			name: "serving cert with an email SAN", username: "system:node:node1", groups: nodes,
++			signer: certsv1.KubeletServingSignerName, usages: serving,
++			request:    csrPEM(t, "system:node:node1", nodes, []string{"node1"}, nil, []string{"a@b.c"}),
++			wantReason: "Email",
++		},
++		{
++			name: "serving cert with client usages", username: "system:node:node1", groups: nodes,
++			signer: certsv1.KubeletServingSignerName, usages: client,
++			request:    csrPEM(t, "system:node:node1", nodes, []string{"node1"}, nil, nil),
++			wantReason: "usages did not match",
++		},
++		{
++			name: "requester outside system:nodes", username: "system:node:node1", groups: []string{"system:authenticated"},
++			signer: certsv1.KubeletServingSignerName, usages: serving,
++			request: csrPEM(t, "system:node:node1", nodes, []string{"node1"}, nil, nil),
++		},
++		{
++			name: "non-node user inside system:nodes", username: "kubeadmin", groups: nodes,
++			signer: certsv1.KubeletServingSignerName, usages: serving,
++			request: csrPEM(t, "system:node:node1", nodes, []string{"node1"}, nil, nil),
++		},
++		{
++			name: "client cert renewal", username: "system:node:node1", groups: nodes,
++			signer: certsv1.KubeAPIServerClientKubeletSignerName, usages: client,
++			request: csrPEM(t, "system:node:node1", nodes, nil, nil, nil),
++			want:    true,
++		},
++		{
++			name: "client cert with a DNS SAN", username: "system:node:node1", groups: nodes,
++			signer: certsv1.KubeAPIServerClientKubeletSignerName, usages: client,
++			request:    csrPEM(t, "system:node:node1", nodes, []string{"node1"}, nil, nil),
++			wantReason: "DNS",
++		},
++		{
++			name: "other signer", username: "system:node:node1", groups: nodes,
++			signer: certsv1.KubeAPIServerClientSignerName, usages: client,
++			request: csrPEM(t, "system:node:node1", nodes, nil, nil, nil),
++		},
++	}
++
++	kc := fake.NewSimpleClientset(&corev1.Node{
++		ObjectMeta: metav1.ObjectMeta{Name: "node1"},
++		Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{
++			{Type: corev1.NodeInternalIP, Address: "192.168.1.11"},
++			{Type: corev1.NodeHostName, Address: "node1"},
++		}},
++	})
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			csr := &certsv1.CertificateSigningRequest{
++				ObjectMeta: metav1.ObjectMeta{Name: "csr"},
++				Spec: certsv1.CertificateSigningRequestSpec{
++					Request:    tt.request,
++					SignerName: tt.signer,
++					Usages:     tt.usages,
++					Username:   tt.username,
++					Groups:     tt.groups,
++				},
++			}
++			got, reason := shouldApprove(context.Background(), kc, csr)
++			if got != tt.want {
++				t.Fatalf("shouldApprove() = %v (%q), want %v", got, reason, tt.want)
++			}
++			if !strings.Contains(reason, tt.wantReason) {
++				t.Fatalf("reason %q does not contain %q", reason, tt.wantReason)
++			}
++		})
++	}
++}
++
++func TestIsResolved(t *testing.T) {
++	cond := func(typ certsv1.RequestConditionType, st corev1.ConditionStatus) *certsv1.CertificateSigningRequest {
++		return &certsv1.CertificateSigningRequest{Status: certsv1.CertificateSigningRequestStatus{
++			Conditions: []certsv1.CertificateSigningRequestCondition{{Type: typ, Status: st}},
++		}}
++	}
++	if isResolved(&certsv1.CertificateSigningRequest{}) {
++		t.Error("a CSR without conditions is pending")
++	}
++	if !isResolved(cond(certsv1.CertificateApproved, corev1.ConditionTrue)) {
++		t.Error("an approved CSR is resolved")
++	}
++	if !isResolved(cond(certsv1.CertificateDenied, corev1.ConditionTrue)) {
++		t.Error("a denied CSR is resolved")
++	}
++	if isResolved(cond(certsv1.CertificateApproved, corev1.ConditionFalse)) {
++		t.Error("an Approved=False condition does not resolve a CSR")
++	}
++}
 diff --git a/pkg/node/kubelet.go b/pkg/node/kubelet.go
 index 8af66791..e457c805 100644
 --- a/pkg/node/kubelet.go
