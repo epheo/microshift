@@ -1,5 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Thibaut Lapierre <root@epheo.eu>
+Date: Fri, 6 Nov 2026 00:00:00 +0000
+Subject: [PATCH 08/11] multinode: ovn interconnect zones
+
+Upstream's multinode OVN cannot host CA-less workers: its master
+DaemonSet needs the master label and its components use the kubeadmin
+kubeconfig. Every node here is its own OVN interconnect zone instead:
+
+- assets/components/ovn/zones/{master,node}: local nbdb, sbdb, northd and
+  ovn-controller plus a combined zone controller (--zone $K8S_NODE) on
+  every node; the master DaemonSet runs the cluster manager only.
+- Service-account auth with apiserver= in ovnkube.conf (net.JoinHostPort,
+  so IPv6 control planes work), plus the RBAC that needs.
+- The NB zone is named after the node in nbdb's postStart.
+- Workers get their node IP as a host alias on br-ex and a route to the
+  apiserver advertise address via the control plane.
+- microshift-cleanup-data drops the OVN databases, which the zones keep
+  on the host under /etc/openvswitch.
+
+Community builds run multinode mode by default, so single-node installs
+use these manifests too.
+Covered by: vm-test (single node), multinode-smoke and multinode-test
+(cross-node pod, service and DNS traffic).
+---
+ .../ovn/common/clusterrole-controller.yaml    |  29 +
+ assets/components/ovn/common/configmap.yaml   |   4 +
+ .../ovn/zones/master/daemonset.yaml           |  92 +++
+ .../components/ovn/zones/node/daemonset.yaml  | 572 ++++++++++++++++++
+ pkg/cmd/addnode.go                            |  47 +-
+ pkg/components/networking.go                  |  37 +-
+ pkg/config/multinode.go                       |  22 +
+ pkg/node/netconfig.go                         | 152 +++++
+ scripts/microshift-cleanup-data.sh            |   4 +
+ 9 files changed, 946 insertions(+), 13 deletions(-)
+ create mode 100644 assets/components/ovn/zones/master/daemonset.yaml
+ create mode 100644 assets/components/ovn/zones/node/daemonset.yaml
+
 diff --git a/assets/components/ovn/common/clusterrole-controller.yaml b/assets/components/ovn/common/clusterrole-controller.yaml
-index be69d281..8568a7ad 100644
+index be69d281eb8ceaac9de7f30b5110873162d950ef..8568a7ad46b2c232efef031994239a9635b70de5 100644
 --- a/assets/components/ovn/common/clusterrole-controller.yaml
 +++ b/assets/components/ovn/common/clusterrole-controller.yaml
 @@ -71,6 +71,9 @@ rules:
@@ -43,7 +81,7 @@ index be69d281..8568a7ad 100644
 +  - update
 +  - patch
 diff --git a/assets/components/ovn/common/configmap.yaml b/assets/components/ovn/common/configmap.yaml
-index c6abdd4c..d83bc161 100644
+index c6abdd4c4aad1459c34ad73f262bf8e4c4c66af8..d83bc16195b45c68224bf620c1225e80c97b3006 100644
 --- a/assets/components/ovn/common/configmap.yaml
 +++ b/assets/components/ovn/common/configmap.yaml
 @@ -17,7 +17,11 @@ data:
@@ -60,7 +98,7 @@ index c6abdd4c..d83bc161 100644
  
 diff --git a/assets/components/ovn/zones/master/daemonset.yaml b/assets/components/ovn/zones/master/daemonset.yaml
 new file mode 100644
-index 00000000..18ae72b0
+index 0000000000000000000000000000000000000000..18ae72b05b148bf16b8ea79208690574e9433f95
 --- /dev/null
 +++ b/assets/components/ovn/zones/master/daemonset.yaml
 @@ -0,0 +1,92 @@
@@ -158,7 +196,7 @@ index 00000000..18ae72b0
 +      - operator: "Exists"
 diff --git a/assets/components/ovn/zones/node/daemonset.yaml b/assets/components/ovn/zones/node/daemonset.yaml
 new file mode 100644
-index 00000000..092c944a
+index 0000000000000000000000000000000000000000..092c944af23596db4d40f1a923955876ce76f6dc
 --- /dev/null
 +++ b/assets/components/ovn/zones/node/daemonset.yaml
 @@ -0,0 +1,572 @@
@@ -735,7 +773,7 @@ index 00000000..092c944a
 +      tolerations:
 +      - operator: "Exists"
 diff --git a/pkg/cmd/addnode.go b/pkg/cmd/addnode.go
-index b4a8571d..d6e3fb19 100644
+index b4a8571dc2d3b6cd65cca94e10b8609eb7edd83f..d6e3fb19a284fec806cbc90b67169d541af8d270 100644
 --- a/pkg/cmd/addnode.go
 +++ b/pkg/cmd/addnode.go
 @@ -6,6 +6,7 @@ import (
@@ -808,7 +846,7 @@ index b4a8571d..d6e3fb19 100644
  	exists, err := util.PathExists(kubeconfigPath)
  	if err != nil {
 diff --git a/pkg/components/networking.go b/pkg/components/networking.go
-index 2e6ccad9..223337be 100644
+index 2e6ccad9277804a654da96211260881e0bca1fdd..223337befda30a0fefd0551683b42fe7ed3126fb 100644
 --- a/pkg/components/networking.go
 +++ b/pkg/components/networking.go
 @@ -4,6 +4,7 @@ import (
@@ -872,7 +910,7 @@ index 2e6ccad9..223337be 100644
  	if err := assets.ApplyDaemonSets(ctx, apps, renderTemplate, renderParamsFromConfig(cfg, extraParams), kubeconfigPath); err != nil {
  		klog.Warningf("Failed to apply apps %v %v", apps, err)
 diff --git a/pkg/config/multinode.go b/pkg/config/multinode.go
-index 86c06cb8..574acfe2 100644
+index 86c06cb8425d0bc9f82b6b5a0588068d06fde374..574acfe2bf76fb622c1bdada02d43b0ccd490aad 100644
 --- a/pkg/config/multinode.go
 +++ b/pkg/config/multinode.go
 @@ -1,8 +1,10 @@
@@ -918,7 +956,7 @@ index 86c06cb8..574acfe2 100644
  // (healthcheck, greenboot) can tell a worker from a control plane node.
  func WorkerMarkerPath() string {
 diff --git a/pkg/node/netconfig.go b/pkg/node/netconfig.go
-index ed338cc7..a468bdbc 100644
+index ed338cc79ec373f0196b6cb41070f7d581d03753..a468bdbc477eb7879933565fdf59f9435ae311ce 100644
 --- a/pkg/node/netconfig.go
 +++ b/pkg/node/netconfig.go
 @@ -38,6 +38,9 @@ const (
@@ -1105,3 +1143,18 @@ index ed338cc7..a468bdbc 100644
 +		}
 +	}
 +}
+diff --git a/scripts/microshift-cleanup-data.sh b/scripts/microshift-cleanup-data.sh
+index 2144d0e87cf720106704b5dc26baebd7df164c66..1ae4957f168158e85e02a0496085f0e2b84acd4e 100755
+--- a/scripts/microshift-cleanup-data.sh
++++ b/scripts/microshift-cleanup-data.sh
+@@ -127,6 +127,10 @@ function clean_data() {
+         rm -rf /var/run/ovn-kubernetes
+         rm -f /etc/cni/net.d/10-ovn-kubernetes.conf
+         rm -f /run/cni/bin/ovn-k8s-cni-overlay
++        # The ovnkube pod keeps the OVN databases on the host under
++        # /etc/openvswitch. Left in place, a node re-roled after the wipe
++        # boots its previous logical topology into the new cluster.
++        rm -f /etc/openvswitch/ovn*_db.db /etc/openvswitch/.ovn*_db.db.~lock~
+     fi
+ }
+ 

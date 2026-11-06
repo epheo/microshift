@@ -43,7 +43,8 @@ RUN git clone --branch "${USHIFT_GITREF}" --single-branch --depth 1 \
 WORKDIR ${HOME}/microshift/
 
 # The distribution's patch series: pristine upstream + patches/*.patch, kept
-# minimal and rebased onto every new pinned ref.
+# minimal and rebased onto every new pinned ref (scripts/patches.sh). Plain
+# git apply on purpose: a patch that only applies by 3-way must fail here.
 COPY ./patches/ /tmp/patches/
 RUN find /tmp/patches -name '*.patch' | sort | while read -r p; do \
         echo "Applying $(basename "${p}")" && git apply --stat --apply "${p}" || exit 1; \

@@ -11,15 +11,15 @@ Published at `ghcr.io/epheo/microshift`.
 |---|---|
 | OVN-Kubernetes is the CNI | `microshift-networking` installed; no kindnet |
 | OVN secondary networks work out of the box | `patches/0001` adds `enable-multi-network=true` to the ovnkube-config template at the source |
-| Secondary networks take policies | `patches/0011` adds `enable-multi-networkpolicy=true` and the MultiNetworkPolicy CRD (copied from cluster-network-operator) to MicroShift's own CRD list, applied before OVN starts: OVN-Kubernetes waits for it at start |
-| Cluster-wide policies | `patches/0012` adds `enable-admin-network-policy=true`, the AdminNetworkPolicy and BaselineAdminNetworkPolicy CRDs (copied from cluster-network-operator) to MicroShift's CRD list, and the OVN controller's rights to read them and write their status: a namespace's NetworkPolicy cannot override an admin Deny |
+| Secondary networks take policies | `patches/0010` adds `enable-multi-networkpolicy=true` and the MultiNetworkPolicy CRD (copied from cluster-network-operator) to MicroShift's own CRD list, applied before OVN starts: OVN-Kubernetes waits for it at start |
+| Cluster-wide policies | `patches/0011` adds `enable-admin-network-policy=true`, the AdminNetworkPolicy and BaselineAdminNetworkPolicy CRDs (copied from cluster-network-operator) to MicroShift's CRD list, and the OVN controller's rights to read them and write their status: a namespace's NetworkPolicy cannot override an admin Deny |
 | Multus enabled | `microshift-multus` (config.d toggle + cri-o default-network drop-in) |
 | r-drbd is the storage driver | [r-drbd](https://github.com/epheo/r-drbd) (DRBD 9 on thin LVM) with its DRBD module built for the image kernel; local volumes on one node, replicated ones on three. See [Storage](#storage) |
 | Air-gapped by default | the full MicroShift payload is embedded as a shared-blob OCI layout and imported into cri-o at boot — first boot needs no registry |
 | [portail](https://github.com/epheo/portail) is the edge | its image is embedded and imported the same way; the router is off and the Gateway API experimental CRDs (TCPRoute, UDPRoute) ship with the image, see [The edge](#the-edge) |
 | Updates must be safe | greenboot MicroShift health gate stays enabled; bootc rollback does the rest |
 | Logs are signal, not noise | `patches/0002` (etcd logs every request at warn — missing threshold default) and `patches/0003` (router status watcher hot-loops when `ingress.status: Removed`) |
-| Terminated pod GC is tunable | `patches/0010` adds `kubeControllerManager.terminatedPodGCThreshold`, the pod garbage collector's threshold (default unchanged, 12500): set it lower where graceful node shutdown leaves many terminated pods |
+| Terminated pod GC is tunable | `patches/0009` adds `kubeControllerManager.terminatedPodGCThreshold`, the pod garbage collector's threshold (default unchanged, 12500): set it lower where graceful node shutdown leaves many terminated pods |
 | Every image can be controller or worker | `microshift-profile` selects the role; `patches/0006`-`0008` add a worker mode where nodes hold no signing keys and OVN runs one interconnect zone per node |
 | The firewall is on and role-scoped | firewalld enabled with `microshift-controlplane`/`microshift-node` services; etcd is never exposed |
 | Headless and quiet | `bluetooth.service` and `fwupd-refresh.timer` masked; Red Hat client stack (`rhc`, `insights-client`, `subscription-manager`) removed: no radio daemon, no daily LVFS fetch, no registration nag or phone-home |
@@ -214,6 +214,22 @@ roles).
 `patches/` is a series applied on pristine upstream tags. Keep it short,
 prefer asset/config patches over code patches, and upstream what can be
 upstreamed. Every patch is rebase debt paid on each new pin.
+
+Each patch is a `git format-patch` mail: its subject and body say why it
+exists, what upstream does instead, and what test covers it. Work on the
+series as commits, never by editing the files:
+
+```sh
+scripts/patches.sh tree /tmp/ushift     # upstream at the pin + one commit per patch
+# edit in /tmp/ushift with plain git: commit --fixup + rebase -i --autosquash, reword...
+scripts/patches.sh export /tmp/ushift   # write the commits back to patches/
+scripts/patches.sh check                # apply on a pristine tag, as the SRPM stage does
+```
+
+After a bump to a new tag, `tree` stops at the first patch that no longer
+applies (`git am --3way`, with the old base fetched for the 3-way merge):
+resolve, `git am --continue`, then `export`. CI keeps applying with plain
+`git apply`, so a patch that only applies by 3-way still fails the build.
 
 ## Credits
 

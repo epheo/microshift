@@ -1,5 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Thibaut Lapierre <root@epheo.eu>
+Date: Fri, 6 Nov 2026 00:00:00 +0000
+Subject: [PATCH 06/11] multinode: worker role
+
+A worker role for multinode: `microshift run --worker` starts kubelet and
+networking only, and `microshift add-node --worker` joins it.
+
+- Workers hold no signing material: no initCerts, no CA keys, no SA keys,
+  no etcd member. They fetch public CA certs only.
+- The kubelet bootstraps its client cert and gets its serving cert through
+  serverTLSBootstrap; a kubelet-csr-approver controller on the control
+  plane approves serving CSRs whose SANs match the node, and client
+  renewals.
+- KubeletClientCARefresh keeps the worker's kubelet client CA bundle
+  current after control plane CA rotation.
+- The join credential's copy is removed on every exit of add-node.
+- Services that need the kubeadmin kubeconfig or CA keys (kustomizer,
+  metrics provisioning, C2CC route manager, CA publishing) stay on the
+  control plane.
+
+Carried by decision, not proposed upstream.
+Covered by: unit tests (CSR approver, kubelet config), multinode-smoke
+and multinode-test (join, certs, restart without bootstrap kubeconfig).
+---
+ assets/core/kubelet.yaml                     |  10 +-
+ pkg/cmd/addnode.go                           | 193 ++++++++++++++++--
+ pkg/cmd/run.go                               | 196 ++++++++++++-------
+ pkg/config/multinode.go                      |  40 +++-
+ pkg/controllers/kubelet_client_ca_refresh.go | 105 ++++++++++
+ pkg/controllers/kubelet_csr_approver.go      | 192 ++++++++++++++++++
+ pkg/controllers/kubelet_csr_approver_test.go | 171 ++++++++++++++++
+ pkg/node/kubelet.go                          |  37 +++-
+ pkg/node/kubelet_test.go                     |  15 ++
+ pkg/node/netconfig.go                        |  14 +-
+ 10 files changed, 870 insertions(+), 103 deletions(-)
+ create mode 100644 pkg/controllers/kubelet_client_ca_refresh.go
+ create mode 100644 pkg/controllers/kubelet_csr_approver.go
+ create mode 100644 pkg/controllers/kubelet_csr_approver_test.go
+
 diff --git a/assets/core/kubelet.yaml b/assets/core/kubelet.yaml
-index 988f071e..5ef9a18e 100644
+index 988f071e0b7b2afa6f89679f847bd47617025a02..5ef9a18e91b46d30fedf701c2ab042859c4fe9a6 100644
 --- a/assets/core/kubelet.yaml
 +++ b/assets/core/kubelet.yaml
 @@ -18,20 +18,24 @@ featureGates:
@@ -31,7 +71,7 @@ index 988f071e..5ef9a18e 100644
  {{- if .resolvConf }}
  resolvConf: "{{ .resolvConf }}"
 diff --git a/pkg/cmd/addnode.go b/pkg/cmd/addnode.go
-index 864876e8..b4a8571d 100644
+index 864876e8920d4e3840cab5e9e945da62fe1adf65..b4a8571dc2d3b6cd65cca94e10b8609eb7edd83f 100644
 --- a/pkg/cmd/addnode.go
 +++ b/pkg/cmd/addnode.go
 @@ -26,6 +26,8 @@ import (
@@ -301,7 +341,7 @@ index 864876e8..b4a8571d 100644
  	secret, err := client.CoreV1().Secrets("kube-system").Get(ctx, name, metav1.GetOptions{})
  	if err != nil {
 diff --git a/pkg/cmd/run.go b/pkg/cmd/run.go
-index e21fba4c..b1d83cb7 100644
+index e21fba4c5b5da3035dfa7cacb34680f0bbbf8690..b1d83cb76e1246500965aca8ad01bcd39a269782 100644
 --- a/pkg/cmd/run.go
 +++ b/pkg/cmd/run.go
 @@ -55,6 +55,7 @@ func NewRunMicroshiftCommand() *cobra.Command {
@@ -553,7 +593,7 @@ index e21fba4c..b1d83cb7 100644
  		// Watch for SIGTERM or service error to exit, now that we are ready.
  		select {
 diff --git a/pkg/config/multinode.go b/pkg/config/multinode.go
-index 37bd5b77..86c06cb8 100644
+index 37bd5b773fae5fdb1796b6d7ffb5f9cdf05ca47b..86c06cb8425d0bc9f82b6b5a0588068d06fde374 100644
 --- a/pkg/config/multinode.go
 +++ b/pkg/config/multinode.go
 @@ -1,14 +1,52 @@
@@ -612,7 +652,7 @@ index 37bd5b77..86c06cb8 100644
 +}
 diff --git a/pkg/controllers/kubelet_client_ca_refresh.go b/pkg/controllers/kubelet_client_ca_refresh.go
 new file mode 100644
-index 00000000..67365d32
+index 0000000000000000000000000000000000000000..67365d32236f45904aa75ea1353bb202ee6c4227
 --- /dev/null
 +++ b/pkg/controllers/kubelet_client_ca_refresh.go
 @@ -0,0 +1,105 @@
@@ -723,7 +763,7 @@ index 00000000..67365d32
 +}
 diff --git a/pkg/controllers/kubelet_csr_approver.go b/pkg/controllers/kubelet_csr_approver.go
 new file mode 100644
-index 00000000..4c0f12e3
+index 0000000000000000000000000000000000000000..4c0f12e325c5930d8b49b15e309ff3f1feb8553b
 --- /dev/null
 +++ b/pkg/controllers/kubelet_csr_approver.go
 @@ -0,0 +1,192 @@
@@ -921,7 +961,7 @@ index 00000000..4c0f12e3
 +}
 diff --git a/pkg/controllers/kubelet_csr_approver_test.go b/pkg/controllers/kubelet_csr_approver_test.go
 new file mode 100644
-index 00000000..9121445b
+index 0000000000000000000000000000000000000000..9121445b7a4320ad2bac0485dcb7986632e8e46b
 --- /dev/null
 +++ b/pkg/controllers/kubelet_csr_approver_test.go
 @@ -0,0 +1,171 @@
@@ -1097,7 +1137,7 @@ index 00000000..9121445b
 +	}
 +}
 diff --git a/pkg/node/kubelet.go b/pkg/node/kubelet.go
-index 8af66791..e457c805 100644
+index 8af667911651b4cb443cfc1e6b5803c9b4346240..e457c8057d6f9d4d02e79fae32b3d822e2aed291 100644
 --- a/pkg/node/kubelet.go
 +++ b/pkg/node/kubelet.go
 @@ -22,6 +22,7 @@ import (
@@ -1180,7 +1220,7 @@ index 8af66791..e457c805 100644
  		"clusterDNSIP":       cfg.Network.DNS,
  		"resolvConf":         resolvConf,
 diff --git a/pkg/node/kubelet_test.go b/pkg/node/kubelet_test.go
-index a98a071c..85451858 100644
+index a98a071c0f9c68af18a9e2fc016c4a2b26eb56e0..854518581d1e920812b950ae66de267c0909cd85 100644
 --- a/pkg/node/kubelet_test.go
 +++ b/pkg/node/kubelet_test.go
 @@ -47,4 +47,19 @@ reservedMemory:
@@ -1204,7 +1244,7 @@ index a98a071c..85451858 100644
 +	assert.NotContains(t, string(data), "tlsPrivateKeyFile")
  }
 diff --git a/pkg/node/netconfig.go b/pkg/node/netconfig.go
-index 35a5ca66..ed338cc7 100644
+index 35a5ca666443bbece1755e245becf0ea3fd536a3..ed338cc79ec373f0196b6cb41070f7d581d03753 100644
 --- a/pkg/node/netconfig.go
 +++ b/pkg/node/netconfig.go
 @@ -63,14 +63,18 @@ func (n *NetworkConfiguration) Run(ctx context.Context, ready chan<- struct{}, s

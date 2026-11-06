@@ -1,5 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Thibaut Lapierre <root@epheo.eu>
+Date: Fri, 6 Nov 2026 00:00:00 +0000
+Subject: [PATCH 03/11] lb-controller: skip router watch when ingress removed
+
+With ingress.status Removed the router-default service never exists, and
+the load balancer controller's router status watcher hot-loops logging
+NotFound errors. The watcher is not started then.
+
+The field sits after a blank line so gofmt leaves upstream's struct and
+literal alignment alone.
+
+Upstream: unchanged as of 5.0.
+Covered by: vm-test's steady-state journal volume check.
+---
+ pkg/loadbalancerservice/controller.go | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
 diff --git a/pkg/loadbalancerservice/controller.go b/pkg/loadbalancerservice/controller.go
-index ddbdd2f9..d0068cf9 100644
+index ddbdd2f92a0d2714d8095e9bb031365ed4ae18ee..d0068cf9e977037411263faa65511a593b4f25c5 100644
 --- a/pkg/loadbalancerservice/controller.go
 +++ b/pkg/loadbalancerservice/controller.go
 @@ -38,6 +38,8 @@ type LoadbalancerServiceController struct {

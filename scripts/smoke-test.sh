@@ -5,9 +5,9 @@
 #   - ovnkube-config carries enable-multi-network=true (patches/0001, applied
 #     at the source — no runtime ConfigMap patching)
 #   - MultiNetworkPolicy is on: enable-multi-networkpolicy=true and its CRD
-#     (patches/0011)
+#     (patches/0010)
 #   - AdminNetworkPolicy is on: enable-admin-network-policy=true and both
-#     CRDs (patches/0012)
+#     CRDs (patches/0011)
 #   - multus is deployed
 #   - r-drbd is deployed (loopback VG + thin pool backend)
 #   - the embedded portail image was imported into cri-o's store at boot

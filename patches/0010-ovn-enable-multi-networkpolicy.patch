@@ -1,5 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Thibaut Lapierre <root@epheo.eu>
+Date: Fri, 6 Nov 2026 00:00:00 +0000
+Subject: [PATCH 10/11] ovn: enable multi-networkpolicy
+
+enable-multi-networkpolicy=true, the MultiNetworkPolicy CRD (from
+cluster-network-operator) in MicroShift's CRD list so it exists before
+OVN-K starts, and the controller's rights to watch it. Needs 0001.
+
+Covered by: vm-test (a MultiNetworkPolicy cuts a pod off the layer2
+network and its removal restores it).
+---
+ .../ovn/common/clusterrole-controller.yaml    |   9 +
+ assets/components/ovn/common/configmap.yaml   |   1 +
+ assets/crd/multi-networkpolicy.crd.yaml       | 472 ++++++++++++++++++
+ pkg/assets/crd.go                             |   1 +
+ 4 files changed, 483 insertions(+)
+ create mode 100644 assets/crd/multi-networkpolicy.crd.yaml
+
 diff --git a/assets/components/ovn/common/clusterrole-controller.yaml b/assets/components/ovn/common/clusterrole-controller.yaml
-index 8568a7a..f4781f6 100644
+index 8568a7ad46b2c232efef031994239a9635b70de5..f4781f611f20e6a5e978f19cebc56a716e9c02bc 100644
 --- a/assets/components/ovn/common/clusterrole-controller.yaml
 +++ b/assets/components/ovn/common/clusterrole-controller.yaml
 @@ -144,3 +144,12 @@ rules:
@@ -16,7 +35,7 @@ index 8568a7a..f4781f6 100644
 +  - list
 +  - watch
 diff --git a/assets/components/ovn/common/configmap.yaml b/assets/components/ovn/common/configmap.yaml
-index 1c0051b..3a709b7 100644
+index d83bc16195b45c68224bf620c1225e80c97b3006..aff3f37e75d682e740a11421a2720b14c7801ae6 100644
 --- a/assets/components/ovn/common/configmap.yaml
 +++ b/assets/components/ovn/common/configmap.yaml
 @@ -30,6 +30,7 @@ data:
@@ -29,7 +48,7 @@ index 1c0051b..3a709b7 100644
      mode=local
 diff --git a/assets/crd/multi-networkpolicy.crd.yaml b/assets/crd/multi-networkpolicy.crd.yaml
 new file mode 100644
-index 0000000..93ac216
+index 0000000000000000000000000000000000000000..93ac216b5e335b75b9ac942d6d4174a9f214cbdf
 --- /dev/null
 +++ b/assets/crd/multi-networkpolicy.crd.yaml
 @@ -0,0 +1,472 @@
@@ -506,7 +525,7 @@ index 0000000..93ac216
 +              type: object
 +          type: object
 diff --git a/pkg/assets/crd.go b/pkg/assets/crd.go
-index 4c4fcdf..e48ef06 100644
+index 80c69cd559b13bb0ad6dd044516adbe53e551cf9..23df1392d149b0b5c2c51beaebf449edd8a6732f 100644
 --- a/pkg/assets/crd.go
 +++ b/pkg/assets/crd.go
 @@ -39,6 +39,7 @@ var (

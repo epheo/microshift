@@ -1,7 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Thibaut Lapierre <root@epheo.eu>
+Date: Fri, 6 Nov 2026 00:00:00 +0000
+Subject: [PATCH 02/11] etcd: default unary warn threshold
+
+The vendored etcd defines DefaultWarningUnaryRequestDuration but never
+applies it to embed configs. The threshold stays 0 and the v3rpc
+interceptor logs a warn-level "request stats" line for every request.
+
+Upstream: still unset as of 5.0 (etcd 3.6.8 NewConfig).
+Covered by: vm-test's steady-state journal volume check.
+---
+ etcd/cmd/microshift-etcd/run.go | 5 +++++
+ 1 file changed, 5 insertions(+)
+
 diff --git a/etcd/cmd/microshift-etcd/run.go b/etcd/cmd/microshift-etcd/run.go
+index a573a5c0135bced8e88c274a86cdacad6aa41f0d..4388818809346e416027f8c9f09ed04af76d4475 100644
 --- a/etcd/cmd/microshift-etcd/run.go
 +++ b/etcd/cmd/microshift-etcd/run.go
-@@ -75,6 +75,11 @@
+@@ -75,6 +75,11 @@ func (s *EtcdService) configure(cfg *config.Config) {
  
  	// based on https://github.com/openshift/cluster-etcd-operator/blob/master/bindata/bootkube/bootstrap-manifests/etcd-member-pod.yaml#L19
  	s.etcdCfg = etcd.NewConfig()
