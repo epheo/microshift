@@ -18,6 +18,9 @@ export
 
 PODMAN ?= podman
 SUDO_PODMAN ?= sudo podman
+# Base images are moving tags; never build on a stale local copy. A failed
+# check falls back to the local image.
+PULL ?= newer
 
 SRPM_IMAGE := epheo-microshift-srpm
 RPM_IMAGE  := epheo-microshift-rpm
@@ -28,7 +31,7 @@ all: srpm rpm image
 
 .PHONY: srpm
 srpm:
-	$(PODMAN) build \
+	$(PODMAN) build --pull=$(PULL) \
 	    -t "$(SRPM_IMAGE)" \
 	    --build-arg USHIFT_GIT_URL="$(USHIFT_GIT_URL)" \
 	    --build-arg USHIFT_GITREF="$(USHIFT_GITREF)" \
@@ -38,15 +41,16 @@ srpm:
 
 .PHONY: rpm
 rpm:
-	$(PODMAN) build \
+	$(PODMAN) build --pull=$(PULL) \
 	    -t "$(RPM_IMAGE)" \
 	    --ulimit nofile=524288:524288 \
 	    --build-arg BUILDROOT_IMAGE="$(BUILDROOT_IMAGE)" \
+	    --build-arg SRPM_IMAGE="localhost/$(SRPM_IMAGE):latest" \
 	    -f packaging/rpm.Containerfile .
 
 .PHONY: image
 image:
-	$(PODMAN) build \
+	$(PODMAN) build --pull=$(PULL) \
 	    -t "$(DIST_IMAGE)" \
 	    --ulimit nofile=524288:524288 \
 	    --label microshift.ref="$(USHIFT_GITREF)" \
@@ -55,6 +59,7 @@ image:
 	    --label portail.image="$(PORTAIL_IMAGE)" \
 	    --label gateway-api.version="$(GATEWAY_API_VERSION)" \
 	    --label org.opencontainers.image.revision="$(shell git rev-parse HEAD 2>/dev/null)" \
+	    --build-arg RPM_IMAGE="localhost/$(RPM_IMAGE):latest" \
 	    --build-arg BOOTC_IMAGE_URL="$(BOOTC_IMAGE_URL)" \
 	    --build-arg BOOTC_IMAGE_TAG="$(BOOTC_IMAGE_TAG)" \
 	    --build-arg PORTAIL_IMAGE="$(PORTAIL_IMAGE)" \
