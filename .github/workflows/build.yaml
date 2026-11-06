@@ -178,6 +178,31 @@ jobs:
           make vm-test-upgrade PODMAN="sudo podman" \
               UPGRADE_FROM="ghcr.io/${{ github.repository_owner }}/microshift:latest"
 
+      # Once a crossing publishes, :latest only covers same-minor upgrades,
+      # while nodes still on the previous minor cross later on their own.
+      # Skipped while that minor tag is the same image as :latest.
+      - name: Upgrade test (previous minor -> candidate)
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${{ github.repository_owner }}/microshift"
+          pinned="$(echo "${USHIFT_GITREF}" | cut -d. -f1,2)"
+          minors="$(skopeo list-tags --retry-times 3 "docker://${image}" \
+              | jq -r '.Tags[]' | grep -E '^[0-9]+\.[0-9]+$' || true)"
+          prev="$(printf '%s\n%s\n' "${minors}" "${pinned}" | grep . | sort -uV \
+              | grep -B1 -xF "${pinned}" | head -1)"
+          if [ "${prev}" = "${pinned}" ]; then
+            echo "No minor tag older than ${pinned} is published; skipping."
+            exit 0
+          fi
+          digest() { skopeo inspect --retry-times 3 --no-tags "docker://${image}:$1" | jq -r .Digest; }
+          if [ "$(digest "${prev}")" = "$(digest latest)" ]; then
+            echo ":${prev} is the image :latest already upgraded from; skipping."
+            exit 0
+          fi
+          sudo rm -rf /tmp/epheo-microshift-vm-upgrade/output
+          WORKDIR=/tmp/epheo-microshift-vm-upgrade-prev \
+              make vm-test-upgrade PODMAN="sudo podman" UPGRADE_FROM="${image}:${prev}"
+
       - name: Make VM logs readable
         if: failure()
         run: sudo chmod -R a+rX /tmp/epheo-microshift-vm* 2>/dev/null || true
