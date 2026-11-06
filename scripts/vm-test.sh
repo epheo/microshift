@@ -124,34 +124,23 @@ dump_diag() {
     tail -n 200 "${out}" 2>/dev/null || true
 }
 
-wait_ssh() {
-    log "waiting for ssh (up to 10m)"
-    for _ in $(seq 120); do
-        if vssh true 2>/dev/null; then return 0; fi
+# wait_for SECONDS WHAT CMD...: run CMD every 5s until it succeeds.
+wait_for() {
+    local secs=$1 what=$2
+    shift 2
+    log "waiting for ${what} (up to $((secs / 60))m)"
+    for _ in $(seq $((secs / 5))); do
+        "$@" 2>/dev/null && return 0
         sleep 5
     done
-    echo "ERROR: VM never became reachable over ssh" >&2
+    echo "ERROR: no ${what} after $((secs / 60))m" >&2
     return 1
 }
 
+node_ready() { koc get node | grep -q ' Ready '; }
 wait_microshift() {
-    log "waiting for microshift.service (up to 5m)"
-    for _ in $(seq 60); do
-        if vssh systemctl is-active -q microshift.service 2>/dev/null; then return 0; fi
-        sleep 5
-    done
-    echo "ERROR: microshift.service did not become active" >&2
-    return 1
-}
-
-wait_node_ready() {
-    log "waiting for the node to be Ready (up to 5m)"
-    for _ in $(seq 60); do
-        if koc get node 2>/dev/null | grep -q ' Ready '; then return 0; fi
-        sleep 5
-    done
-    echo "ERROR: node never became Ready" >&2
-    return 1
+    wait_for 300 "active microshift.service" vssh systemctl is-active -q microshift.service
+    wait_for 300 "Ready node" node_ready
 }
 
 wait_pod_running() {
@@ -282,7 +271,7 @@ sudo qemu-system-x86_64 \
     -display none -daemonize -pidfile "${WORKDIR}/qemu.pid"
 QEMU_PID="$(sudo cat "${WORKDIR}/qemu.pid")"
 
-wait_ssh
+wait_for 600 "ssh into the VM" vssh true
 
 # VG myvg1 with a thin pool named thin is the shape this image turns into an
 # r-drbd Pool and default StorageClass by itself. In upgrade mode it is made
@@ -299,7 +288,6 @@ if [ -n "${UPGRADE_FROM}" ]; then
     # No green gate on the old boot: an old release's own bugs must not be
     # able to fail the candidate's gate. The API is enough for the marker.
     wait_microshift
-    wait_node_ready
 
     log "planting upgrade survival markers (one file on /var, one etcd object)"
     vssh sh -c 'echo pre-upgrade > /var/upgrade-marker'
@@ -318,14 +306,12 @@ if [ -n "${UPGRADE_FROM}" ]; then
     log "rebooting into the candidate"
     old_boot_id="$(vssh cat /proc/sys/kernel/random/boot_id)"
     vssh reboot || true
-    log "waiting for the VM to come back (up to 10m)"
-    ok=false
-    for _ in $(seq 120); do
-        sleep 5
-        boot_id="$(vssh cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
-        if [ -n "${boot_id}" ] && [ "${boot_id}" != "${old_boot_id}" ]; then ok=true; break; fi
-    done
-    ${ok} || { echo "ERROR: VM did not come back after the upgrade reboot" >&2; exit 1; }
+    new_boot() {
+        local id
+        id="$(vssh cat /proc/sys/kernel/random/boot_id)"
+        [ -n "${id}" ] && [ "${id}" != "${old_boot_id}" ]
+    }
+    wait_for 600 "VM back from the upgrade reboot" new_boot
 fi
 
 # --- 5. Assert this is a real bootc deployment of the candidate ---------------
@@ -345,7 +331,6 @@ else
 fi
 
 wait_microshift
-wait_node_ready
 
 # Pod phases alone pass mid-rollout: an upgrade that changes a DaemonSet
 # template leaves its old pod Completed, which looks settled, while the new
@@ -374,40 +359,20 @@ done
 ${ok} || { echo "ERROR: pods did not settle (total=${total} not-ready=${bad})" >&2; koc get pods -A || true; exit 1; }
 
 # --- 6. Assert the distribution's opinions ------------------------------------
-log "assert: OVN-Kubernetes is the CNI"
-koc -n openshift-ovn-kubernetes get pods --no-headers | grep -q Running
-
-log "assert: enable-multi-network=true is native in ovnkube-config"
-koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkube\.conf}' \
-    | grep -q 'enable-multi-network=true' || {
-        echo "ERROR: enable-multi-network missing from ovnkube-config:" >&2
-        koc -n openshift-ovn-kubernetes get cm ovnkube-config -o yaml | head -40 >&2 || true
+# The probes below prove each feature works; these name the missing flag
+# when one does not.
+log "assert: ovnkube-config carries the patched-in flags natively"
+ovnkube_conf="$(koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkube\.conf}')"
+for flag in enable-multi-network enable-multi-networkpolicy enable-admin-network-policy; do
+    echo "${ovnkube_conf}" | grep -qE "^[[:space:]]*${flag}=true[[:space:]]*$" || {
+        echo "ERROR: ${flag}=true missing from ovnkube-config:" >&2
+        echo "${ovnkube_conf}" >&2
         exit 1
     }
+done
 
-log "assert: enable-multi-networkpolicy=true is native in ovnkube-config"
-koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkube\.conf}' \
-    | grep -q 'enable-multi-networkpolicy=true' || {
-        echo "ERROR: enable-multi-networkpolicy missing from ovnkube-config" >&2
-        exit 1
-    }
-
-log "assert: enable-admin-network-policy=true is native in ovnkube-config"
-koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkube\.conf}' \
-    | grep -q 'enable-admin-network-policy=true' || {
-        echo "ERROR: enable-admin-network-policy missing from ovnkube-config" >&2
-        exit 1
-    }
-
-log "assert: multus is deployed"
-koc -n openshift-multus get daemonset multus --no-headers >/dev/null
-
-log "assert: the DRBD module is loaded and r-drbd is running"
+log "assert: the DRBD module is loaded"
 vssh grep -q '^drbd ' /proc/modules
-koc -n r-drbd-system get pods --no-headers | grep -q Running
-
-log "assert: embedded portail image was imported into cri-o at boot"
-vssh crictl images | grep -q 'localhost/embedded/portail'
 
 # #12: an OS upgrade can ship a new image under the same tag. Simulate it by
 # re-pointing the portail tag at a payload image; the import must restore it.
@@ -429,15 +394,11 @@ util_img="$(koc -n openshift-ovn-kubernetes get pods -o jsonpath='{.items[0].spe
 
 # Separates a Pool that never comes up from a PVC that never binds, and
 # keeps the pod wait below for provisioning alone.
-log "waiting for the default r-drbd Pool to be Available (up to 5m)"
-ok=false
-for _ in $(seq 60); do
-    avail="$(koc get pools -o jsonpath='{range .items[*]}{.spec.vg}={.status.conditions[?(@.type=="Available")].status}{"\n"}{end}' 2>/dev/null || true)"
-    if echo "${avail}" | grep -qx "${VG_NAME}=True"; then ok=true; break; fi
-    sleep 5
-done
-${ok} || {
-    echo "ERROR: no Available r-drbd Pool for ${VG_NAME}" >&2
+pool_available() {
+    koc get pools -o jsonpath='{range .items[*]}{.spec.vg}={.status.conditions[?(@.type=="Available")].status}{"\n"}{end}' \
+        | grep -qx "${VG_NAME}=True"
+}
+wait_for 300 "Available r-drbd Pool on ${VG_NAME}" pool_available || {
     vssh systemctl status microshift-r-drbd-default-pool --no-pager >&2 || true
     koc get pools -o yaml >&2 || true
     koc -n r-drbd-system get pods >&2 || true
@@ -640,26 +601,19 @@ ${ok} || {
 # On the upgrade path the previous release may have run the router: the
 # candidate must delete it. With it gone, the greenboot gate below is the
 # regression cover for patch 0005, the quiet-journal check for 0003.
-log "assert: the router is not deployed (up to 3m)"
-ok=false
-for _ in $(seq 36); do
-    if ns="$(koc get namespace openshift-ingress --ignore-not-found -o name)" && [ -z "${ns}" ]; then
-        ok=true; break
-    fi
-    sleep 5
-done
-${ok} || {
-    echo "ERROR: openshift-ingress still exists with ingress Removed by default" >&2
+no_router() {
+    local ns
+    ns="$(koc get namespace openshift-ingress --ignore-not-found -o name)" && [ -z "${ns}" ]
+}
+wait_for 180 "router-free cluster (openshift-ingress gone)" no_router || {
     koc -n openshift-ingress get all >&2 || true
     exit 1
 }
 
 # The kustomizer applies the CRDs after the core is up and retries, so the
 # first attempts can race it.
-log "assert: the API accepts TCPRoute and UDPRoute (up to 3m)"
-ok=false
-for _ in $(seq 36); do
-    if koc apply -f - >/dev/null 2>&1 <<EOF
+routes_accepted() {
+    koc apply -f - >/dev/null <<EOF
 apiVersion: gateway.networking.k8s.io/v1alpha2
 kind: TCPRoute
 metadata:
@@ -684,11 +638,8 @@ spec:
     - name: probe
       port: 9
 EOF
-    then ok=true; break; fi
-    sleep 5
-done
-${ok} || {
-    echo "ERROR: TCPRoute/UDPRoute not served" >&2
+}
+wait_for 180 "TCPRoute and UDPRoute accepted" routes_accepted || {
     koc get crd -o name | grep gateway.networking >&2 || true
     vssh journalctl -u microshift --no-pager | grep -i kustomiz | tail -20 >&2 || true
     exit 1
@@ -721,17 +672,11 @@ fi
 # Status is GREEN"; the CS10 Rust rewrite: "greenboot health-check passed") —
 # accept both, then assert the actual contract: boot_success=1 in grubenv.
 # -b: with a persistent journal a pre-upgrade GREEN would satisfy the grep.
-log "assert: greenboot health checks passed (up to 5m)"
-ok=false
-for _ in $(seq 60); do
-    if vssh journalctl -b -u greenboot-healthcheck --no-pager 2>/dev/null \
-            | grep -qiE 'Status is GREEN|health-check passed'; then
-        ok=true; break
-    fi
-    sleep 5
-done
-${ok} || {
-    echo "ERROR: greenboot health checks did not pass" >&2
+greenboot_green() {
+    vssh journalctl -b -u greenboot-healthcheck --no-pager \
+        | grep -qiE 'Status is GREEN|health-check passed'
+}
+wait_for 300 "greenboot GREEN on this boot" greenboot_green || {
     vssh journalctl -b -u greenboot-healthcheck --no-pager | tail -30 || true
     exit 1
 }
@@ -751,14 +696,17 @@ failed="$(vssh systemctl --failed --no-legend | wc -l)"
 # both fail as runaway journal volume, and both could silently return if a
 # bump lets a patch apply cleanly against code that moved. 500 lines/2m is
 # about 10x quiet steady state and 100x under a hot loop. No message-text
-# greps: wording changes across the auto-bumped z-streams.
-log "assert: journal is quiet at steady state (2m window)"
-sleep 120
-lines="$(vssh journalctl --since=-2min --no-pager | wc -l)"
-[ "${lines}" -lt 500 ] || {
-    echo "ERROR: ${lines} journal lines in 2m, log noise regression?" >&2
-    vssh journalctl --since=-2min --no-pager | tail -40 || true
-    exit 1
-}
+# greps: wording changes across the auto-bumped z-streams. The fresh lane
+# runs the same binary, so the upgrade lanes skip the 2m wait.
+if [ -z "${UPGRADE_FROM}" ]; then
+    log "assert: journal is quiet at steady state (2m window)"
+    sleep 120
+    lines="$(vssh journalctl --since=-2min --no-pager | wc -l)"
+    [ "${lines}" -lt 500 ] || {
+        echo "ERROR: ${lines} journal lines in 2m, log noise regression?" >&2
+        vssh journalctl --since=-2min --no-pager | tail -40 || true
+        exit 1
+    }
+fi
 
 log "VM ${UPGRADE_FROM:+UPGRADE }TEST PASSED"
