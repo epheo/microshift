@@ -150,7 +150,9 @@ if it was inactive: a site relying on previously open ports must add explicit
 firewalld rules. Multinode remains upstream-unsupported and single-controller:
 losing the controller means losing the cluster, and the join credential is
 still the cluster-admin kubeconfig for its short lifetime (a scoped bootstrap
-token is the planned follow-up).
+token is the planned follow-up). Cluster-to-cluster (C2CC) routes reach pods
+on the controller only: each worker is its own OVN zone, and the route manager
+programs the controller's.
 
 Two suites gate the topology: `multinode-smoke` (containers; join
 mechanics, cert flow, cross-node pod-to-pod, pod-to-service and cluster

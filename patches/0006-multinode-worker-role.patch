@@ -301,7 +301,7 @@ index 864876e8..b4a8571d 100644
  	secret, err := client.CoreV1().Secrets("kube-system").Get(ctx, name, metav1.GetOptions{})
  	if err != nil {
 diff --git a/pkg/cmd/run.go b/pkg/cmd/run.go
-index e21fba4c..310eb310 100644
+index e21fba4c..b1d83cb7 100644
 --- a/pkg/cmd/run.go
 +++ b/pkg/cmd/run.go
 @@ -55,6 +55,7 @@ func NewRunMicroshiftCommand() *cobra.Command {
@@ -347,7 +347,7 @@ index e21fba4c..310eb310 100644
  
  		for _, w := range cfg.Warnings {
  			klog.Warningf("Configuration warning: %s", w)
-@@ -204,43 +216,72 @@ func RunMicroshift(cfg *config.Config) error {
+@@ -204,43 +216,77 @@ func RunMicroshift(cfg *config.Config) error {
  		return err
  	}
  
@@ -447,11 +447,16 @@ index e21fba4c..310eb310 100644
 +		util.Must(m.AddService(gdp.NewGenericDevicePlugin(cfg)))
 +		// Reads the kubeadmin kubeconfig, which a worker does not have.
 +		util.Must(m.AddService(c2cc.NewC2CCRouteManager(cfg)))
++		if cfg.MultiNode.Enabled && cfg.C2CC.IsEnabled() {
++			// The route manager programs this node's NB over its local socket,
++			// and every worker is its own OVN zone.
++			klog.Warning("C2CC routes reach pods on this node only: pods on worker nodes do not get them")
++		}
 +	}
  
  	// Storing and clearing the env, so other components don't send the READY=1 until MicroShift is fully ready
  	notifySocket := os.Getenv("NOTIFY_SOCKET")
-@@ -248,28 +289,32 @@ func RunMicroshift(cfg *config.Config) error {
+@@ -248,28 +294,32 @@ func RunMicroshift(cfg *config.Config) error {
  
  	startRec.ServicesStart(microshiftStart)
  
@@ -504,7 +509,7 @@ index e21fba4c..310eb310 100644
  
  	// Start everything up
  	ready, stopped := make(chan struct{}), make(chan struct{})
-@@ -302,22 +347,26 @@ func RunMicroshift(cfg *config.Config) error {
+@@ -302,22 +352,26 @@ func RunMicroshift(cfg *config.Config) error {
  		}
  
  		// After MicroShift's core becomes ready, run the kustomizer (delete and/or apply manifests).
