@@ -19,7 +19,7 @@ Published at `ghcr.io/epheo/microshift`.
 | [portail](https://github.com/epheo/portail) is the edge | its image is embedded and imported the same way; the router is off and the Gateway API experimental CRDs (TCPRoute, UDPRoute) ship with the image, see [The edge](#the-edge) |
 | Updates must be safe | greenboot MicroShift health gate stays enabled; bootc rollback does the rest |
 | Logs are signal, not noise | `patches/0002` (etcd logs every request at warn — missing threshold default) and `patches/0003` (router status watcher hot-loops when `ingress.status: Removed`) |
-| Terminated pods do not pile up | `patches/0010` adds `kubeControllerManager.terminatedPodGCThreshold`, the pod garbage collector's threshold (default unchanged, 12500); graceful node shutdown leaves every pod it stops as a terminated pod |
+| Terminated pod GC is tunable | `patches/0010` adds `kubeControllerManager.terminatedPodGCThreshold`, the pod garbage collector's threshold (default unchanged, 12500): set it lower where graceful node shutdown leaves many terminated pods |
 | Every image can be controller or worker | `microshift-profile` selects the role; `patches/0006`-`0008` add a worker mode where nodes hold no signing keys and OVN runs one interconnect zone per node |
 | The firewall is on and role-scoped | firewalld enabled with `microshift-controlplane`/`microshift-node` services; etcd is never exposed |
 | Headless and quiet | `bluetooth.service` and `fwupd-refresh.timer` masked; Red Hat client stack (`rhc`, `insights-client`, `subscription-manager`) removed: no radio daemon, no daily LVFS fetch, no registration nag or phone-home |
@@ -57,8 +57,8 @@ Three container stages, driven by `make` and pinned by `versions.env`:
    the boot import service and greenboot.
 
 Runtime dependencies (cri-o, openvswitch, openshift-clients, …) come from the
-public `mirror.openshift.com` dependencies repo. Payload images come from the
-OKD release — public, no pull secret.
+public `mirror.openshift.com` dependencies repo of the pinned minor (el9
+builds). Payload images come from the OKD release: public, no pull secret.
 
 ```sh
 make srpm rpm image        # build everything (rootless podman is fine)
@@ -78,23 +78,39 @@ make version               # print the version string of the built RPMs
 `vm-test` is the CI gate — it validates what the container smoke cannot:
 bootloader, ostree deployment, boot ordering, greenboot actually gating
 the boot, and the air-gapped contract (the fresh-install VM has zero
-egress). Its opinion assertions are functional, not existence checks: a PVC
-is provisioned and written (TopoLVM), an OVN-K layer2 secondary network is
-attached through a NetworkAttachmentDefinition, the embedded portail
-image is started from cri-o's store with pull policy Never, the API accepts
-TCPRoute and UDPRoute objects, and steady-state
-journal volume is capped (regression cover for the log-noise patches, which
-could silently go dead on a bump while still applying cleanly). `vm-test-upgrade`
-runs the same suite on the update path every existing install takes (boot
-the last published release, `bootc switch` to the candidate, reboot), so
-the upgrade itself is gated before anything publishes. `smoke` remains the fast
-inner loop for local iteration.
+egress). Its opinion assertions are functional, not existence checks:
+- a PVC is provisioned and written (TopoLVM);
+- an OVN-K layer2 secondary network is attached through a
+  NetworkAttachmentDefinition, a MultiNetworkPolicy cuts a pod off it, and
+  removing the policy restores it;
+- an AdminNetworkPolicy Deny does the same on the cluster network;
+- the router is not deployed;
+- the embedded portail image starts from cri-o's store with pull policy
+  Never, and a re-pointed embedded tag is re-imported;
+- the API accepts TCPRoute and UDPRoute objects;
+- steady-state journal volume is capped (regression cover for the log-noise
+  patches, which could silently go dead on a bump while still applying
+  cleanly).
+
+`vm-test-upgrade` runs the same suite on the update path every existing
+install takes (boot the last published release, `bootc switch` to the
+candidate, reboot), and also asserts that a file on `/var` and an etcd object
+survived, that the data version moved to the candidate's, and that the
+pre-upgrade data was backed up for a rollback. The upgrade itself is gated
+before anything publishes. `smoke` remains the fast inner loop for local
+iteration.
 
 ## Versioning
 
-Image tags: `<microshift-version>_g<commit>_<okd-tag>_epheo.<rev>` plus the
+Image tags: `<microshift-version>_g<commit>_<okd-tag>_epheo.<rev>`, with
+every dash turned into an underscore, e.g.
+`4.22.20_202610260627.p0_g9879ed9a_4.22.0_okd_scos.10_epheo.20`, plus the
 moving tags `<minor>` (e.g. `4.22`) and `latest`. `EPHEO_REV` in
 `versions.env` tracks changes to the patch/opinion set itself.
+
+A minor tag stops moving once main crosses to the next minor: it gets no more
+z-streams and no more weekly rebuilds. Follow `latest`, or a minor tag only as
+long as you accept that.
 
 ## Release cadence
 
@@ -106,6 +122,10 @@ are automatic too, gated on one condition: a stable OKD payload of the new
 minor must exist. There is no manual step in the release process — the CI
 gate is the judge, and a crossing that breaks the patch series simply fails
 the run (main stays red, nothing publishes) until `patches/` is rebased.
+
+A node configured with custom feature gates (`featureSet: CustomNoUpgrade`)
+refuses to start after any minor or major change, and greenboot rolls it
+back: such a node must not follow `latest`.
 
 ## Multinode (experimental)
 
