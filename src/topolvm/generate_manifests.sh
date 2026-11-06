@@ -6,7 +6,7 @@ ASSETS_DIR="${SCRIPT_DIR}/assets"
 RELEASE_DIR="${SCRIPT_DIR}/release"
 
 # Prepares manifests and release info for TopoLVM upstream running on MicroShift
-TOPO_LVM_VERSION=v15.5.2
+TOPO_LVM_VERSION=v17.3.1
 
 generate_manifests() {
   # Create a namespace for TopoLVM
@@ -26,6 +26,11 @@ EOF
   # NOTE: this will produce multi-arch manifest, support both amd64 and arm64
   helm repo add topolvm https://topolvm.github.io/topolvm/
   helm repo update
+  # The chart pins tag@index-digest. The payload embed stores one arch
+  # instance under the reference the pods use, which an index digest cannot
+  # name, and the same manifests serve both arches: keep the tag only.
+  local app_version
+  app_version="$(helm show chart --version="${TOPO_LVM_VERSION}" topolvm/topolvm | yq -r .appVersion)"
   # spare-gb defaults to 10 in the chart, which zeroes out usable capacity on
   # the small default LVM backend (1G) and leaves PVCs Pending with "not enough
   # free storage". Render it as 0 so the ConfigMap and the DaemonSet's
@@ -37,8 +42,7 @@ EOF
   helm template --include-crds --namespace=topolvm-system \
   --set "cert-manager.enabled=false" \
   --set "webhook.podMutatingWebhook.enabled=false" \
-  --set webhook.caBundle="dummy" \
-  --set webhook.tlsSecretName=topolvm-webhook-cert \
+  --set "image.reference=${app_version}" \
   --set "lvmd.deviceClasses[0].name=ssd" \
   --set "lvmd.deviceClasses[0].volume-group=myvg1" \
   --set "lvmd.deviceClasses[0].default=true" \
@@ -48,12 +52,17 @@ EOF
   
   helm repo remove topolvm
 
-  # remove the caBundle from the mutatingwebhookconfiguration
-  yq -i 'del(.webhooks.0.clientConfig.caBundle)' "${ASSETS_DIR}/02-topolvm.yaml"
-
   # Patch replicas to 1
   # shellcheck disable=SC2016
   yq 'select(.kind == "Deployment").spec.replicas = 1' -i "${ASSETS_DIR}/02-topolvm.yaml"
+
+  # The controller keeps the chart's required anti-affinity on hostname. With
+  # one replica on one node, a surge pod can never schedule next to the old
+  # one, and the default rollout only removes the old one once the new one is
+  # available: any template change hangs and greenboot rolls the update back.
+  # Not type Recreate: kubectl apply cannot switch a live Deployment off
+  # RollingUpdate (its defaulted rollingUpdate block is then forbidden).
+  yq 'select(.kind == "Deployment").spec.strategy = {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}}' -i "${ASSETS_DIR}/02-topolvm.yaml"
 
   # Annotate topolvm-provisioner StorageClass as default
   yq 'with(select(.kind == "StorageClass" and .metadata.name == "topolvm-provisioner");
@@ -88,27 +97,8 @@ EOF
         "path": "/healthz"
       }
     })' -i "${ASSETS_DIR}/02-topolvm.yaml"
-  # Generate Patch with annotation to dynamically inject the CA bundle
-  cat >"${ASSETS_DIR}/topolvm_mutatingwebhook_patch.yaml" <<'EOF'
-apiVersion: admissionregistration.k8s.io/v1
-kind: MutatingWebhookConfiguration
-metadata:
-  name: topolvm-hook
-  annotations:
-    service.beta.openshift.io/inject-cabundle: "true"
-webhooks:
-  - name: pvc-hook.topolvm.io
-EOF
-
-  cat >"${ASSETS_DIR}/topolvm_service_patch.yaml" <<'EOF'
-apiVersion: v1
-kind: Service
-metadata:
-  name: topolvm-controller
-  namespace: topolvm-system
-  annotations:
-    service.beta.openshift.io/serving-cert-secret-name: topolvm-mutatingwebhook
-EOF
+  # No webhook cert patches: 17.x has no PVC webhook and the pod webhook is
+  # disabled above, so the controller runs --enable-webhooks=false.
 
 # Generate kustomize
   cat >"${ASSETS_DIR}/kustomization.yaml" <<'EOF'
@@ -117,9 +107,6 @@ kind: Kustomization
 resources:
   - 01-namespace.yaml
   - 02-topolvm.yaml
-patches:
-  - path: topolvm_mutatingwebhook_patch.yaml
-  - path: topolvm_service_patch.yaml
 EOF
 }
 

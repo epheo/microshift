@@ -90,7 +90,8 @@ vm-test:
 
 # The same suite on the update path every existing install takes: boot the
 # previously published image, bootc switch to the candidate, reboot, assert.
-# Skips cleanly when UPGRADE_FROM does not exist yet (first release, forks).
+# Fails when UPGRADE_FROM cannot be pulled; UPGRADE_ALLOW_MISSING=1 skips
+# instead (first release, forks).
 UPGRADE_FROM ?= ghcr.io/epheo/microshift:latest
 
 .PHONY: vm-test-upgrade

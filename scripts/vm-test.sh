@@ -19,8 +19,9 @@
 # throwaway local registry over the QEMU user network), reboot, then
 # assert. This is the path every existing install takes on a publish;
 # switch to a local ref stands in for the bootc upgrade users run, because
-# the candidate is by definition not on ghcr yet. Exits 0 without testing
-# when UPGRADE_FROM does not exist (first release, forks).
+# the candidate is by definition not on ghcr yet. A missing UPGRADE_FROM
+# fails the run; set UPGRADE_ALLOW_MISSING=1 to skip instead (first
+# release, forks).
 #
 # Requires root-capable podman (bootc-image-builder is a privileged container
 # reading the root containers-storage) and qemu-system-x86_64. Uses KVM when
@@ -33,6 +34,8 @@ set -euo pipefail
 
 DIST_IMAGE="${DIST_IMAGE:-epheo-microshift}"
 UPGRADE_FROM="${UPGRADE_FROM:-}"
+UPGRADE_ALLOW_MISSING="${UPGRADE_ALLOW_MISSING:-}"
+USHIFT_GITREF="${USHIFT_GITREF:-$(sed -n 's/^USHIFT_GITREF=//p' "$(dirname "$0")/../versions.env")}"
 . "$(dirname "$0")/lib-diag.sh"
 WORKDIR="${WORKDIR:-/tmp/epheo-microshift-vm${UPGRADE_FROM:+-upgrade}}"
 SSH_PORT="${SSH_PORT:-2222}"
@@ -209,7 +212,11 @@ if [ -n "${UPGRADE_FROM}" ]; then
     pull_err="${WORKDIR}/pull-err.txt"
     if ! sudo podman pull -q "${UPGRADE_FROM}" 2> "${pull_err}"; then
         cat "${pull_err}" >&2
-        if grep -qiE 'manifest unknown|name unknown|not found|denied' "${pull_err}"; then
+        # ghcr answers denied for a missing package too, which an outage or an
+        # auth regression also produces: skipping is opt-in, or a broken
+        # registry would silently drop the upgrade gate and still publish.
+        if [ -n "${UPGRADE_ALLOW_MISSING}" ] && \
+                grep -qiE 'manifest unknown|name unknown|not found|denied' "${pull_err}"; then
             log "SKIPPED: nothing published at ${UPGRADE_FROM} to upgrade from"
             exit 0
         fi
@@ -296,6 +303,12 @@ if [ -n "${UPGRADE_FROM}" ]; then
     vssh sh -c 'echo pre-upgrade > /var/upgrade-marker'
     koc create configmap upgrade-marker --from-literal=probe=pre-upgrade
 
+    # The candidate's first start backs up the data under the deployment
+    # and boot recorded here, and rewrites the version.
+    pre_version="$(vssh jq -r .version /var/lib/microshift/version)"
+    pre_backup="$(vssh jq -r '.deployment_id + "_" + .boot_id' /var/lib/microshift/version)"
+    log "previous release data: version ${pre_version}, backup name ${pre_backup}"
+
     log "bootc switch to the candidate (pull over the user network)"
     vssh bootc switch "${CANDIDATE_REF}"
     vssh bootc status | grep -qF "${CANDIDATE_REF}"
@@ -335,10 +348,17 @@ wait_node_ready
 log "waiting for all pods to be Running/Completed (up to 15m)"
 ok=false
 total=0 bad=0
-for _ in $(seq 180); do
+for i in $(seq 180); do
     total="$(koc get pods -A --no-headers 2>/dev/null | wc -l)"
     bad="$(koc get pods -A --no-headers 2>/dev/null | grep -cvE 'Running|Completed' || true)"
     if [ "${total}" -ge 8 ] && [ "${bad}" -eq 0 ]; then ok=true; break; fi
+    # On the upgrade boot greenboot reboots the VM after about 10m, before
+    # this wait ends and before dump_diag can reach it: report as it goes.
+    if [ $((i % 12)) -eq 0 ]; then
+        log "still waiting: ${bad} of ${total} pods not Running/Completed"
+        koc get pods -A --no-headers 2>/dev/null | grep -vE 'Running|Completed' | head -20 || true
+        vssh journalctl -u microshift -b --no-pager 2>/dev/null | grep -i 'kustomiz' | tail -3 || true
+    fi
     sleep 5
 done
 ${ok} || { echo "ERROR: pods did not settle (total=${total} not-ready=${bad})" >&2; koc get pods -A || true; exit 1; }
@@ -387,10 +407,9 @@ vssh /usr/bin/import-embedded-images.sh | { ! grep -q '^importing'; }
 # no extra registry pull, no docker.io rate limits.
 util_img="$(koc -n openshift-ovn-kubernetes get pods -o jsonpath='{.items[0].spec.containers[0].image}')"
 
-# The PVC mutating webhook has failurePolicy Fail, and the controller pod
-# can be Running before its webhook endpoint is Ready; applying early gets
-# "no endpoints available for service topolvm-controller".
-log "waiting for the TopoLVM webhook endpoints (up to 3m)"
+# Separates a controller that never gets Ready from a PVC that never binds,
+# and keeps the pod wait below for provisioning alone.
+log "waiting for the TopoLVM controller endpoints (up to 3m)"
 ok=false
 for _ in $(seq 36); do
     ep="$(koc -n topolvm-system get endpoints topolvm-controller -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)"
@@ -398,7 +417,7 @@ for _ in $(seq 36); do
     sleep 5
 done
 ${ok} || {
-    echo "ERROR: topolvm-controller webhook endpoints never appeared" >&2
+    echo "ERROR: topolvm-controller endpoints never appeared" >&2
     koc -n topolvm-system get pods >&2 || true
     exit 1
 }
@@ -650,6 +669,23 @@ if [ -n "${UPGRADE_FROM}" ]; then
     log "assert: data survived the upgrade (/var file + etcd object)"
     vssh cat /var/upgrade-marker | grep -q pre-upgrade
     koc get configmap upgrade-marker -o jsonpath='{.data.probe}' | grep -q pre-upgrade
+
+    # A rollback can only restore what the candidate backed up, and a version
+    # file still at the old release means the data was never migrated.
+    want_version="${USHIFT_GITREF%%-*}"
+    log "assert: data version is ${want_version} (was ${pre_version})"
+    post_version="$(vssh jq -r .version /var/lib/microshift/version)"
+    [ "${post_version}" = "${want_version}" ] || {
+        echo "ERROR: data version is '${post_version}', expected '${want_version}'" >&2
+        exit 1
+    }
+
+    log "assert: the pre-upgrade data was backed up as ${pre_backup}"
+    vssh test -d "/var/lib/microshift-backups/${pre_backup}" || {
+        echo "ERROR: no backup of the pre-upgrade data" >&2
+        vssh ls -la /var/lib/microshift-backups >&2 || true
+        exit 1
+    }
 fi
 
 # The log phrasing differs between greenboot implementations (bash: "Boot
