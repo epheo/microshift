@@ -1,5 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Thibaut Lapierre <root@epheo.eu>
+Date: Fri, 6 Nov 2026 00:00:00 +0000
+Subject: [PATCH 01/11] ovn: enable multi-network
+
+OVN secondary networks (layer2 and localnet NetworkAttachmentDefinitions
+attached through multus) work out of the box: enable-multi-network=true
+goes into the ovnkube-config template itself, so no runtime ConfigMap
+edit is needed.
+
+0010 and 0011 build on it: OVN-K enables MultiNetworkPolicy only together
+with multi-network.
+
+Upstream: no config knob as of 5.0.
+Covered by: vm-test (layer2 NAD attach, MultiNetworkPolicy probe).
+---
+ assets/components/ovn/common/configmap.yaml | 1 +
+ 1 file changed, 1 insertion(+)
+
 diff --git a/assets/components/ovn/common/configmap.yaml b/assets/components/ovn/common/configmap.yaml
-index 7279ce1fb..c6abdd4c4 100644
+index 7279ce1fb83283099232f481e243bb976386295c..c6abdd4c4aad1459c34ad73f262bf8e4c4c66af8 100644
 --- a/assets/components/ovn/common/configmap.yaml
 +++ b/assets/components/ovn/common/configmap.yaml
 @@ -25,6 +25,7 @@ data:
@@ -10,3 +29,5 @@ index 7279ce1fb..c6abdd4c4 100644
  
      [gateway]
      mode=local
+
+base-commit: 0f0de241c7978084be7656d979cf11860eca08b2

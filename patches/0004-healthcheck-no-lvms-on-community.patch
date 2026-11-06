@@ -1,5 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Thibaut Lapierre <root@epheo.eu>
+Date: Fri, 6 Nov 2026 00:00:00 +0000
+Subject: [PATCH 04/11] healthcheck: no lvms on community
+
+Community builds never deploy LVMS (startCSIPlugin returns early for
+them), but the healthcheck still expected openshift-storage whenever the
+host had a volume group or /etc/microshift/lvmd.yaml, so greenboot failed
+healthy boots. lvmsIsExpected now returns false for the community
+variant, and storage config validation keeps running.
+
+Upstream: the deploy is gated on the variant, the healthcheck is not, as
+of 5.0.
+Covered by: vm-test (a VG exists on every test VM).
+---
+ pkg/healthcheck/microshift_core_workloads.go | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
 diff --git a/pkg/healthcheck/microshift_core_workloads.go b/pkg/healthcheck/microshift_core_workloads.go
-index 164ddcb3..c84d5c49 100644
+index 164ddcb3ac8245df71c0e8ed6fa6d6545ad52680..c84d5c4974b5cb82d3e61e3bc46f6c3a34ddd73c 100644
 --- a/pkg/healthcheck/microshift_core_workloads.go
 +++ b/pkg/healthcheck/microshift_core_workloads.go
 @@ -7,6 +7,7 @@ import (

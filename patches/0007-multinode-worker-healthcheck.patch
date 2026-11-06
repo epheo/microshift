@@ -1,5 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Thibaut Lapierre <root@epheo.eu>
+Date: Fri, 6 Nov 2026 00:00:00 +0000
+Subject: [PATCH 07/11] multinode: worker healthcheck
+
+The worker role marker /var/lib/microshift/multinode-worker (it holds the
+control plane IP) makes the healthcheck gate a worker on its own Node
+being Ready, the only thing its kubelet credentials can read.
+
+On a multinode control plane, DaemonSets are judged by the pod on this
+node only: a NotReady worker kept its pods unavailable and rolled the
+control plane back over another machine's outage.
+
+Covered by: unit test (own-node DaemonSet check), multinode-test (worker
+greenboot, controller green while the worker is down).
+---
+ pkg/healthcheck/healthcheck.go   | 10 ++++
+ pkg/healthcheck/own_node.go      | 82 ++++++++++++++++++++++++++++++++
+ pkg/healthcheck/own_node_test.go | 64 +++++++++++++++++++++++++
+ pkg/healthcheck/worker.go        | 49 +++++++++++++++++++
+ pkg/healthcheck/workloads.go     | 14 +++++-
+ 5 files changed, 217 insertions(+), 2 deletions(-)
+ create mode 100644 pkg/healthcheck/own_node.go
+ create mode 100644 pkg/healthcheck/own_node_test.go
+ create mode 100644 pkg/healthcheck/worker.go
+
 diff --git a/pkg/healthcheck/healthcheck.go b/pkg/healthcheck/healthcheck.go
-index bed41145..77080ac5 100644
+index bed4114588bd52e7fb3e197aa9d33245e0796e1a..77080ac5b3782b2249bcf35c49c040a433fcf539 100644
 --- a/pkg/healthcheck/healthcheck.go
 +++ b/pkg/healthcheck/healthcheck.go
 @@ -6,6 +6,8 @@ import (
@@ -28,7 +54,7 @@ index bed41145..77080ac5 100644
  		return err
 diff --git a/pkg/healthcheck/own_node.go b/pkg/healthcheck/own_node.go
 new file mode 100644
-index 00000000..9d9cd913
+index 0000000000000000000000000000000000000000..9d9cd913adf18941ace48f6fc9feaf87f540e341
 --- /dev/null
 +++ b/pkg/healthcheck/own_node.go
 @@ -0,0 +1,82 @@
@@ -116,7 +142,7 @@ index 00000000..9d9cd913
 +}
 diff --git a/pkg/healthcheck/own_node_test.go b/pkg/healthcheck/own_node_test.go
 new file mode 100644
-index 00000000..88634b88
+index 0000000000000000000000000000000000000000..88634b8863695590d5a62538ae80bfb9013aa5ab
 --- /dev/null
 +++ b/pkg/healthcheck/own_node_test.go
 @@ -0,0 +1,64 @@
@@ -186,7 +212,7 @@ index 00000000..88634b88
 +}
 diff --git a/pkg/healthcheck/worker.go b/pkg/healthcheck/worker.go
 new file mode 100644
-index 00000000..49597e79
+index 0000000000000000000000000000000000000000..49597e79e7b7472b56138f6edcecf1c8c36b0140
 --- /dev/null
 +++ b/pkg/healthcheck/worker.go
 @@ -0,0 +1,49 @@
@@ -240,7 +266,7 @@ index 00000000..49597e79
 +	})
 +}
 diff --git a/pkg/healthcheck/workloads.go b/pkg/healthcheck/workloads.go
-index 181bf883..95379264 100644
+index 181bf8832148d90622c32054d7110d0acdfad717..95379264d30f778c544af69db0f8c61848644969 100644
 --- a/pkg/healthcheck/workloads.go
 +++ b/pkg/healthcheck/workloads.go
 @@ -124,6 +124,11 @@ func waitForWorkloads(ctx context.Context, timeout time.Duration, workloads map[

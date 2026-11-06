@@ -1,5 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Thibaut Lapierre <root@epheo.eu>
+Date: Fri, 6 Nov 2026 00:00:00 +0000
+Subject: [PATCH 11/11] ovn: enable admin network policy
+
+enable-admin-network-policy=true, the AdminNetworkPolicy and
+BaselineAdminNetworkPolicy CRDs (from cluster-network-operator) in
+MicroShift's CRD list, and the controller's rights to read them and patch
+their status. Needs 0010's RBAC context.
+
+Covered by: vm-test (an AdminNetworkPolicy Deny cuts a pod off the
+cluster network and its removal restores it).
+---
+ .../ovn/common/clusterrole-controller.yaml    |   17 +
+ assets/components/ovn/common/configmap.yaml   |    1 +
+ assets/crd/admin-network-policy.crd.yaml      | 1084 +++++++++++++++++
+ .../baseline-admin-network-policy.crd.yaml    | 1059 ++++++++++++++++
+ pkg/assets/crd.go                             |    2 +
+ 5 files changed, 2163 insertions(+)
+ create mode 100644 assets/crd/admin-network-policy.crd.yaml
+ create mode 100644 assets/crd/baseline-admin-network-policy.crd.yaml
+
 diff --git a/assets/components/ovn/common/clusterrole-controller.yaml b/assets/components/ovn/common/clusterrole-controller.yaml
-index f4781f6..3233940 100644
+index f4781f611f20e6a5e978f19cebc56a716e9c02bc..323394004c7077593cb33a8f9d6c889c497434e5 100644
 --- a/assets/components/ovn/common/clusterrole-controller.yaml
 +++ b/assets/components/ovn/common/clusterrole-controller.yaml
 @@ -153,3 +153,20 @@ rules:
@@ -24,7 +46,7 @@ index f4781f6..3233940 100644
 +  verbs:
 +  - patch
 diff --git a/assets/components/ovn/common/configmap.yaml b/assets/components/ovn/common/configmap.yaml
-index 3a709b7..33573b6 100644
+index aff3f37e75d682e740a11421a2720b14c7801ae6..b9d6899434ee0e7e541e6695df30ef22668be72e 100644
 --- a/assets/components/ovn/common/configmap.yaml
 +++ b/assets/components/ovn/common/configmap.yaml
 @@ -31,6 +31,7 @@ data:
@@ -37,7 +59,7 @@ index 3a709b7..33573b6 100644
      mode=local
 diff --git a/assets/crd/admin-network-policy.crd.yaml b/assets/crd/admin-network-policy.crd.yaml
 new file mode 100644
-index 0000000..18d3e14
+index 0000000000000000000000000000000000000000..18d3e14ede364db1001248c57b403b5c45bd2301
 --- /dev/null
 +++ b/assets/crd/admin-network-policy.crd.yaml
 @@ -0,0 +1,1084 @@
@@ -1127,7 +1149,7 @@ index 0000000..18d3e14
 +  storedVersions: null
 diff --git a/assets/crd/baseline-admin-network-policy.crd.yaml b/assets/crd/baseline-admin-network-policy.crd.yaml
 new file mode 100644
-index 0000000..2cd65a6
+index 0000000000000000000000000000000000000000..2cd65a67a58ce680d01850b80cf70d01e2e16c45
 --- /dev/null
 +++ b/assets/crd/baseline-admin-network-policy.crd.yaml
 @@ -0,0 +1,1059 @@
@@ -2191,7 +2213,7 @@ index 0000000..2cd65a6
 +  conditions: null
 +  storedVersions: null
 diff --git a/pkg/assets/crd.go b/pkg/assets/crd.go
-index e48ef06..3d526f6 100644
+index 23df1392d149b0b5c2c51beaebf449edd8a6732f..ec21e1c12ea26936d2e732cf51c51fd4a38b847d 100644
 --- a/pkg/assets/crd.go
 +++ b/pkg/assets/crd.go
 @@ -40,6 +40,8 @@ var (
