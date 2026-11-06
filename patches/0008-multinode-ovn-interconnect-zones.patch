@@ -27,12 +27,11 @@ Covered by: vm-test (single node), multinode-smoke and multinode-test
  assets/components/ovn/common/configmap.yaml   |   4 +
  .../ovn/zones/master/daemonset.yaml           |  92 +++
  .../components/ovn/zones/node/daemonset.yaml  | 572 ++++++++++++++++++
- pkg/cmd/addnode.go                            |  47 +-
  pkg/components/networking.go                  |  37 +-
  pkg/config/multinode.go                       |  22 +
  pkg/node/netconfig.go                         | 152 +++++
  scripts/microshift-cleanup-data.sh            |   4 +
- 9 files changed, 946 insertions(+), 13 deletions(-)
+ 8 files changed, 900 insertions(+), 12 deletions(-)
  create mode 100644 assets/components/ovn/zones/master/daemonset.yaml
  create mode 100644 assets/components/ovn/zones/node/daemonset.yaml
 
@@ -772,79 +771,6 @@ index 0000000000000000000000000000000000000000..092c944af23596db4d40f1a923955876
 +          optional: true
 +      tolerations:
 +      - operator: "Exists"
-diff --git a/pkg/cmd/addnode.go b/pkg/cmd/addnode.go
-index b4a8571dc2d3b6cd65cca94e10b8609eb7edd83f..d6e3fb19a284fec806cbc90b67169d541af8d270 100644
---- a/pkg/cmd/addnode.go
-+++ b/pkg/cmd/addnode.go
-@@ -6,6 +6,7 @@ import (
- 	"fmt"
- 	"math/big"
- 	"net"
-+	"net/url"
- 	"os"
- 	"os/exec"
- 	"path/filepath"
-@@ -201,8 +202,15 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
- 
- 	// Role marker for role-agnostic tools (healthcheck, greenboot); a
- 	// re-join with a different role must not leave a stale marker behind.
-+	// The marker carries the control plane's routable IP: the worker needs
-+	// it at runtime to route the virtual advertise address off-node, and
-+	// the bootstrap kubeconfig is the only artifact that knows it.
- 	if opts.Worker {
--		if err := os.WriteFile(config.WorkerMarkerPath(), []byte{}, 0600); err != nil {
-+		cpIP, err := resolveControlplaneIP(opts.KubeconfigPath)
-+		if err != nil {
-+			return fmt.Errorf("failed to resolve the control plane address: %w", err)
-+		}
-+		if err := os.WriteFile(config.WorkerMarkerPath(), []byte(cpIP+"\n"), 0600); err != nil {
- 			return fmt.Errorf("failed to write worker marker: %w", err)
- 		}
- 	} else if err := os.Remove(config.WorkerMarkerPath()); err != nil && !os.IsNotExist(err) {
-@@ -227,6 +235,43 @@ func runAddNode(ctx context.Context, opts *AddNodeOptions) error {
- 	return nil
- }
- 
-+func resolveControlplaneIP(kubeconfigPath string) (string, error) {
-+	kc, err := clientcmd.LoadFromFile(kubeconfigPath)
-+	if err != nil {
-+		return "", err
-+	}
-+	server := ""
-+	for _, cluster := range kc.Clusters {
-+		server = cluster.Server
-+		break
-+	}
-+	if server == "" {
-+		return "", fmt.Errorf("no cluster in bootstrap kubeconfig")
-+	}
-+	u, err := url.Parse(server)
-+	if err != nil {
-+		return "", err
-+	}
-+	host := u.Hostname()
-+	if ip := net.ParseIP(host); ip != nil {
-+		return ip.String(), nil
-+	}
-+	addrs, err := net.LookupHost(host)
-+	if err != nil {
-+		return "", err
-+	}
-+	// The route added from this value is v4; prefer a v4 answer.
-+	for _, a := range addrs {
-+		if ip := net.ParseIP(a); ip != nil && ip.To4() != nil {
-+			return ip.String(), nil
-+		}
-+	}
-+	if len(addrs) > 0 {
-+		return addrs[0], nil
-+	}
-+	return "", fmt.Errorf("cannot resolve control plane host %q", host)
-+}
-+
- func createKubernetesClient(kubeconfigPath string) (*kubernetes.Clientset, error) {
- 	exists, err := util.PathExists(kubeconfigPath)
- 	if err != nil {
 diff --git a/pkg/components/networking.go b/pkg/components/networking.go
 index 2e6ccad9277804a654da96211260881e0bca1fdd..223337befda30a0fefd0551683b42fe7ed3126fb 100644
 --- a/pkg/components/networking.go
