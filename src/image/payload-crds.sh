@@ -15,10 +15,20 @@ root=$3
 yq="${root}/_output/bin/yq"
 [ -x "${yq}" ] || "${root}/scripts/fetch_tools.sh" yq
 
-cno="$(oc adm release info --image-for=cluster-network-operator "${okd_url}:${tag}")"
+# quay's CDN drops blobs mid-transfer (unexpected EOF) under CI load.
+retry() {
+    local i
+    for i in 1 2 3 4; do
+        "$@" && return 0
+        [ "${i}" = 4 ] || { echo "retrying in 15s: $1 $2" >&2; sleep 15; }
+    done
+    return 1
+}
+
+cno="$(retry oc adm release info --image-for=cluster-network-operator "${okd_url}:${tag}")"
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
-oc image extract "${cno}" \
+retry oc image extract "${cno}" \
     --path "/bindata/network/ovn-kubernetes/common/001-crd.yaml:${work}" \
     --path "/bindata/network/multus-networkpolicy/001-scheme.yaml:${work}"
 
