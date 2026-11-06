@@ -11,7 +11,11 @@ kubeconfig. Every node here is its own OVN interconnect zone instead:
   ovn-controller plus a combined zone controller (--zone $K8S_NODE) on
   every node; the master DaemonSet runs the cluster manager only.
 - Service-account auth with apiserver= in ovnkube.conf (net.JoinHostPort,
-  so IPv6 control planes work), plus the RBAC that needs.
+  so IPv6 control planes work). The cluster manager keeps the controller
+  account; zone pods get ovn-kubernetes-node-limited, the
+  cluster-network-operator's node-limited role minus CSRs, since root on
+  any worker holds that token: pods and nodes written through status only,
+  ConfigMaps and leases in openshift-ovn-kubernetes only.
 - The NB zone is named after the node in nbdb's postStart.
 - Workers get their node IP as a host alias on br-ex and a route to the
   apiserver advertise address via the control plane.
@@ -26,14 +30,24 @@ Covered by: vm-test (single node), multinode-smoke and multinode-test
  .../ovn/common/clusterrole-controller.yaml    |  29 +
  assets/components/ovn/common/configmap.yaml   |   4 +
  .../ovn/zones/master/daemonset.yaml           |  92 +++
- .../components/ovn/zones/node/daemonset.yaml  | 572 ++++++++++++++++++
- pkg/components/networking.go                  |  37 +-
+ .../ovn/zones/node/clusterrole.yaml           | 111 ++++
+ .../ovn/zones/node/clusterrolebinding.yaml    |  13 +
+ .../components/ovn/zones/node/daemonset.yaml  | 571 ++++++++++++++++++
+ assets/components/ovn/zones/node/role.yaml    |  27 +
+ .../ovn/zones/node/rolebinding.yaml           |  14 +
+ .../ovn/zones/node/serviceaccount.yaml        |   8 +
+ pkg/components/networking.go                  |  40 +-
  pkg/config/multinode.go                       |  22 +
  pkg/node/netconfig.go                         | 152 +++++
  scripts/microshift-cleanup-data.sh            |   4 +
- 8 files changed, 900 insertions(+), 12 deletions(-)
+ 13 files changed, 1076 insertions(+), 11 deletions(-)
  create mode 100644 assets/components/ovn/zones/master/daemonset.yaml
+ create mode 100644 assets/components/ovn/zones/node/clusterrole.yaml
+ create mode 100644 assets/components/ovn/zones/node/clusterrolebinding.yaml
  create mode 100644 assets/components/ovn/zones/node/daemonset.yaml
+ create mode 100644 assets/components/ovn/zones/node/role.yaml
+ create mode 100644 assets/components/ovn/zones/node/rolebinding.yaml
+ create mode 100644 assets/components/ovn/zones/node/serviceaccount.yaml
 
 diff --git a/assets/components/ovn/common/clusterrole-controller.yaml b/assets/components/ovn/common/clusterrole-controller.yaml
 index be69d281eb8ceaac9de7f30b5110873162d950ef..8568a7ad46b2c232efef031994239a9635b70de5 100644
@@ -193,12 +207,148 @@ index 0000000000000000000000000000000000000000..18ae72b05b148bf16b8ea79208690574
 +          optional: true
 +      tolerations:
 +      - operator: "Exists"
+diff --git a/assets/components/ovn/zones/node/clusterrole.yaml b/assets/components/ovn/zones/node/clusterrole.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..c95cc228cf706f7a82c21f01d7fb095cccdaeeb1
+--- /dev/null
++++ b/assets/components/ovn/zones/node/clusterrole.yaml
+@@ -0,0 +1,111 @@
++# cluster-network-operator's openshift-ovn-kubernetes-node-limited, the role
++# OpenShift gives interconnect zone pods, minus CSRs: zones here authenticate
++# with the service account token, not per-node certificates.
++# Pods and nodes are written through status only, never a full patch.
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRole
++metadata:
++  name: openshift-ovn-kubernetes-node-limited
++rules:
++- apiGroups: [""]
++  resources:
++  - pods/status
++  - nodes/status
++  verbs:
++  - patch
++  - update
++- apiGroups: [""]
++  resources:
++  - namespaces
++  - nodes
++  - pods
++  verbs:
++  - get
++  - list
++  - watch
++- apiGroups: [""]
++  resources:
++  - endpoints
++  - services
++  verbs:
++  - get
++  - list
++  - watch
++- apiGroups:
++  - discovery.k8s.io
++  resources:
++  - endpointslices
++  verbs:
++  - list
++  - watch
++- apiGroups: ["networking.k8s.io"]
++  resources:
++  - networkpolicies
++  verbs:
++  - get
++  - list
++  - watch
++- apiGroups: ["", "events.k8s.io"]
++  resources:
++  - events
++  verbs:
++  - create
++  - patch
++  - update
++- apiGroups: ["apiextensions.k8s.io"]
++  resources:
++  - customresourcedefinitions
++  verbs:
++  - get
++  - list
++  - watch
++- apiGroups: ["security.openshift.io"]
++  resources:
++  - securitycontextconstraints
++  verbs:
++  - use
++  resourceNames:
++  - privileged
++- apiGroups: ["k8s.ovn.org"]
++  resources:
++  - adminpolicybasedexternalroutes
++  - egressfirewalls
++  - egressips
++  - egressqoses
++  - egressservices
++  - userdefinednetworks
++  - clusteruserdefinednetworks
++  verbs:
++  - get
++  - list
++  - watch
++- apiGroups: ["k8s.ovn.org"]
++  resources:
++  - adminpolicybasedexternalroutes/status
++  - egressfirewalls/status
++  - egressqoses/status
++  verbs:
++  - patch
++- apiGroups: ["policy.networking.k8s.io"]
++  resources:
++  - adminnetworkpolicies
++  - baselineadminnetworkpolicies
++  verbs:
++  - get
++  - list
++  - watch
++- apiGroups: ["policy.networking.k8s.io"]
++  resources:
++  - adminnetworkpolicies/status
++  - baselineadminnetworkpolicies/status
++  verbs:
++  - patch
++- apiGroups: ["k8s.cni.cncf.io"]
++  resources:
++  - network-attachment-definitions
++  - multi-networkpolicies
++  verbs:
++  - get
++  - list
++  - watch
+diff --git a/assets/components/ovn/zones/node/clusterrolebinding.yaml b/assets/components/ovn/zones/node/clusterrolebinding.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..1dcce90b203da79d6635348db7c802b3ddd75519
+--- /dev/null
++++ b/assets/components/ovn/zones/node/clusterrolebinding.yaml
+@@ -0,0 +1,13 @@
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: ClusterRoleBinding
++metadata:
++  name: openshift-ovn-kubernetes-node-limited
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: ClusterRole
++  name: openshift-ovn-kubernetes-node-limited
++subjects:
++- kind: ServiceAccount
++  name: ovn-kubernetes-node-limited
++  namespace: openshift-ovn-kubernetes
 diff --git a/assets/components/ovn/zones/node/daemonset.yaml b/assets/components/ovn/zones/node/daemonset.yaml
 new file mode 100644
-index 0000000000000000000000000000000000000000..092c944af23596db4d40f1a923955876ce76f6dc
+index 0000000000000000000000000000000000000000..1cda74fa6d010148a0d762fbdec46e683ca286d7
 --- /dev/null
 +++ b/assets/components/ovn/zones/node/daemonset.yaml
-@@ -0,0 +1,572 @@
+@@ -0,0 +1,571 @@
 +# Carried by the distribution in place of multi-node/node/daemonset.yaml:
 +# one OVN interconnect zone per node, no database raft across nodes.
 +---
@@ -236,11 +386,10 @@ index 0000000000000000000000000000000000000000..092c944af23596db4d40f1a923955876
 +        kubernetes.io/os: "linux"
 +        microshift.io/ipfamilypolicy: '{{.IPFamily}}'
 +    spec:
-+      # The zone controller writes cluster-scoped state (node annotations,
-+      # logical topology), which is controller-level access; workers hold no
-+      # kubeadmin material, so auth is the pod service account (see the
-+      # [kubernetes] section of ovnkube-config).
-+      serviceAccountName: ovn-kubernetes-controller
++      # Workers hold no kubeadmin material, so auth is the pod service
++      # account (see the [kubernetes] section of ovnkube-config). Not the
++      # controller's: every node holds this token (see serviceaccount.yaml).
++      serviceAccountName: ovn-kubernetes-node-limited
 +      hostNetwork: true
 +      hostPID: true
 +      dnsPolicy: Default
@@ -771,8 +920,75 @@ index 0000000000000000000000000000000000000000..092c944af23596db4d40f1a923955876
 +          optional: true
 +      tolerations:
 +      - operator: "Exists"
+diff --git a/assets/components/ovn/zones/node/role.yaml b/assets/components/ovn/zones/node/role.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce22718e8e5e3f799c2a474cd38194507347a98d
+--- /dev/null
++++ b/assets/components/ovn/zones/node/role.yaml
+@@ -0,0 +1,27 @@
++# ConfigMap and lease writes stay in this namespace: cluster-wide, a worker
++# could rewrite kube-system/kubelet-client-ca and reach every kubelet.
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: openshift-ovn-kubernetes-node-limited
++  namespace: openshift-ovn-kubernetes
++rules:
++- apiGroups: [""]
++  resources:
++  - configmaps
++  verbs:
++  - create
++  - get
++  - list
++  - patch
++  - update
++  - watch
++- apiGroups: ["coordination.k8s.io"]
++  resources:
++  - leases
++  verbs:
++  - create
++  - get
++  - list
++  - update
+diff --git a/assets/components/ovn/zones/node/rolebinding.yaml b/assets/components/ovn/zones/node/rolebinding.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..df2952155512ee27ea32ce62f06db941c9cc63e9
+--- /dev/null
++++ b/assets/components/ovn/zones/node/rolebinding.yaml
+@@ -0,0 +1,14 @@
++---
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: openshift-ovn-kubernetes-node-limited
++  namespace: openshift-ovn-kubernetes
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: Role
++  name: openshift-ovn-kubernetes-node-limited
++subjects:
++- kind: ServiceAccount
++  name: ovn-kubernetes-node-limited
++  namespace: openshift-ovn-kubernetes
+diff --git a/assets/components/ovn/zones/node/serviceaccount.yaml b/assets/components/ovn/zones/node/serviceaccount.yaml
+new file mode 100644
+index 0000000000000000000000000000000000000000..75df26a0f571dee667b200131b27fa5778fe6f40
+--- /dev/null
++++ b/assets/components/ovn/zones/node/serviceaccount.yaml
+@@ -0,0 +1,8 @@
++# Every node's zone pod runs with this account, workers included: root on
++# any node holds its token. Keep it to what a zone needs (see clusterrole.yaml).
++---
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: ovn-kubernetes-node-limited
++  namespace: openshift-ovn-kubernetes
 diff --git a/pkg/components/networking.go b/pkg/components/networking.go
-index 2e6ccad9277804a654da96211260881e0bca1fdd..223337befda30a0fefd0551683b42fe7ed3126fb 100644
+index 2e6ccad9277804a654da96211260881e0bca1fdd..a329f8ca41189065b3edb6ab3e534c6e5fe0760f 100644
 --- a/pkg/components/networking.go
 +++ b/pkg/components/networking.go
 @@ -4,6 +4,7 @@ import (
@@ -783,7 +999,7 @@ index 2e6ccad9277804a654da96211260881e0bca1fdd..223337befda30a0fefd0551683b42fe7
  	"path/filepath"
  	"runtime"
  	"strings"
-@@ -61,9 +62,12 @@ func startCNIPlugin(ctx context.Context, cfg *config.Config, kubeconfigPath stri
+@@ -61,10 +62,18 @@ func startCNIPlugin(ctx context.Context, cfg *config.Config, kubeconfigPath stri
  	)
  
  	if cfg.MultiNode.Enabled {
@@ -796,9 +1012,15 @@ index 2e6ccad9277804a654da96211260881e0bca1fdd..223337befda30a0fefd0551683b42fe7
 +			"components/ovn/zones/master/daemonset.yaml",
 +			"components/ovn/zones/node/daemonset.yaml",
  		}
++		sa = append(sa, "components/ovn/zones/node/serviceaccount.yaml")
++		r = append(r, "components/ovn/zones/node/role.yaml")
++		rb = append(rb, "components/ovn/zones/node/rolebinding.yaml")
++		cr = append(cr, "components/ovn/zones/node/clusterrole.yaml")
++		crb = append(crb, "components/ovn/zones/node/clusterrolebinding.yaml")
  	}
  
-@@ -110,17 +114,26 @@ func startCNIPlugin(ctx context.Context, cfg *config.Config, kubeconfigPath stri
+ 	ipFamily := netlink.FAMILY_ALL
+@@ -110,17 +119,26 @@ func startCNIPlugin(ctx context.Context, cfg *config.Config, kubeconfigPath stri
  		return err
  	}
  
@@ -813,17 +1035,16 @@ index 2e6ccad9277804a654da96211260881e0bca1fdd..223337befda30a0fefd0551683b42fe7
 -		"KubeconfigDir":  filepath.Join(config.DataDir, "/resources/kubeadmin"),
 -		"OVN_NB_PORT":    ovn.OVN_NB_PORT,
 -		"OVN_SB_PORT":    ovn.OVN_SB_PORT,
--	}
--	if err := assets.ApplyConfigMaps(ctx, cm, renderTemplate, renderParamsFromConfig(cfg, extraParams), kubeconfigPath); err != nil {
--		klog.Warningf("Failed to apply configMap %v %v", cm, err)
--		return err
 +		"OVNConfig":        ovnConfig,
 +		"KubeconfigPath":   kubeconfigPath,
 +		"KubeconfigDir":    filepath.Join(config.DataDir, "/resources/kubeadmin"),
 +		"MultiNodeEnabled": cfg.MultiNode.Enabled,
 +		// JoinHostPort brackets an IPv6 control plane address.
 +		"MultiNodeAPIServer": net.JoinHostPort(cfg.MultiNode.Controlplane, "6443"),
-+	}
+ 	}
+-	if err := assets.ApplyConfigMaps(ctx, cm, renderTemplate, renderParamsFromConfig(cfg, extraParams), kubeconfigPath); err != nil {
+-		klog.Warningf("Failed to apply configMap %v %v", cm, err)
+-		return err
 +	// The configmap carries the control plane's apiserver address. Only the
 +	// control plane may write it; a joined replica would overwrite that
 +	// address with its own for every node that reads the configmap afterwards.

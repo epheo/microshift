@@ -7,6 +7,8 @@
 #     controller's kubelet-csr-approver approves them
 #   - apiserver -> kubelet TLS works with the CSR-issued serving cert
 #   - OVN and DNS daemonsets land and run on the worker
+#   - the zone pods' account, which every worker holds, writes nothing
+#     outside openshift-ovn-kubernetes but pod and node status
 #   - 'microshift healthcheck' gates on the worker's own readiness
 # bootc deployment and greenboot boot-gating remain vm-test territory.
 #
@@ -231,6 +233,26 @@ fi
 if wexec test -f /var/lib/microshift/resources/kube-apiserver/secrets/service-account-key/service-account.key; then
     echo "ERROR: service account key found on the worker" >&2; exit 1
 fi
+
+# Root on a worker holds the zone pod's token. It must not be the
+# controller's account: that one writes any ConfigMap, kube-system's
+# kubelet-client-ca included. The status patch is the control: it proves the
+# probe reads RBAC rather than failing for another reason.
+log "assert: the worker's OVN account writes nothing outside its namespace"
+sa=system:serviceaccount:openshift-ovn-kubernetes:ovn-kubernetes-node-limited
+ds_sa="$(koc -n openshift-ovn-kubernetes get ds ovnkube-node -o jsonpath='{.spec.template.spec.serviceAccountName}')"
+[ "${ds_sa}" = ovn-kubernetes-node-limited ] \
+    || { echo "ERROR: ovnkube-node runs as '${ds_sa}'" >&2; exit 1; }
+can() { koc auth can-i --as="${sa}" "$@" 2>/dev/null || true; }
+[ "$(can patch pods --subresource=status -n default)" = yes ] \
+    || { echo "ERROR: ${sa} cannot patch pod status; the probe below proves nothing" >&2; exit 1; }
+for probe in "update configmaps -n kube-system" "patch pods -n default" \
+        "patch nodes" "delete pods -n default"; do
+    # shellcheck disable=SC2086
+    if [ "$(can ${probe})" != no ]; then
+        echo "ERROR: ${sa} may ${probe}" >&2; exit 1
+    fi
+done
 
 log "assert: kubelet serving CSR was approved and issued (up to 2m)"
 # The approver ticks every 30s and node-Ready does not depend on the serving
