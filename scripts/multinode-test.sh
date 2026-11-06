@@ -275,14 +275,12 @@ log "joining node2 as a worker (microshift-profile worker + add-node --worker)"
 node_config v2 node2 "${IP2}"
 v2 microshift-profile worker
 v2 systemctl enable microshift
-BOOTSTRAP="/var/lib/microshift/resources/kubeadmin/${IP1}/kubeconfig"
-scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
-    -i "${WORKDIR}/id" "root@${IP1}:${BOOTSTRAP}" "${WORKDIR}/bootstrap-kubeconfig"
+v1 microshift worker-join-kubeconfig --address "${IP1}" --duration 30m > "${WORKDIR}/bootstrap-kubeconfig"
 scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
     -i "${WORKDIR}/id" "${WORKDIR}/bootstrap-kubeconfig" "root@${IP2}:/root/bootstrap-kubeconfig"
 v2 microshift add-node --worker --kubeconfig /root/bootstrap-kubeconfig
 
-log "assert: the join left no copy of the cluster-admin kubeconfig"
+log "assert: the join left no copy of its credential"
 if v2 test -e /var/lib/microshift/bootstrap/kubeconfig; then
     die "add-node left its bootstrap kubeconfig on the worker"
 fi

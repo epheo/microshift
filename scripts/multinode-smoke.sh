@@ -2,7 +2,8 @@
 # Two privileged containers on one podman network: a controller (default
 # profile) and a worker joined with 'microshift add-node --worker'. Asserts
 # the join mechanics the single-node smoke cannot:
-#   - the worker holds no signing material (no ca.key, no SA key)
+#   - the worker joins with a short-lived token that can create CSRs and
+#     nothing an admin could, and holds no signing material
 #   - the kubelet bootstraps client + serving certs through CSRs and the
 #     controller's kubelet-csr-approver approves them
 #   - apiserver -> kubelet TLS works with the CSR-issued serving cert
@@ -193,18 +194,32 @@ ${ok} || { echo "ERROR: controller pods did not settle (total=${total} not-ready
 log "assert: worker profile is detected"
 [ "$(wexec microshift-profile | tr -d '[:space:]')" = "worker" ]
 
-# The hostname kubeadmin kubeconfig: its URL resolves over the podman network
-# and the external serving cert covers the hostname.
-log "fetching the bootstrap kubeconfig from the controller"
+# The hostname resolves over the podman network and the controller's external
+# serving cert covers it.
+log "minting a join kubeconfig on the controller"
 boot_kc="$(mktemp)"
-cexec cat "/var/lib/microshift/resources/kubeadmin/${CTRL}/kubeconfig" > "${boot_kc}"
+cexec microshift worker-join-kubeconfig --address "${CTRL}" --duration 30m > "${boot_kc}"
 sudo podman cp "${boot_kc}" "${WORKER}:/tmp/bootstrap-kubeconfig"
 rm -f "${boot_kc}"
+
+# The join token replaces the cluster-admin kubeconfig. Creating CSRs is the
+# control: it proves the probe reads RBAC rather than failing to connect.
+log "assert: the join token creates CSRs and nothing an admin could"
+can_join() { wexec oc --kubeconfig /tmp/bootstrap-kubeconfig auth can-i "$@" 2>/dev/null || true; }
+[ "$(can_join create certificatesigningrequests)" = yes ] \
+    || { echo "ERROR: the join token cannot create CSRs; the probe below proves nothing" >&2; exit 1; }
+for probe in "get secrets -n kube-system" "create pods -n default" \
+        "update configmaps -n kube-system" "list nodes"; do
+    # shellcheck disable=SC2086
+    if [ "$(can_join ${probe})" != no ]; then
+        echo "ERROR: the join token may ${probe}" >&2; exit 1
+    fi
+done
 
 log "joining the worker (microshift add-node --worker, up to 10m)"
 wexec microshift add-node --worker --kubeconfig /tmp/bootstrap-kubeconfig
 
-log "assert: the join left no copy of the cluster-admin kubeconfig"
+log "assert: the join left no copy of its credential"
 if wexec test -e /var/lib/microshift/bootstrap/kubeconfig; then
     echo "ERROR: add-node left its bootstrap kubeconfig on the worker" >&2; exit 1
 fi
