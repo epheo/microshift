@@ -345,17 +345,25 @@ fi
 wait_microshift
 wait_node_ready
 
-log "waiting for all pods to be Running/Completed (up to 15m)"
+# Pod phases alone pass mid-rollout: an upgrade that changes a DaemonSet
+# template leaves its old pod Completed, which looks settled, while the new
+# one is not up yet. Every DaemonSet and Deployment must also be fully
+# rolled out (observed, updated and available everywhere it is wanted).
+rollouts_done() {
+    koc get daemonsets,deployments -A -o jsonpath='{range .items[*]}{.metadata.generation}|{.status.observedGeneration}|{.status.desiredNumberScheduled}{.spec.replicas}|{.status.updatedNumberScheduled}{.status.updatedReplicas}|{.status.numberAvailable}{.status.availableReplicas}{"\n"}{end}' 2>/dev/null \
+        | awk -F'|' 'NF == 5 { n++; if ($1 != $2 || $4+0 != $3+0 || $5+0 != $3+0) bad = 1 } END { exit (bad || n == 0) }'
+}
+log "waiting for all pods to be Running/Completed and rollouts done (up to 15m)"
 ok=false
 total=0 bad=0
 for i in $(seq 180); do
     total="$(koc get pods -A --no-headers 2>/dev/null | wc -l)"
     bad="$(koc get pods -A --no-headers 2>/dev/null | grep -cvE 'Running|Completed' || true)"
-    if [ "${total}" -ge 8 ] && [ "${bad}" -eq 0 ]; then ok=true; break; fi
+    if [ "${total}" -ge 8 ] && [ "${bad}" -eq 0 ] && rollouts_done; then ok=true; break; fi
     # On the upgrade boot greenboot reboots the VM after about 10m, before
     # this wait ends and before dump_diag can reach it: report as it goes.
     if [ $((i % 12)) -eq 0 ]; then
-        log "still waiting: ${bad} of ${total} pods not Running/Completed"
+        log "still waiting: ${bad} of ${total} pods not Running/Completed, or a rollout in progress"
         koc get pods -A --no-headers 2>/dev/null | grep -vE 'Running|Completed' | head -20 || true
         vssh journalctl -u microshift -b --no-pager 2>/dev/null | grep -i 'kustomiz' | tail -3 || true
     fi
