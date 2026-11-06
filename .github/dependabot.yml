@@ -1,8 +1,9 @@
 version: 2
 updates:
   # Actions are pinned by commit sha; this keeps the pins moving.
+  # The composite actions carry pins too; the root alone covers workflows only.
   - package-ecosystem: github-actions
-    directory: /
+    directories: ["/", "/.github/actions/*"]
     schedule:
       interval: monthly
     groups:

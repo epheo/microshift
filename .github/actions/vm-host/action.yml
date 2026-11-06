@@ -1,0 +1,34 @@
+name: Prepare the runner for VMs
+description: KVM for every user and qemu; dnsmasq for the tests that run their own on a bridge.
+inputs:
+  dnsmasq:
+    description: Install dnsmasq, with its global service off
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - name: Enable KVM for the runner
+      shell: bash
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+          | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+
+    - name: Install qemu
+      shell: bash
+      env:
+        DNSMASQ: ${{ inputs.dnsmasq }}
+      run: |
+        set -euo pipefail
+        pkgs="qemu-system-x86"
+        [ "${DNSMASQ}" = "true" ] && pkgs="${pkgs} dnsmasq"
+        sudo apt-get update -q
+        # shellcheck disable=SC2086
+        sudo apt-get install -y -q ${pkgs}
+        if [ "${DNSMASQ}" = "true" ]; then
+          # ubuntu's dnsmasq wants to run globally; the test runs its own
+          # instance on the bridge.
+          sudo systemctl stop dnsmasq 2>/dev/null || true
+          sudo systemctl disable dnsmasq 2>/dev/null || true
+        fi

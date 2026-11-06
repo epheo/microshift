@@ -1,0 +1,53 @@
+name: Build the image
+description: >-
+  Free the runner's disk, load versions.env into the job environment,
+  pre-pull the base images, then make srpm, rpm and image (epheo-microshift
+  in root's podman store).
+inputs:
+  pull-also:
+    description: More images to pre-pull, space-separated (what the tests use)
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Free disk space
+      uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+      with:
+        preinstalled-runtimes: true
+
+    - name: Load version pins
+      shell: bash
+      run: grep -E '^[A-Z_]+=' versions.env >> "${GITHUB_ENV}"
+
+    # Registry CDNs flake (unexpected EOF mid-blob); pull every base image
+    # with retries up front so the builds run against the local store.
+    - name: Pre-pull base images
+      shell: bash
+      env:
+        PULL_ALSO: ${{ inputs.pull-also }}
+      run: |
+        set -euo pipefail
+        # shellcheck disable=SC2086
+        for img in \
+            quay.io/fedora/fedora:latest \
+            "${BUILDROOT_IMAGE}" \
+            "${BOOTC_IMAGE_URL}:${BOOTC_IMAGE_TAG}" \
+            ${PULL_ALSO}; do
+          for i in $(seq 5); do
+            if sudo podman pull -q "${img}"; then break; fi
+            if [ "${i}" = "5" ]; then echo "ERROR: could not pull ${img}"; exit 1; fi
+            echo "pull failed (attempt ${i}) for ${img}, retrying"; sleep 15
+          done
+        done
+
+    - name: Build SRPM (source + patches + OKD payload swap)
+      shell: bash
+      run: make srpm PODMAN="sudo podman"
+
+    - name: Build RPMs (el10)
+      shell: bash
+      run: make rpm PODMAN="sudo podman"
+
+    - name: Build bootc image
+      shell: bash
+      run: make image PODMAN="sudo podman"

@@ -23,21 +23,10 @@ jobs:
         with:
           preinstalled-runtimes: true
 
-      - name: Enable KVM for the runner
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-
-      - name: Install qemu and dnsmasq
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q qemu-system-x86 dnsmasq
-          # ubuntu's dnsmasq wants to run globally; the test runs its
-          # own instance on the bridge.
-          sudo systemctl stop dnsmasq 2>/dev/null || true
-          sudo systemctl disable dnsmasq 2>/dev/null || true
+      - name: Prepare the runner for VMs
+        uses: ./.github/actions/vm-host
+        with:
+          dnsmasq: "true"
 
       - name: Multinode test
         run: make multinode-test DIST_IMAGE="${{ inputs.image }}"
