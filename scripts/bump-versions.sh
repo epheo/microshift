@@ -7,10 +7,13 @@
 # Minor (and any future major) crossings are automatic, gated on one
 # mechanical condition: a new upstream GA minor is adopted only once a stable
 # OKD payload of the same minor exists — until then the script keeps shipping
-# z-streams of the pinned minor. The CI gate (patch series applies, RPMs
-# build, the VM boots green through greenboot on the recommended shape) is
-# what actually guards a crossing; a crossing that breaks the patch series
-# leaves main red until the series is rebased by hand. Never downgrades.
+# z-streams of the pinned minor. A crossing advances one minor per run, so
+# every minor gets published on the way up: a node refuses data more than
+# MAX_VERSION_SKEW (2) minors older than its binary. The CI gate (patch
+# series applies, RPMs build, the VM boots green through greenboot on the
+# recommended shape) is what actually guards a crossing; a crossing that
+# breaks the patch series leaves main red until the series is rebased by
+# hand. Never downgrades.
 #
 # Exits 0 whether or not anything changed; the workflow commits a dirty
 # versions.env and the same run builds, VM-tests and publishes it.
@@ -29,11 +32,13 @@ all_okd="$(skopeo list-tags "docker://${OKD_RELEASE_IMAGE}" \
     | jq -r '.Tags[]' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-okd-scos\.[0-9]+$' \
     | sort -uV)"
 
-# The newest minor released on BOTH sides, floored at the pinned minor.
+# The next minor released on BOTH sides after the pinned one, else the
+# pinned one.
 cur_minor="$(echo "${USHIFT_GITREF}" | cut -d. -f1,2)"
 common_minors="$(grep -Fxf <(echo "${all_ushift}" | cut -d. -f1,2 | sort -u) \
     <(echo "${all_okd}" | cut -d. -f1,2 | sort -u) || true)"
-minor="$(printf '%s\n%s\n' "${cur_minor}" "${common_minors}" | sort -uV | tail -1)"
+minor="$(printf '%s\n%s\n' "${cur_minor}" "${common_minors}" | grep . | sort -uV \
+    | grep -A1 -xF "${cur_minor}" | tail -1)"
 if [ "${minor}" != "${cur_minor}" ]; then
     echo "crossing: ${cur_minor} -> ${minor} (stable OKD payload available)"
 fi
@@ -47,7 +52,9 @@ latest_portail="$(skopeo list-tags "docker://${portail_repo}" \
 
 update() {
     local key=$1 cur=$2 new=$3
-    if [ -n "${new}" ] && [ "${new}" != "${cur}" ]; then
+    # Never downgrade, e.g. if an upstream tag is withdrawn.
+    if [ -n "${new}" ] && [ "${new}" != "${cur}" ] && \
+            [ "$(printf '%s\n%s\n' "${cur}" "${new}" | sort -V | tail -1)" = "${new}" ]; then
         echo "bump: ${key} ${cur} -> ${new}"
         sed -i "s|^${key}=.*|${key}=${new}|" versions.env
     else
