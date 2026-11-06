@@ -22,14 +22,17 @@
 #
 # Derived images (site/lab layers) may drop additional OCI archives + manifest
 # lines under /usr/lib/embedded-images/ — the import service picks them up.
-ARG BOOTC_IMAGE_URL=quay.io/centos-bootc/centos-bootc
-ARG BOOTC_IMAGE_TAG=stream10
+ARG BOOTC_IMAGE_URL
+ARG BOOTC_IMAGE_TAG
+ARG RPM_IMAGE=localhost/epheo-microshift-rpm:latest
 
-FROM localhost/epheo-microshift-rpm:latest AS builder
+FROM ${RPM_IMAGE} AS builder
 
 FROM ${BOOTC_IMAGE_URL}:${BOOTC_IMAGE_TAG}
 
-ARG PORTAIL_IMAGE=ghcr.io/epheo/portail:0.1.17
+# Pinned in versions.env; the Makefile passes it.
+ARG PORTAIL_IMAGE
+RUN test -n "${PORTAIL_IMAGE}" || { echo "ERROR: PORTAIL_IMAGE must be set"; exit 1; }
 
 ARG REPO_CONFIG_SCRIPT=/tmp/create_repos.sh
 ARG USHIFT_POSTINSTALL_SCRIPT=/tmp/postinstall.sh
@@ -97,7 +100,8 @@ RUN dnf -y remove \
     dnf clean all
 
 # containers-common 6.x moved the default signature policy to
-# /usr/share/containers/policy.json, but el10 cri-o searches only $HOME and
+# /usr/share/containers/policy.json, but cri-o (an el9 build from the
+# OpenShift dependencies mirror) searches only $HOME and
 # /etc/containers, so without this copy EVERY image pull fails "no policy.json
 # file found". A booted node hides the defect: store-resident and embedded
 # images keep running and greenboot stays green until the first fresh pull
@@ -105,6 +109,16 @@ RUN dnf -y remove \
 # PVC-backed workload). vm-test catches it as node-never-Ready in a clean VM.
 RUN test -f /etc/containers/policy.json || \
     cp /usr/share/containers/policy.json /etc/containers/policy.json
+# Same for registries.d: policy.json requires sigstore signatures for the Red
+# Hat registries, and without these files cri-o never looks them up and
+# rejects every image from registry.redhat.io and registry.access.redhat.com
+# (microshift-io 87a0789).
+RUN mkdir -p /etc/containers/registries.d && \
+    for f in /usr/share/containers/registries.d/*.yaml; do \
+        [ -f "${f}" ] || continue; \
+        dst="/etc/containers/registries.d/$(basename "${f}")"; \
+        [ -f "${dst}" ] || cp "${f}" "${dst}"; \
+    done
 
 # Role-scoped firewalld services; postinstall bakes the controller baseline
 # and microshift-profile switches roles post-deploy.
@@ -209,4 +223,5 @@ RUN count="$(find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d | wc -l)" && 
 # Guard: last step, after every package operation — cri-o reads the signature
 # policy from /etc/containers only, and a base or package bump that loses the
 # file again must fail the build, not the node.
-RUN test -f /etc/containers/policy.json
+RUN test -f /etc/containers/policy.json && \
+    test -f /etc/containers/registries.d/registry.redhat.io.yaml

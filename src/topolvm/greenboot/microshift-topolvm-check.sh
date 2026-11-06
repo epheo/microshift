@@ -5,6 +5,8 @@ set -euo pipefail
 # shellcheck disable=SC1091
 source /usr/share/microshift/functions/greenboot.sh
 
+SCRIPT_NAME=$(basename "$0")
+
 # Exit if the current user is not 'root'
 if [ "$(id -u)" -ne 0 ] ; then
     echo "The '${SCRIPT_NAME}' script must be run with the 'root' user privileges"

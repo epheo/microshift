@@ -4,9 +4,10 @@
 # el10 bootc host (the upstream spec supports rhel>=10 and stream10 golang
 # satisfies the spec's minimum). Adapted from microshift-io/microshift
 # packaging/rpm.Containerfile, which uses a stream9 buildroot.
-ARG BUILDROOT_IMAGE=quay.io/centos/centos:stream10
+ARG BUILDROOT_IMAGE
+ARG SRPM_IMAGE=localhost/epheo-microshift-srpm:latest
 
-FROM localhost/epheo-microshift-srpm:latest AS srpm
+FROM ${SRPM_IMAGE} AS srpm
 
 FROM ${BUILDROOT_IMAGE}
 
