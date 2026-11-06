@@ -30,12 +30,15 @@ ExclusiveArch: x86_64 aarch64
 Requires: microshift = %{version}
 
 %description topolvm
-The microshift-topolvm package provides the required manifests for the TopoLVM CSI and the dependent
-cert-manager to be installed on MicroShift.
+The microshift-topolvm package provides the required manifests for the TopoLVM CSI to be installed
+on MicroShift.
 
 %files topolvm
 %dir %{_prefix}/lib/microshift/manifests.d/001-microshift-topolvm
 %{_prefix}/lib/microshift/manifests.d/001-microshift-topolvm/*
+%dir %{_prefix}/lib/microshift/manifests.d/delete
+%dir %{_prefix}/lib/microshift/manifests.d/delete/001-microshift-topolvm
+%{_prefix}/lib/microshift/manifests.d/delete/001-microshift-topolvm/*
 %{_sysconfdir}/greenboot/check/required.d/50_microshift_topolvm_check.sh
 
 %package topolvm-release-info
@@ -54,6 +57,8 @@ release. These files contain the list of container image references used by the 
 # topolvm
 install -d -m755 %{buildroot}/%{_prefix}/lib/microshift/manifests.d/001-microshift-topolvm
 install -p -m644 assets/optional/topolvm/*.yaml %{buildroot}/%{_prefix}/lib/microshift/manifests.d/001-microshift-topolvm
+install -d -m755 %{buildroot}/%{_prefix}/lib/microshift/manifests.d/delete/001-microshift-topolvm
+install -p -m644 assets/optional/topolvm/delete/*.yaml %{buildroot}/%{_prefix}/lib/microshift/manifests.d/delete/001-microshift-topolvm
 
 install -d -m755 %{buildroot}%{_sysconfdir}/greenboot/check/required.d
 install -p -m755 packaging/greenboot/microshift-topolvm-check.sh %{buildroot}%{_sysconfdir}/greenboot/check/required.d/50_microshift_topolvm_check.sh

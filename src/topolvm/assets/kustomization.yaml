@@ -3,6 +3,3 @@ kind: Kustomization
 resources:
   - 01-namespace.yaml
   - 02-topolvm.yaml
-patches:
-  - path: topolvm_mutatingwebhook_patch.yaml
-  - path: topolvm_service_patch.yaml

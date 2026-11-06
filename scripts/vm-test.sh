@@ -400,10 +400,9 @@ vssh /usr/bin/import-embedded-images.sh | { ! grep -q '^importing'; }
 # no extra registry pull, no docker.io rate limits.
 util_img="$(koc -n openshift-ovn-kubernetes get pods -o jsonpath='{.items[0].spec.containers[0].image}')"
 
-# The PVC mutating webhook has failurePolicy Fail, and the controller pod
-# can be Running before its webhook endpoint is Ready; applying early gets
-# "no endpoints available for service topolvm-controller".
-log "waiting for the TopoLVM webhook endpoints (up to 3m)"
+# Separates a controller that never gets Ready from a PVC that never binds,
+# and keeps the pod wait below for provisioning alone.
+log "waiting for the TopoLVM controller endpoints (up to 3m)"
 ok=false
 for _ in $(seq 36); do
     ep="$(koc -n topolvm-system get endpoints topolvm-controller -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)"
@@ -411,7 +410,7 @@ for _ in $(seq 36); do
     sleep 5
 done
 ${ok} || {
-    echo "ERROR: topolvm-controller webhook endpoints never appeared" >&2
+    echo "ERROR: topolvm-controller endpoints never appeared" >&2
     koc -n topolvm-system get pods >&2 || true
     exit 1
 }

@@ -15,7 +15,6 @@ Run the `src/topolvm/generate_manifests.sh` script to generate the TopoLVM manif
 in `src/topolvm/assets` and container image references in `src/topolvm/release`.
 
 This script will:
-- Download cert-manager manifests from the upstream repository
 - Download and template the upstream TopoLVM Helm chart
 - Patch it for compatibility with MicroShift by changing deployment replicas to 1
 - Display a path to the generated manifests and release info
@@ -46,9 +45,13 @@ cd ~/microshift
 MICROSHIFT_VARIANT=community make rpm
 ```
 
-## Service CA Cert Injection Instead of Cert-Manager
+## No Webhooks
 
-Instead of deploying and managing a full cert-manager stack, MicroShift uses [OpenShift Service CA Operator](https://docs.openshift.com/container-platform/latest/security/certificate_types_descriptions/service-ca-certificates.html) to automate TopoLVM certificate creation. We annotate the TopoLVM Service and MutatingWebhookConfiguration resources, which triggers the Service CA Operator in MicroShift/OKD to inject valid serving certificates.
+Chart 17.x has no PVC webhook, and the pod webhook is disabled, so the
+controller runs with `--enable-webhooks=false` and needs neither cert-manager
+nor a Service CA serving cert.
 
-This approach is lighter-weight than running cert-manager, minimizing dependencies and reducing resource consumption. 
-
+Chart 15.x installed a `topolvm-hook` MutatingWebhookConfiguration with
+`failurePolicy: Fail`. On an upgraded node it would reject every PVC create,
+so `assets/delete/` ships a delete kustomization that removes it and its
+serving cert secret on every MicroShift start.

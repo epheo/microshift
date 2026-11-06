@@ -1,0 +1,15 @@
+# Left behind by TopoLVM 0.36 (chart 15.x). 0.42 serves no webhooks, and
+# this one has failurePolicy Fail, so on an upgraded node every PVC create
+# would be rejected until it is gone. The kustomizer deletes it on each
+# start, before applying, and ignores it when absent.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: topolvm-hook
+---
+# Serving cert service-ca minted for that webhook.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: topolvm-mutatingwebhook
+  namespace: topolvm-system
