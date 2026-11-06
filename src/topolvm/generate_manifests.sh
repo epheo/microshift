@@ -56,6 +56,12 @@ EOF
   # shellcheck disable=SC2016
   yq 'select(.kind == "Deployment").spec.replicas = 1' -i "${ASSETS_DIR}/02-topolvm.yaml"
 
+  # The controller keeps the chart's required anti-affinity on hostname. With
+  # one replica on one node, a RollingUpdate surge pod can never schedule next
+  # to the old one, and the old one only goes once the new one is available:
+  # any template change hangs the rollout and greenboot rolls the update back.
+  yq 'select(.kind == "Deployment").spec.strategy = {"type": "Recreate"}' -i "${ASSETS_DIR}/02-topolvm.yaml"
+
   # Annotate topolvm-provisioner StorageClass as default
   yq 'with(select(.kind == "StorageClass" and .metadata.name == "topolvm-provisioner");
   .metadata.annotations."storageclass.kubernetes.io/is-default-class" = "true"

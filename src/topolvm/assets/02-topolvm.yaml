@@ -1128,6 +1128,8 @@ spec:
                     values:
                       - topolvm
               topologyKey: kubernetes.io/hostname
+  strategy:
+    type: Recreate
 ---
 # Source: topolvm/templates/controller/csidriver.yaml
 apiVersion: storage.k8s.io/v1
