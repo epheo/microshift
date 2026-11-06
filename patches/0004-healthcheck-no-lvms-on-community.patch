@@ -1,0 +1,27 @@
+diff --git a/pkg/healthcheck/microshift_core_workloads.go b/pkg/healthcheck/microshift_core_workloads.go
+index 164ddcb3..c84d5c49 100644
+--- a/pkg/healthcheck/microshift_core_workloads.go
++++ b/pkg/healthcheck/microshift_core_workloads.go
+@@ -7,6 +7,7 @@ import (
+ 
+ 	"github.com/openshift/microshift/pkg/config"
+ 	"github.com/openshift/microshift/pkg/util"
++	"github.com/openshift/microshift/pkg/version"
+ 	"k8s.io/klog/v2"
+ )
+ 
+@@ -45,6 +46,14 @@ func getCoreMicroShiftWorkloads() (map[string]NamespaceWorkloads, error) {
+ }
+ 
+ func lvmsIsExpected(cfg *config.Config) (bool, error) {
++	// Community builds never deploy LVMS (startCSIPlugin returns early), so a
++	// volume group or an lvmd.yaml on the host must not arm the expectation:
++	// greenboot would fail a healthy boot waiting for openshift-storage.
++	if version.Get().BuildVariant == version.BuildVariantCommunity {
++		klog.Infof("LVMS is not deployed by community builds")
++		return false, nil
++	}
++
+ 	cfgFile := "/etc/microshift/lvmd.yaml"
+ 	if exists, err := util.PathExists(cfgFile); err != nil {
+ 		return false, err

@@ -1,5 +1,5 @@
 diff --git a/cmd/generate-config/config/config-openapi-spec.json b/cmd/generate-config/config/config-openapi-spec.json
-index 28169bcf..7a381808 100755
+index e677bbe9..d7e87fbc 100755
 --- a/cmd/generate-config/config/config-openapi-spec.json
 +++ b/cmd/generate-config/config/config-openapi-spec.json
 @@ -8,6 +8,7 @@
@@ -10,7 +10,7 @@ index 28169bcf..7a381808 100755
      "kubelet",
      "manifests",
      "network",
-@@ -988,6 +989,21 @@
+@@ -1008,6 +1009,21 @@
          }
        }
      },
@@ -32,33 +32,11 @@ index 28169bcf..7a381808 100755
      "kubelet": {
        "description": "Settings specified in this section are transferred as-is into the Kubelet config."
      },
-diff --git a/docs/user/howto_config.md b/docs/user/howto_config.md
-index a5bb49c0..eb684c34 100644
---- a/docs/user/howto_config.md
-+++ b/docs/user/howto_config.md
-@@ -138,6 +138,8 @@ ingress:
-         threadCount: 0
-         tlsInspectDelay: ""
-         tunnelTimeout: ""
-+kubeControllerManager:
-+    terminatedPodGCThreshold: 0
- kubelet:
- manifests:
-     kustomizePaths: []
-@@ -304,6 +306,8 @@ ingress:
-         threadCount: 0
-         tlsInspectDelay: 5s
-         tunnelTimeout: 1h
-+kubeControllerManager:
-+    terminatedPodGCThreshold: 12500
- kubelet:
- manifests:
-     kustomizePaths:
 diff --git a/packaging/microshift/config.yaml b/packaging/microshift/config.yaml
-index d69c68ed..ef2efa72 100644
+index a6171e6c..f0ce2744 100644
 --- a/packaging/microshift/config.yaml
 +++ b/packaging/microshift/config.yaml
-@@ -654,6 +654,12 @@ ingress:
+@@ -664,6 +664,12 @@ ingress:
  
          # If unset, the default timeout is 1h
          tunnelTimeout: 1h
@@ -72,7 +50,7 @@ index d69c68ed..ef2efa72 100644
  kubelet:
  manifests:
 diff --git a/pkg/config/config.go b/pkg/config/config.go
-index fdac17ad..bb9f19ae 100644
+index 35fafe3a..b484b5ff 100644
 --- a/pkg/config/config.go
 +++ b/pkg/config/config.go
 @@ -56,6 +56,8 @@ type Config struct {
@@ -92,7 +70,7 @@ index fdac17ad..bb9f19ae 100644
  	c.DNS = dnsDefaults()
  	c.C2CC = C2CC{
  		DNS:           C2CCDNS{CacheTTL: ptr.To(10), CacheNegativeTTL: ptr.To(10)},
-@@ -417,6 +420,10 @@ func (c *Config) incorporateUserSettings(u *Config) {
+@@ -398,6 +401,10 @@ func (c *Config) incorporateUserSettings(u *Config) {
  	if u.Telemetry.Proxy != "" {
  		c.Telemetry.Proxy = u.Telemetry.Proxy
  	}
@@ -103,7 +81,7 @@ index fdac17ad..bb9f19ae 100644
  	if len(u.Ingress.ServingCertificateSecret) != 0 {
  		c.Ingress.ServingCertificateSecret = u.Ingress.ServingCertificateSecret
  	}
-@@ -708,6 +715,10 @@ func (c *Config) validate() error {
+@@ -726,6 +733,10 @@ func (c *Config) validate() error {
  		return fmt.Errorf("error validating telemetry: %v", err)
  	}
  
@@ -115,10 +93,10 @@ index fdac17ad..bb9f19ae 100644
  		return fmt.Errorf("error validating Generic Device Plugin configuration: %v", err)
  	}
 diff --git a/pkg/config/config_test.go b/pkg/config/config_test.go
-index 523a53c6..aa4de2ea 100644
+index cf2778b7..33fb6503 100644
 --- a/pkg/config/config_test.go
 +++ b/pkg/config/config_test.go
-@@ -214,6 +214,19 @@ func TestGetActiveConfigFromYAML(t *testing.T) {
+@@ -289,6 +289,19 @@ func TestGetActiveConfigFromYAML(t *testing.T) {
  				return c
  			}(),
  		},
@@ -138,7 +116,7 @@ index 523a53c6..aa4de2ea 100644
  		{
  			name: "manifests-default",
  			config: dedent(`
-@@ -545,6 +558,15 @@ func TestValidate(t *testing.T) {
+@@ -620,6 +633,15 @@ func TestValidate(t *testing.T) {
  			}(),
  			expectErr: true,
  		},
