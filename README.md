@@ -115,13 +115,16 @@ long as you accept that.
 ## Release cadence
 
 The build workflow checks daily for new z-stream tags, OKD stable payload
-tags, and portail releases, auto-commits the bump, and the same run builds,
-VM-tests, upgrade-tests from the previous release, and publishes. A weekly run rebuilds even with unchanged pins to
-pick up package-level (CVE) fixes. Minor (and any future major) crossings
-are automatic too, gated on one condition: a stable OKD payload of the new
-minor must exist. There is no manual step in the release process — the CI
-gate is the judge, and a crossing that breaks the patch series simply fails
-the run (main stays red, nothing publishes) until `patches/` is rebased.
+tags, and portail releases. A bump is committed to the `auto/bump` branch,
+never straight to main: the same run builds it, VM-tests it, upgrade-tests it
+from the previous release and the previous minor, and only then fast-forwards
+main to it and publishes. A weekly run rebuilds even with unchanged pins to
+pick up package-level (CVE) fixes. Minor (and any future major) crossings are
+automatic too, one minor per run, gated on one condition: a stable OKD payload
+of the new minor must exist. There is no manual step in the release process:
+the CI gate is the judge. A bump that breaks the build leaves main on the last
+green pins, opens an "auto-bump-red" issue, and fails again daily, in seconds,
+until an input or main moves (for example once `patches/` is rebased).
 
 A node configured with custom feature gates (`featureSet: CustomNoUpgrade`)
 refuses to start after any minor or major change, and greenboot rolls it
