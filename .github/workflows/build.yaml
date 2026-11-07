@@ -33,6 +33,10 @@ on:
         description: Run the daily bump path (auto/bump, promote main on green)
         type: boolean
         default: false
+      rollback:
+        description: Make the upgrade lanes test a greenboot rollback first
+        type: boolean
+        default: false
   schedule:
     - cron: "15 6 * * *" # daily bump check
     - cron: "45 5 * * 1" # weekly refresh rebuild
@@ -151,24 +155,33 @@ jobs:
       - name: VM boot test (bootc-image-builder -> qcow2 -> QEMU)
         run: make vm-test PODMAN="sudo podman"
 
+      # When on, both upgrade lanes first make the candidate go red: greenboot
+      # must roll it back and MicroShift restore the data, then it is
+      # installed again. The script says when and why.
+      - name: Decide whether the upgrade lanes test a rollback
+        id: rollback
+        env:
+          WEEKLY: ${{ github.event.schedule == '45 5 * * 1' }}
+          ASKED: ${{ github.event_name == 'workflow_dispatch' && inputs.rollback }}
+          # A bump run compares the staged bump with main.
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before || (needs.bump.outputs.sha && github.sha) || '' }}
+        run: ./scripts/ci-rollback-needed.sh
+
       # The fresh-boot qcow2 is no longer needed; reclaim its space before
       # the second bootc-image-builder run.
-      # Both upgrade lanes first make the candidate go red: greenboot must
-      # roll it back and MicroShift restore the data, then it is installed
-      # again. A publish that breaks nodes must leave them on the old image.
-      - name: Upgrade test (previous release -> rollback -> candidate)
+      - name: Upgrade test (previous release -> candidate)
         env:
           # Forks have nothing published to upgrade from.
           UPGRADE_ALLOW_MISSING: ${{ github.repository != 'epheo/microshift' && '1' || '' }}
         run: |
           sudo rm -rf /tmp/epheo-microshift-vm/output
-          make vm-test-upgrade PODMAN="sudo podman" ROLLBACK=1 \
+          make vm-test-upgrade PODMAN="sudo podman" ROLLBACK="${{ steps.rollback.outputs.enabled }}" \
               UPGRADE_FROM="ghcr.io/${{ github.repository_owner }}/microshift:latest"
 
       # Once a crossing publishes, :latest only covers same-minor upgrades,
       # while nodes still on the previous minor cross later on their own.
       # Skipped while that minor tag is the same image as :latest.
-      - name: Upgrade test (previous minor -> rollback -> candidate)
+      - name: Upgrade test (previous minor -> candidate)
         run: |
           set -euo pipefail
           image="ghcr.io/${{ github.repository_owner }}/microshift"
@@ -188,7 +201,8 @@ jobs:
           fi
           sudo rm -rf /tmp/epheo-microshift-vm-upgrade/output
           WORKDIR=/tmp/epheo-microshift-vm-upgrade-prev \
-              make vm-test-upgrade PODMAN="sudo podman" ROLLBACK=1 UPGRADE_FROM="${image}:${prev}"
+              make vm-test-upgrade PODMAN="sudo podman" ROLLBACK="${{ steps.rollback.outputs.enabled }}" \
+                  UPGRADE_FROM="${image}:${prev}"
 
       - name: Make VM logs readable
         if: failure()
