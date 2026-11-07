@@ -99,6 +99,7 @@ vm-test:
 
 # The same suite on the update path every existing install takes: boot the
 # previously published image, bootc switch to the candidate, reboot, assert.
+# ROLLBACK=1 first makes the candidate go red and asserts the rollback.
 # Fails when UPGRADE_FROM cannot be pulled; UPGRADE_ALLOW_MISSING=1 skips
 # instead (first release, forks).
 UPGRADE_FROM ?= ghcr.io/epheo/microshift:latest
