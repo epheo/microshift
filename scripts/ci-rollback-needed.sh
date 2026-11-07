@@ -5,8 +5,9 @@
 # touch. So it runs when one of those can have moved:
 # - the weekly rebuild: the base drifts without a diff;
 # - the upstream pin moves;
-# - a change touches the rollback cycle in the test, a greenboot file, or
-#   a patch to upstream code on the rollback path;
+# - a change touches the rollback cycle in the test, a greenboot file,
+#   src/update (it records rolled-back images), or a patch to upstream code
+#   on the rollback path;
 # - workflow_dispatch asks for it.
 # Env: WEEKLY, ASKED (true or not), BASE (sha to compare HEAD with).
 set -euo pipefail
@@ -33,7 +34,7 @@ upstream_path='^diff --git a/(pkg/admin/|packaging/greenboot/)'
 
 while IFS=$'\t' read -r status path; do
     case "${path}" in
-        scripts/ci-rollback-needed.sh|*greenboot*)
+        scripts/ci-rollback-needed.sh|*greenboot*|src/update/*)
             decide 1 "on, ${path} changed" ;;
         scripts/vm-test.sh)
             # Most edits add asserts elsewhere; the weekly run covers drift.

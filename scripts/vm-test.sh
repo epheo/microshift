@@ -378,6 +378,7 @@ EOF
             exit 1
         }
         koc create configmap rollback-marker --from-literal=probe=candidate-only
+        candidate_digest="$(vssh bootc status --json | jq -r '.status.booted.image.imageDigest')"
 
         log "forcing greenboot red on the candidate"
         vssh touch "${FORCE_RED_TRIGGER}"
@@ -408,6 +409,13 @@ EOF
         koc get configmap upgrade-marker -o jsonpath='{.data.probe}' | grep -q pre-upgrade
         [ -z "$(koc get configmap rollback-marker --ignore-not-found -o name)" ] || {
             echo "ERROR: the candidate's configmap survived the rollback" >&2
+            exit 1
+        }
+
+        # Else bootc's timer would bring the same image back, red again.
+        log "assert: updates now skip the rolled-back image"
+        vssh grep -qxF "${candidate_digest}" /var/lib/microshift-update/rolled-back || {
+            echo "ERROR: ${candidate_digest} is not in /var/lib/microshift-update/rolled-back" >&2
             exit 1
         }
 
@@ -798,6 +806,19 @@ wait_for 300 "greenboot GREEN on this boot" greenboot_green || {
 
 log "assert: grubenv records boot_success=1"
 vssh grub2-editenv list | grep -q 'boot_success=1'
+
+# multinode-test proves the follow itself; this is the controller's half on
+# every lane, read with a kubelet's credential as a worker reads it.
+want_image="$(vssh bootc status --json | jq -r '.status.booted.image
+    | (.image.image | sub("@.*$"; "") | sub(":[^:/]*$"; "")) + "@" + .imageDigest')"
+published_image() {
+    [ "$(vssh oc --kubeconfig /var/lib/microshift/resources/kubelet/kubeconfig \
+        -n kube-public get configmap microshift-update -o jsonpath='{.data.image}')" = "${want_image}" ]
+}
+wait_for 180 "kube-public/microshift-update to name ${want_image}" published_image || {
+    vssh journalctl -b -u microshift-update-publish --no-pager | tail -20 || true
+    exit 1
+}
 
 log "assert: no failed systemd units"
 failed="$(vssh systemctl --failed --no-legend | wc -l)"

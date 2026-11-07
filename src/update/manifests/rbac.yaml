@@ -1,0 +1,25 @@
+# Workers read the image to follow with their kubelet's own credential.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: microshift-update-reader
+  namespace: kube-public
+rules:
+- apiGroups: [""]
+  resources: [configmaps]
+  resourceNames: [microshift-update]
+  verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: microshift-update-reader
+  namespace: kube-public
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: microshift-update-reader
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: Group
+  name: system:nodes

@@ -1,0 +1,15 @@
+[Unit]
+Description=Publish the image this controller booted green, for workers to follow
+ConditionPathExists=/run/ostree-booted
+After=greenboot-healthcheck.service microshift.service
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/libexec/microshift-update when controller
+ExecStart=/usr/libexec/microshift-update publish
+# Until workers can read it: the API may still be settling.
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
