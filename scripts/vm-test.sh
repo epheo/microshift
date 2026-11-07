@@ -340,18 +340,27 @@ rollouts_done() {
     koc get daemonsets,deployments -A -o jsonpath='{range .items[*]}{.metadata.generation}|{.status.observedGeneration}|{.status.desiredNumberScheduled}{.spec.replicas}|{.status.updatedNumberScheduled}{.status.updatedReplicas}|{.status.numberAvailable}{.status.availableReplicas}{"\n"}{end}' 2>/dev/null \
         | awk -F'|' 'NF == 5 { n++; if ($1 != $2 || $4+0 != $3+0 || $5+0 != $3+0) bad = 1 } END { exit (bad || n == 0) }'
 }
+# Graceful node shutdown (for r-drbd) leaves the pods it killed Failed with
+# reason Terminated, shown as Error, until pod GC: only their replacements,
+# covered by rollouts_done, tell whether the new boot settled.
+unsettled_pods() {
+    local killed
+    killed="$(koc get pods -A -o jsonpath='{range .items[?(@.status.reason=="Terminated")]}{.metadata.namespace}/{.metadata.name} {end}' 2>/dev/null)" || true
+    koc get pods -A --no-headers 2>/dev/null \
+        | awk -v killed=" ${killed}" '!/Running|Completed/ && index(killed, " " $1 "/" $2 " ") == 0'
+}
 log "waiting for all pods to be Running/Completed and rollouts done (up to 15m)"
 ok=false
 total=0 bad=0
 for i in $(seq 180); do
     total="$(koc get pods -A --no-headers 2>/dev/null | wc -l)"
-    bad="$(koc get pods -A --no-headers 2>/dev/null | grep -cvE 'Running|Completed' || true)"
+    bad="$(unsettled_pods | wc -l)"
     if [ "${total}" -ge 8 ] && [ "${bad}" -eq 0 ] && rollouts_done; then ok=true; break; fi
     # On the upgrade boot greenboot reboots the VM after about 10m, before
     # this wait ends and before dump_diag can reach it: report as it goes.
     if [ $((i % 12)) -eq 0 ]; then
         log "still waiting: ${bad} of ${total} pods not Running/Completed, or a rollout in progress"
-        koc get pods -A --no-headers 2>/dev/null | grep -vE 'Running|Completed' | head -20 || true
+        unsettled_pods | head -20 || true
         vssh journalctl -u microshift -b --no-pager 2>/dev/null | grep -i 'kustomiz' | tail -3 || true
     fi
     sleep 5
