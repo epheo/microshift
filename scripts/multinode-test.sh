@@ -450,7 +450,19 @@ push_update() {
     cat "${ctx}/digest"
 }
 digest_of() { $1 bootc status --json | jq -r '.status.booted.image.imageDigest'; }
+lock_holder() { koc -n kube-public get lease microshift-update -o jsonpath='{.spec.holderIdentity}'; }
+lock_as() { # lock_as <holder>: a fresh hold, as a node mid-update leaves it
+    koc -n kube-public patch lease microshift-update --type merge -p \
+        "{\"spec\":{\"holderIdentity\":\"$1\",\"leaseDurationSeconds\":3600,\"renewTime\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)\"}}" >/dev/null
+}
+unlock_all() {
+    koc -n kube-public patch lease microshift-update --type json \
+        -p '[{"op":"remove","path":"/spec/holderIdentity"}]' >/dev/null
+}
 
+# Another node holds the update lock from the start: the worker must wait
+# for it however long the controller's own update takes.
+lock_as vm-test
 update_a="$(push_update update a)"
 log "updating the controller to ${update_a}"
 boot1="$(v1 cat /proc/sys/kernel/random/boot_id)"
@@ -465,6 +477,14 @@ published() {
 }
 retry 900 "node1 green and publishing its image" published
 
+log "assert: the worker waits while another node holds the update lock"
+worker_before="$(digest_of v2)"
+v2 systemctl start microshift-update-follow.service
+v2 journalctl -u microshift-update-follow -b --no-pager | grep 'vm-test is updating' >/dev/null \
+    || die "the worker's follow did not wait for the lock holder"
+[ "$(digest_of v2)" = "${worker_before}" ] || die "the worker updated while another node held the lock"
+unlock_all
+
 log "assert: the worker follows the controller to the same digest"
 followed() { [ "$(digest_of v2)" = "${update_a}" ]; }
 retry 1200 "node2 on ${update_a}" followed
@@ -472,6 +492,8 @@ retry 900 "both nodes Ready after the worker's update" both_ready
 retry 900 "all pods Running/Completed after the worker's update" pods_settled
 worker_green() { v2 grub2-editenv list | grep -q 'boot_success=1'; }
 retry 600 "greenboot green on node2's new boot" worker_green
+lock_free() { [ -z "$(lock_holder)" ]; }
+retry 600 "node2 releases the update lock after its green boot" lock_free
 
 log "assert: bootc's own update timer stays idle on the worker"
 v2 systemctl start bootc-fetch-apply-updates.service
@@ -490,7 +512,10 @@ v1 systemctl start bootc-fetch-apply-updates.service
 v1 journalctl -u bootc-fetch-apply-updates -b --no-pager | grep "skipping ${update_b}" >/dev/null \
     || die "the controller's update gate did not name ${update_b}"
 v1 sh -c 'echo sha256:0000 > /var/lib/microshift-update/rolled-back'
+log "assert: the gate lets another image through and takes the update lock for it"
 v1 /usr/libexec/microshift-update gate || die "the update gate skips an image nobody rolled back"
+[ "$(lock_holder)" = node1 ] || die "the gate passed without taking the update lock (holder: '$(lock_holder)')"
+unlock_all
 v1 rm -f /var/lib/microshift-update/rolled-back
 
 log "MULTINODE TEST PASSED"

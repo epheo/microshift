@@ -22,7 +22,8 @@
 #     (microshift-profile worker + microshift add-node --worker); workers hold
 #     no signing keys (patches/0006, 0007).
 #   - The controller leads updates and workers follow the image it booted
-#     green; no node retries an image greenboot rolled back.
+#     green, one node at a time and only while every r-drbd Volume is fully
+#     replicated; no node retries an image greenboot rolled back.
 #
 # Derived images (site/lab layers) may drop additional OCI archives + manifest
 # lines under /usr/lib/embedded-images/ — the import service picks them up.
@@ -176,8 +177,8 @@ RUN /tmp/repair-module-store.sh && rm -vf /tmp/repair-module-store.sh
 COPY --chmod=755 ./src/profiles/microshift-profile /usr/bin/microshift-profile
 
 # Updates: the controller leads on bootc's own timer and publishes the image
-# it booted green; workers follow that exact image. Any node skips an image
-# greenboot rolled back. src/update/microshift-update says why.
+# it booted green; workers follow that exact image, one node at a time.
+# src/update/microshift-update says why.
 COPY --chmod=755 ./src/update/microshift-update /usr/libexec/microshift-update
 COPY ./src/update/microshift-update-publish.service \
      ./src/update/microshift-update-follow.service \

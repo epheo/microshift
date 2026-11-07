@@ -4,6 +4,8 @@
 # publishes the exact image it booted. Workers switch to that image and to no
 # other: a worker is then never newer than the control plane (Kubernetes
 # version skew policy), and never meets an update the controller rolled back.
+# One node at a time, and only while every r-drbd Volume is fully replicated:
+# a second node down could take a replicated volume below quorum.
 # A single node is a controller.
 #
 #   when <role>       ExecCondition: this node has the role, its boot is not red
@@ -13,12 +15,16 @@
 #   record-rollback   greenboot red.d
 set -euo pipefail
 
-CM_NS=kube-public
-CM=microshift-update
+NS=kube-public
+# The ConfigMap with the controller's image, and the Lease one updating node holds.
+NAME=microshift-update
 ADMIN_KUBECONFIG=/var/lib/microshift/resources/kubeadmin/kubeconfig
 NODE_KUBECONFIG=/var/lib/microshift/resources/kubelet/kubeconfig
 # On /var, so it outlives the deployment that wrote it.
 ROLLED_BACK=/var/lib/microshift-update/rolled-back
+# A node that never comes back stops holding the lock after this; its
+# Volumes stay Degraded, so nobody else reboots anyway.
+LOCK_SECS=3600
 
 booted() { bootc status --json | jq -r ".status.booted.image.$1 // empty"; }
 
@@ -32,6 +38,73 @@ repo_of() {
     echo "${ref}"
 }
 
+# Every node, the controller included, uses its kubelet's credential for the
+# lock and the Volumes: src/update/manifests grants system:nodes just that.
+noc() { oc --kubeconfig "${NODE_KUBECONFIG}" "$@"; }
+
+node_name() {
+    local user
+    user="$(noc auth whoami -o jsonpath='{.status.userInfo.username}')" || return 1
+    case "${user}" in system:node:?*) echo "${user#system:node:}" ;; *) return 1 ;; esac
+}
+
+# Fails, saying why, while a reboot could take a Volume below quorum: r-drbd
+# services one node at a time and waits for every Volume to be Ready.
+storage_settled() {
+    local out res busy
+    if ! out="$(noc get volumes.r-drbd.io -o json)"; then
+        # Only a cluster without r-drbd at all has nothing to keep in quorum.
+        res="$(noc api-resources --api-group=r-drbd.io -o name)" && [ -z "${res}" ] && return 0
+        echo "cannot read the r-drbd Volumes"
+        return 1
+    fi
+    busy="$(jq -r '.items[] | select(.status.phase == "Degraded" or .status.phase == "Provisioning")
+        | "\(.metadata.name) \(.status.phase)"' <<<"${out}")" || {
+        echo "cannot parse the r-drbd Volumes"
+        return 1
+    }
+    [ -z "${busy}" ] && return 0
+    echo "waiting for every Volume to be Ready:"
+    echo "${busy}"
+    return 1
+}
+
+lock_expired() {
+    local renew secs
+    renew="$(jq -r '.spec.renewTime // empty' <<<"$1")"
+    secs="$(jq -r '.spec.leaseDurationSeconds // 0' <<<"$1")"
+    [ -z "${renew}" ] || [ $(( $(date -u -d "${renew}" +%s) + secs )) -lt "$(date -u +%s)" ]
+}
+
+# The write carries the resourceVersion just read: two nodes racing for a
+# free lock, one gets a conflict.
+lock() {
+    local me=$1 lease holder now
+    lease="$(noc -n "${NS}" get lease "${NAME}" -o json)" || { echo "cannot read the update lock"; return 1; }
+    holder="$(jq -r '.spec.holderIdentity // empty' <<<"${lease}")"
+    if [ -n "${holder}" ] && [ "${holder}" != "${me}" ] && ! lock_expired "${lease}"; then
+        echo "${holder} is updating; waiting for it"
+        return 1
+    fi
+    now="$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)"
+    jq --arg me "${me}" --arg now "${now}" --argjson secs "${LOCK_SECS}" \
+        'del(.metadata.managedFields) | .spec.holderIdentity = $me
+         | .spec.acquireTime = $now | .spec.renewTime = $now
+         | .spec.leaseDurationSeconds = $secs' <<<"${lease}" \
+        | noc replace -f - >/dev/null || { echo "another node took the update lock first"; return 1; }
+}
+
+# Run on a green boot: an update this node started is over, done or rolled back.
+unlock() {
+    local me=$1 lease
+    lease="$(noc -n "${NS}" get lease "${NAME}" -o json)"
+    [ "$(jq -r '.spec.holderIdentity // empty' <<<"${lease}")" = "${me}" ] || return 0
+    jq 'del(.metadata.managedFields, .spec.holderIdentity, .spec.acquireTime,
+            .spec.renewTime, .spec.leaseDurationSeconds)' \
+        <<<"${lease}" | noc replace -f - >/dev/null
+    echo "released the update lock"
+}
+
 when() {
     [ "$(microshift-profile)" = "$1" ] || exit 1
     # A red boot is greenboot's to resolve: it reboots or rolls back. Inactive
@@ -43,31 +116,34 @@ when() {
 }
 
 publish() {
-    local digest image
+    local digest image me
     digest="$(booted imageDigest)"
     [ -n "${digest}" ] || { echo "bootc reports no booted image" >&2; return 1; }
     image="$(repo_of "$(booted image.image)")@${digest}"
-    oc --kubeconfig "${ADMIN_KUBECONFIG}" -n "${CM_NS}" create configmap "${CM}" \
+    oc --kubeconfig "${ADMIN_KUBECONFIG}" -n "${NS}" create configmap "${NAME}" \
         --from-literal=image="${image}" \
         --from-literal=transport="$(booted image.transport)" \
         --dry-run=client -o yaml \
         | oc --kubeconfig "${ADMIN_KUBECONFIG}" apply --server-side \
             --field-manager=microshift-update -f - >/dev/null
     echo "published ${image} for workers to follow"
+    me="$(node_name)"
+    unlock "${me}"
 }
 
 follow() {
-    local target transport image digest
+    local me target transport image digest
     if [ ! -f "${NODE_KUBECONFIG}" ]; then
         echo "not joined to a cluster yet"
         return 0
     fi
     # The controller may be rebooting into its own update: try again later.
-    if ! target="$(oc --kubeconfig "${NODE_KUBECONFIG}" -n "${CM_NS}" get configmap "${CM}" \
+    if ! me="$(node_name)" || ! target="$(noc -n "${NS}" get configmap "${NAME}" \
             -o jsonpath='{.data.transport} {.data.image}')"; then
-        echo "the controller's image is unknown for now"
+        echo "the controller is unreachable or has published nothing yet"
         return 0
     fi
+    unlock "${me}"
     read -r transport image <<<"${target}"
     [ -n "${image}" ] || return 0
     digest="${image##*@}"
@@ -76,26 +152,38 @@ follow() {
         echo "not following ${image}: greenboot rolled it back on this node"
         return 0
     fi
+    storage_settled || return 0
+    lock "${me}" || return 0
     echo "following the controller to ${image}"
     bootc switch --apply --transport "${transport}" "${image}"
 }
 
 gate() {
-    local digest
-    # Unknown is no reason to skip: the update then reports what went wrong.
-    trap 'echo "update gate failed, not skipping"; exit 0' ERR
+    local digest me
+    # Unchecked, a reboot can take a replicated Volume below quorum: when in
+    # doubt, wait for the next run.
+    set -o errtrace
+    trap 'echo "update gate failed; skipping this run"; exit 1' ERR
     if [ "$(microshift-profile)" = worker ]; then
         echo "workers follow the controller's image instead (microshift-update-follow.timer)"
         exit 1
     fi
-    [ -s "${ROLLED_BACK}" ] || exit 0
     bootc upgrade --check >/dev/null
     digest="$(bootc status --json | jq -r '.status.booted.cachedUpdate.imageDigest // empty')"
+    if [ -z "${digest}" ] || [ "${digest}" = "$(booted imageDigest)" ]; then
+        echo "no update"
+        exit 1
+    fi
     if rolled_back "${digest}"; then
         echo "skipping ${digest}: greenboot rolled it back on this node."
         echo "A new image, or a manual 'bootc upgrade --apply', ends this."
         exit 1
     fi
+    me="$(node_name)"
+    unlock "${me}"
+    storage_settled || exit 1
+    lock "${me}" || exit 1
+    echo "updating to ${digest}"
 }
 
 record_rollback() {

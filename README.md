@@ -219,10 +219,16 @@ Updates: the controller leads, workers follow.
   `bootc switch` still applies it.
 - A worker tracks a digest: after `microshift-profile controller`,
   `bootc switch` it to a tag to update on its own.
+- One node at a time, the controller included: a node takes the Lease
+  `kube-public/microshift-update` before it reboots into an update, and
+  releases it once green again. A node that never comes back loses it after
+  an hour.
+- And only while no r-drbd Volume is Degraded or Provisioning: a second
+  replica down could take a replicated volume below quorum. This is r-drbd's
+  own rule for planned maintenance; a dead node therefore holds back every
+  automatic update until its Volumes recover or are evicted.
 - Backstop: a worker refuses to start a kubelet newer than the controller's
   apiserver, and greenboot rolls it back.
-- Workers reboot on their own schedule: nothing yet keeps two from rebooting
-  at once.
 
 The firewall follows the profile (workers expose only kubelet and Geneve).
 Note that upgrading a pre-existing install to this revision enables firewalld
@@ -236,8 +242,8 @@ Two suites gate the topology: `multinode-smoke` (containers; join
 mechanics, cert flow, cross-node pod-to-pod, pod-to-service and cluster
 DNS) and `multinode-test` (two QEMU VMs; the same dataplane asserts on a
 real bootc deployment with firewalld running and greenboot green on both
-roles, then a controller update the worker follows by digest, and the
-update gate skipping a rolled-back image).
+roles, then a controller update the worker follows by digest once the
+update lock is free, and the update gate skipping a rolled-back image).
 
 ## Patch policy
 
