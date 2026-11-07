@@ -257,7 +257,9 @@ jobs:
           set -euo pipefail
           image="ghcr.io/${{ github.repository_owner }}/microshift"
           full="${{ steps.version.outputs.version }}_epheo.${EPHEO_REV}"
-          inspect() { skopeo inspect --retry-times 3 --no-tags "docker://${image}:$1"; }
+          # Anonymous: the package is public, and root's podman login left an auth
+          # file under the runner's XDG_RUNTIME_DIR that this user cannot read.
+          inspect() { skopeo inspect --retry-times 3 --no-creds --no-tags "docker://${image}:$1"; }
           ref="$(inspect "${full}")"
           digest="$(echo "${ref}" | jq -r .Digest)"
           for tag in "${{ steps.version.outputs.minor }}" latest; do
