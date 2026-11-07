@@ -23,6 +23,11 @@
 # fails the run; set UPGRADE_ALLOW_MISSING=1 to skip instead (first
 # release, forks).
 #
+# With ROLLBACK=1 as well, the candidate first goes red on purpose: greenboot
+# must roll it back and MicroShift must restore the previous release's data
+# (an older binary refuses data a newer minor migrated). Then the candidate
+# is installed again and the suite runs on it as usual.
+#
 # Requires root-capable podman (bootc-image-builder is a privileged container
 # reading the root containers-storage) and qemu-system-x86_64. Uses KVM when
 # /dev/kvm exists, falls back to TCG (slow) otherwise. Upgrade mode also
@@ -35,6 +40,7 @@ set -euo pipefail
 DIST_IMAGE="${DIST_IMAGE:-epheo-microshift}"
 UPGRADE_FROM="${UPGRADE_FROM:-}"
 UPGRADE_ALLOW_MISSING="${UPGRADE_ALLOW_MISSING:-}"
+ROLLBACK="${ROLLBACK:-}"
 USHIFT_GITREF="${USHIFT_GITREF:-$(sed -n 's/^USHIFT_GITREF=//p' "$(dirname "$0")/../versions.env")}"
 . "$(dirname "$0")/lib-diag.sh"
 WORKDIR="${WORKDIR:-/tmp/epheo-microshift-vm${UPGRADE_FROM:+-upgrade}}"
@@ -47,6 +53,8 @@ REG_NAME=epheo-microshift-upgrade-registry
 # 10.0.2.2 is the QEMU user-network alias for the host loopback.
 CANDIDATE_REF="10.0.2.2:${REG_PORT}/epheo-microshift:candidate"
 VG_NAME="myvg1" # the VG microshift-r-drbd-default-pool turns into a Pool
+FORCE_RED_CHECK=/etc/greenboot/check/required.d/99_vm_test_force_red.sh
+FORCE_RED_TRIGGER=/var/vm-test-force-red
 
 log() { echo "--- $*"; }
 
@@ -141,6 +149,18 @@ node_ready() { koc get node | grep -q ' Ready '; }
 wait_microshift() {
     wait_for 300 "active microshift.service" vssh systemctl is-active -q microshift.service
     wait_for 300 "Ready node" node_ready
+}
+
+# Precise: after a greenboot rollback the candidate ref still appears in the
+# deployment list, so a substring grep over the whole status passes wrongly.
+booted_image() { vssh bootc status --json | jq -r '.status.booted.image.image.image'; }
+
+# The log phrasing differs between greenboot implementations (bash: "Boot
+# Status is GREEN"; the CS10 Rust rewrite: "greenboot health-check passed").
+# -b: with a persistent journal a pre-upgrade GREEN would satisfy the grep.
+greenboot_green() {
+    vssh journalctl -b -u greenboot-healthcheck --no-pager \
+        | grep -qiE 'Status is GREEN|health-check passed'
 }
 
 wait_pod_running() {
@@ -299,28 +319,120 @@ if [ -n "${UPGRADE_FROM}" ]; then
     pre_backup="$(vssh jq -r '.deployment_id + "_" + .boot_id' /var/lib/microshift/version)"
     log "previous release data: version ${pre_version}, backup name ${pre_backup}"
 
-    log "bootc switch to the candidate (pull over the user network)"
-    vssh bootc switch "${CANDIDATE_REF}"
-    vssh bootc status | grep -qF "${CANDIDATE_REF}"
-
-    log "rebooting into the candidate"
-    old_boot_id="$(vssh cat /proc/sys/kernel/random/boot_id)"
-    vssh reboot || true
     new_boot() {
         local id
         id="$(vssh cat /proc/sys/kernel/random/boot_id)"
         [ -n "${id}" ] && [ "${id}" != "${old_boot_id}" ]
     }
-    wait_for 600 "VM back from the upgrade reboot" new_boot
+    upgrade_to_candidate() {
+        log "bootc switch to the candidate (pull over the user network)"
+        vssh bootc switch "${CANDIDATE_REF}"
+        local staged
+        staged="$(vssh bootc status --json | jq -r '.status.staged.image.image.image')"
+        [ "${staged}" = "${CANDIDATE_REF}" ] || {
+            echo "ERROR: staged image is '${staged}', expected '${CANDIDATE_REF}'" >&2
+            exit 1
+        }
+        log "rebooting into the candidate"
+        old_boot_id="$(vssh cat /proc/sys/kernel/random/boot_id)"
+        vssh reboot || true
+        wait_for 600 "VM back from the upgrade reboot" new_boot
+    }
+
+    if [ -n "${ROLLBACK}" ]; then
+        # Shows how the boots went whether the rollback came or not.
+        rollback_report() {
+            vssh journalctl --list-boots --no-pager | tail -8 || true
+            vssh sh -c 'journalctl -u greenboot-healthcheck --no-pager | grep -iE "counter|rollback|trigger|fallback|imminent|restore|passed|error|vm-test" | tail -40' || true
+            vssh grub2-editenv list || true
+            vssh ls /var/lib/microshift-backups || true
+        }
+
+        # /etc is per deployment: written here, the check reaches the
+        # candidate through the /etc merge at the switch, and stays on the
+        # previous release too, where it must pass. It waits for the trigger
+        # so the candidate first writes data the restore has to undo.
+        log "installing a greenboot check that fails on the candidate"
+        vssh sh -c "cat > ${FORCE_RED_CHECK} && chmod 755 ${FORCE_RED_CHECK}" <<EOF
+#!/bin/bash
+[ "\$(bootc status --json | jq -r .status.booted.image.image.image)" = "${CANDIDATE_REF}" ] || exit 0
+for _ in \$(seq 180); do
+    [ -e ${FORCE_RED_TRIGGER} ] && { echo "vm-test: forced red"; exit 1; }
+    sleep 5
+done
+echo "vm-test: forced red, no trigger after 15m"
+exit 1
+EOF
+        upgrade_to_candidate
+        [ "$(booted_image)" = "${CANDIDATE_REF}" ] || {
+            echo "ERROR: the first boot after the switch is not the candidate" >&2
+            exit 1
+        }
+        wait_microshift
+
+        want_version="${USHIFT_GITREF%%-*}"
+        log "assert: the candidate migrated the data to ${want_version}"
+        mid_version="$(vssh jq -r .version /var/lib/microshift/version)"
+        [ "${mid_version}" = "${want_version}" ] || {
+            echo "ERROR: candidate data version is '${mid_version}'" >&2
+            exit 1
+        }
+        koc create configmap rollback-marker --from-literal=probe=candidate-only
+
+        log "forcing greenboot red on the candidate"
+        vssh touch "${FORCE_RED_TRIGGER}"
+        # About 4 candidate boots (greenboot's 3 retries) then the rollback.
+        rolled_back() { [ "$(booted_image)" = "${UPGRADE_FROM}" ]; }
+        wait_for 1800 "greenboot rollback to ${UPGRADE_FROM}" rolled_back || {
+            rollback_report
+            exit 1
+        }
+        rollback_report
+
+        wait_microshift
+        wait_for 600 "greenboot GREEN on the rolled-back boot" greenboot_green || {
+            vssh journalctl -b -u greenboot-healthcheck --no-pager | tail -30 || true
+            exit 1
+        }
+
+        log "assert: MicroShift restored the previous release's data"
+        vssh test ! -e /var/lib/microshift-backups/restore || {
+            echo "ERROR: the restore marker is still there" >&2
+            exit 1
+        }
+        post_version="$(vssh jq -r .version /var/lib/microshift/version)"
+        [ "${post_version}" = "${pre_version}" ] || {
+            echo "ERROR: data version is '${post_version}', expected '${pre_version}'" >&2
+            exit 1
+        }
+        koc get configmap upgrade-marker -o jsonpath='{.data.probe}' | grep -q pre-upgrade
+        [ -z "$(koc get configmap rollback-marker --ignore-not-found -o name)" ] || {
+            echo "ERROR: the candidate's configmap survived the rollback" >&2
+            exit 1
+        }
+
+        # A leftover counter would roll the next update back on its first red.
+        log "assert: greenboot cleared its boot counter"
+        grubenv="$(vssh grub2-editenv list)"
+        if grep -q '^boot_counter=' <<<"${grubenv}"; then
+            echo "ERROR: boot_counter left in grubenv:" >&2
+            echo "${grubenv}" >&2
+            exit 1
+        fi
+
+        # The real follow-up: the update comes back (fixed) over restored data.
+        log "removing the forced red check; installing the candidate again"
+        vssh rm -f "${FORCE_RED_CHECK}" "${FORCE_RED_TRIGGER}"
+        pre_backup="$(vssh jq -r '.deployment_id + "_" + .boot_id' /var/lib/microshift/version)"
+    fi
+
+    upgrade_to_candidate
 fi
 
 # --- 5. Assert this is a real bootc deployment of the candidate ---------------
 if [ -n "${UPGRADE_FROM}" ]; then
-    # Precise booted-deployment check: after a greenboot rollback the
-    # candidate ref still appears in the deployment list, so a substring
-    # grep over the whole status would pass wrongly.
     log "assert: the booted deployment is the candidate"
-    booted="$(vssh bootc status --json | jq -r '.status.booted.image.image.image')"
+    booted="$(booted_image)"
     if [ "${booted}" != "${CANDIDATE_REF}" ]; then
         echo "ERROR: booted image is '${booted}', expected '${CANDIDATE_REF}' (greenboot rollback?)" >&2
         exit 1
@@ -677,14 +789,8 @@ if [ -n "${UPGRADE_FROM}" ]; then
     }
 fi
 
-# The log phrasing differs between greenboot implementations (bash: "Boot
-# Status is GREEN"; the CS10 Rust rewrite: "greenboot health-check passed") —
-# accept both, then assert the actual contract: boot_success=1 in grubenv.
-# -b: with a persistent journal a pre-upgrade GREEN would satisfy the grep.
-greenboot_green() {
-    vssh journalctl -b -u greenboot-healthcheck --no-pager \
-        | grep -qiE 'Status is GREEN|health-check passed'
-}
+# The log line alone is implementation-specific; boot_success=1 in grubenv
+# below is the actual contract.
 wait_for 300 "greenboot GREEN on this boot" greenboot_green || {
     vssh journalctl -b -u greenboot-healthcheck --no-pager | tail -30 || true
     exit 1
