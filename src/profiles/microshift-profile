@@ -46,6 +46,11 @@ controller)
     echo "Profile: controller."
     echo "A previous worker join is not undone; run 'microshift-cleanup-data --all'"
     echo "before re-purposing a joined node."
+    booted="$(bootc status --json 2>/dev/null | jq -r '.status.booted.image.image.image // empty')" || true
+    case "${booted}" in *@*)
+        echo "This node tracks ${booted}, the image it followed as a worker:"
+        echo "'bootc switch <image>:<tag>' lets it update on its own again." ;;
+    esac
     ;;
 worker)
     mkdir -p "${OVERRIDE_DIR}"

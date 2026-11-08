@@ -21,6 +21,9 @@
 #   - Node profiles: every image can be a controller (default) or a worker
 #     (microshift-profile worker + microshift add-node --worker); workers hold
 #     no signing keys (patches/0006, 0007).
+#   - The controller leads updates and workers follow the image it booted
+#     green, one node at a time and only while every r-drbd Volume is fully
+#     replicated; no node retries an image greenboot rolled back.
 #
 # Derived images (site/lab layers) may drop additional OCI archives + manifest
 # lines under /usr/lib/embedded-images/ — the import service picks them up.
@@ -172,6 +175,20 @@ RUN /tmp/repair-module-store.sh && rm -vf /tmp/repair-module-store.sh
 
 # Node role selector: controller (default) or worker (multinode, patches/0006).
 COPY --chmod=755 ./src/profiles/microshift-profile /usr/bin/microshift-profile
+
+# Updates: the controller leads on bootc's own timer and publishes the image
+# it booted green; workers follow that exact image, one node at a time.
+# src/update/microshift-update says why.
+COPY --chmod=755 ./src/update/microshift-update /usr/libexec/microshift-update
+COPY ./src/update/microshift-update-publish.service \
+     ./src/update/microshift-update-follow.service \
+     ./src/update/microshift-update-follow.timer \
+     /usr/lib/systemd/system/
+COPY ./src/update/bootc-fetch-apply-updates.conf \
+     /usr/lib/systemd/system/bootc-fetch-apply-updates.service.d/50-microshift-update.conf
+COPY --chmod=755 ./src/update/greenboot-red.sh /etc/greenboot/red.d/50_microshift_update_rolled_back.sh
+COPY ./src/update/manifests/ /usr/lib/microshift/manifests.d/010-microshift-update/
+RUN systemctl enable microshift-update-publish.service microshift-update-follow.timer
 
 # r-drbd, the storage plane. Its manifests apply from manifests.d like the
 # rest of the payload; its images are listed in a release-info JSON so the

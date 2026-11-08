@@ -1,0 +1,9 @@
+[Unit]
+Description=Switch this worker to the image its controller booted green
+ConditionPathExists=/run/ostree-booted
+After=greenboot-healthcheck.service microshift.service
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/libexec/microshift-update when worker
+ExecStart=/usr/libexec/microshift-update follow

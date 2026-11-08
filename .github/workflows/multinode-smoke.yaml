@@ -1,7 +1,8 @@
 name: multinode-smoke
 # Worker-join acceptance, built from the dispatched ref's source. Two lanes on independent runners:
 #   smoke    two privileged containers, join mechanics + dataplane (~30m)
-#   vm-join  two QEMU VMs, bootc deploy + firewalld + greenboot (~60m)
+#   vm-join  two QEMU VMs, bootc deploy + firewalld + greenboot, then a
+#            controller update the worker follows (~85m)
 # Publishes nothing; build.yaml stays the only publish path.
 
 on:

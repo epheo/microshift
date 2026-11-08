@@ -5,7 +5,8 @@
 # + 'microshift add-node --worker', and assert the result is a working
 # cluster: both nodes Ready, every pod Running, cross-node pod-to-pod
 # and pod-to-service traffic, cluster DNS from a worker pod, and
-# greenboot health checks green on both roles.
+# greenboot health checks green on both roles. Then the controller takes an
+# update from a registry on the host and the worker must follow it.
 #
 # Requires root-capable podman, qemu-system-x86_64, dnsmasq, and sudo
 # for the bridge/taps. Runner-sized: two 5GB VMs.
@@ -16,6 +17,8 @@ set -euo pipefail
 DIST_IMAGE="${DIST_IMAGE:-epheo-microshift}"
 WORKDIR="${WORKDIR:-/tmp/epheo-microshift-multinode}"
 BIB_IMAGE="${BIB_IMAGE:-quay.io/centos-bootc/bootc-image-builder:latest}"
+REGISTRY_IMAGE="${REGISTRY_IMAGE:-quay.io/libpod/registry:2.8}"
+REG_NAME=epheo-microshift-multinode-registry
 VM_MEM="${VM_MEM:-5120}"
 BR=ushift-mn-br0
 # Keep guest networks out of 10.42-10.44: pods, services, and the
@@ -25,8 +28,10 @@ IP1=$NET.11
 IP2=$NET.12
 MAC1=52:54:00:45:00:01
 MAC2=52:54:00:45:00:02
+REG="${NET}.1:5000"
 KEEP="${KEEP:-0}"
 . "$(dirname "$0")/lib-diag.sh"
+. "$(dirname "$0")/lib-settle.sh"
 
 log() { echo "--- $*"; }
 die() { echo "FAIL: $*" >&2; exit 1; }
@@ -89,6 +94,9 @@ node_summary() { # node_summary <exec-fn> <name>
     ${fn} sh -c 'ovs-vsctl --timeout=5 show | head -40' 2>&1
     echo "### ${name}: failed units ###"
     ${fn} systemctl list-units --failed --no-pager 2>&1
+    echo "### ${name}: update units (this boot) ###"
+    ${fn} journalctl -b --no-pager -u microshift-update-publish -u microshift-update-follow \
+        -u bootc-fetch-apply-updates 2>&1 | tail -30
     diag_selinux "${fn}" 20 "${name}"
 }
 
@@ -102,6 +110,9 @@ diagnostics() {
         echo "### nodes ###"; koc get nodes -o wide 2>&1
         echo "### non-running pods ###"
         koc get pods -A -o wide --no-headers 2>&1 | grep -vE 'Running|Completed'
+        echo "### update image, lock and Volumes ###"
+        koc -n kube-public get configmap microshift-update microshift-update-lock -o yaml 2>&1
+        koc get volumes.r-drbd.io 2>&1
         echo "### events ###"
         koc get events -A --sort-by='.metadata.creationTimestamp' 2>&1 | tail -30
         echo "### not-ready pod logs ###"
@@ -136,6 +147,7 @@ cleanup() {
     fi
     for n in 1 2; do sudo kill "$(sudo cat "${WORKDIR}/qemu${n}.pid" 2>/dev/null)" 2>/dev/null || true; done
     sleep 1
+    sudo podman rm -f "${REG_NAME}" >/dev/null 2>&1 || true
     host_net_down
     # On failure keep WORKDIR: the workflow uploads console*.log and diag*.log
     # from it AFTER this script exits, and the next run starts with its own
@@ -184,10 +196,20 @@ esac
 # --- 2. qcow2 ----------------------------------------------------------------
 log "building qcow2 from ${SRC_IMAGE} (bootc-image-builder)"
 ssh-keygen -q -t ed25519 -N '' -f "${WORKDIR}/id"
+# The update test pulls from the host over plain HTTP and needs room for a
+# second deployment.
 cat > "${WORKDIR}/config.toml" <<EOF
 [[customizations.user]]
 name = "root"
 key = "$(cat "${WORKDIR}/id.pub")"
+
+[[customizations.files]]
+path = "/etc/containers/registries.conf.d/900-multinode-test.conf"
+data = "[[registry]]\nlocation = \"${REG}\"\ninsecure = true\n"
+
+[[customizations.filesystem]]
+mountpoint = "/"
+minsize = "20 GiB"
 EOF
 sudo podman run --rm --privileged \
     --security-opt label=type:unconfined_t \
@@ -299,10 +321,9 @@ if echo "${labels}" | grep -q 'node-role.kubernetes.io/control-plane'; then
 fi
 
 pods_settled() {
-    local total bad
+    local total
     total=$(koc get pods -A --no-headers 2>/dev/null | wc -l)
-    bad=$(koc get pods -A --no-headers 2>/dev/null | grep -cvE 'Running|Completed' || true)
-    [ "${total}" -ge 12 ] && [ "${bad}" -eq 0 ]
+    [ "${total}" -ge 12 ] && [ -z "$(unsettled_pods)" ]
 }
 retry 900 "all pods Running/Completed on both nodes" pods_settled
 
@@ -413,5 +434,94 @@ retry 300 "ovnkube-node counts the worker's pod unavailable" ovnk_short
 greenboot_checks v1 controller
 v2 systemctl start microshift
 retry 300 "both nodes Ready after the worker comes back" both_ready
+
+# --- 10. The worker follows the controller's update -----------------------------
+log "serving updates from ${REG}"
+sudo podman rm -f "${REG_NAME}" >/dev/null 2>&1 || true
+sudo podman run -d --name "${REG_NAME}" -p "${REG}:5000" "${REGISTRY_IMAGE}" >/dev/null
+
+# push_update <tag> <marker>: the image plus one file, so a new digest.
+push_update() {
+    local ctx="${WORKDIR}/update-$2"
+    mkdir -p "${ctx}"
+    echo "$2" > "${ctx}/marker"
+    printf 'FROM %s\nCOPY marker /usr/share/epheo-multinode-test\n' "${SRC_IMAGE}" > "${ctx}/Containerfile"
+    sudo podman build -q -t "${REG}/epheo-microshift:$1" "${ctx}" >/dev/null
+    for i in $(seq 5); do
+        sudo podman push -q --tls-verify=false --digestfile "${ctx}/digest" \
+            "${REG}/epheo-microshift:$1" && break
+        [ "${i}" = 5 ] && die "could not push to ${REG}"
+        sleep 2
+    done
+    cat "${ctx}/digest"
+}
+digest_of() { $1 bootc status --json | jq -r '.status.booted.image.imageDigest'; }
+lock_holder() { koc -n kube-public get configmap microshift-update-lock -o jsonpath='{.data.holder}'; }
+lock_as() { # lock_as <holder>: a fresh hold, as a node mid-update leaves it
+    koc -n kube-public patch configmap microshift-update-lock --type merge -p \
+        "{\"data\":{\"holder\":\"$1\",\"expires\":\"$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)\"}}" >/dev/null
+}
+unlock_all() {
+    koc -n kube-public patch configmap microshift-update-lock --type merge \
+        -p '{"data":{"holder":null,"expires":null}}' >/dev/null
+}
+
+# Another node holds the update lock from the start: the worker must wait
+# for it however long the controller's own update takes.
+lock_as vm-test
+update_a="$(push_update update a)"
+log "updating the controller to ${update_a}"
+boot1="$(v1 cat /proc/sys/kernel/random/boot_id)"
+v1 bootc switch --quiet "${REG}/epheo-microshift:update"
+v1 systemctl reboot || true
+node1_rebooted() { [ "$(v1 cat /proc/sys/kernel/random/boot_id)" != "${boot1}" ]; }
+retry 600 "node1 back from its update" node1_rebooted
+retry 600 "microshift active on node1" microshift_active
+published() {
+    [ "$(koc -n kube-public get configmap microshift-update -o jsonpath='{.data.image}')" \
+        = "${REG}/epheo-microshift@${update_a}" ]
+}
+retry 900 "node1 green and publishing its image" published
+
+log "assert: the worker waits while another node holds the update lock"
+worker_before="$(digest_of v2)"
+v2 systemctl start microshift-update-follow.service
+v2 journalctl -u microshift-update-follow -b --no-pager | grep 'vm-test is updating' >/dev/null \
+    || die "the worker's follow did not wait for the lock holder"
+[ "$(digest_of v2)" = "${worker_before}" ] || die "the worker updated while another node held the lock"
+unlock_all
+
+log "assert: the worker follows the controller to the same digest"
+followed() { [ "$(digest_of v2)" = "${update_a}" ]; }
+retry 1200 "node2 on ${update_a}" followed
+retry 900 "both nodes Ready after the worker's update" both_ready
+retry 900 "all pods Running/Completed after the worker's update" pods_settled
+worker_green() { v2 grub2-editenv list | grep -q 'boot_success=1'; }
+retry 600 "greenboot green on node2's new boot" worker_green
+lock_free() { [ -z "$(lock_holder)" ]; }
+retry 600 "node2 releases the update lock after its green boot" lock_free
+
+log "assert: bootc's own update timer stays idle on the worker"
+v2 systemctl start bootc-fetch-apply-updates.service
+# Not grep -q: its early exit would fail the pipe (pipefail).
+v2 journalctl -u bootc-fetch-apply-updates -b --no-pager \
+    | grep 'workers follow the controller' >/dev/null \
+    || die "the worker's bootc-fetch-apply-updates was not skipped"
+
+# Else the controller's timer would bring a rolled-back image back, red again.
+log "assert: the controller skips an image greenboot rolled back"
+update_b="$(push_update update b)"
+v1 sh -c "mkdir -p /var/lib/microshift-update && echo ${update_b} >> /var/lib/microshift-update/rolled-back"
+v1 systemctl start bootc-fetch-apply-updates.service
+[ "$(v1 bootc status --json | jq -r '.status.staged')" = null ] \
+    || die "the controller staged an image it rolled back before"
+v1 journalctl -u bootc-fetch-apply-updates -b --no-pager | grep "skipping ${update_b}" >/dev/null \
+    || die "the controller's update gate did not name ${update_b}"
+v1 sh -c 'echo sha256:0000 > /var/lib/microshift-update/rolled-back'
+log "assert: the gate lets another image through and takes the update lock for it"
+v1 /usr/libexec/microshift-update gate || die "the update gate skips an image nobody rolled back"
+[ "$(lock_holder)" = node1 ] || die "the gate passed without taking the update lock (holder: '$(lock_holder)')"
+unlock_all
+v1 rm -f /var/lib/microshift-update/rolled-back
 
 log "MULTINODE TEST PASSED"

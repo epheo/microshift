@@ -1,0 +1,52 @@
+# Every node, with its kubelet's own credential: reads the image to follow,
+# takes and releases the update lock, and reads Volume health before a reboot.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: microshift-update
+  namespace: kube-public
+rules:
+- apiGroups: [""]
+  resources: [configmaps]
+  resourceNames: [microshift-update]
+  verbs: [get]
+- apiGroups: [""]
+  resources: [configmaps]
+  resourceNames: [microshift-update-lock]
+  verbs: [get, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: microshift-update
+  namespace: kube-public
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: microshift-update
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: Group
+  name: system:nodes
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: microshift-update-volumes
+rules:
+- apiGroups: [r-drbd.io]
+  resources: [volumes]
+  verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: microshift-update-volumes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: microshift-update-volumes
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: Group
+  name: system:nodes

@@ -43,6 +43,7 @@ UPGRADE_ALLOW_MISSING="${UPGRADE_ALLOW_MISSING:-}"
 ROLLBACK="${ROLLBACK:-}"
 USHIFT_GITREF="${USHIFT_GITREF:-$(sed -n 's/^USHIFT_GITREF=//p' "$(dirname "$0")/../versions.env")}"
 . "$(dirname "$0")/lib-diag.sh"
+. "$(dirname "$0")/lib-settle.sh"
 WORKDIR="${WORKDIR:-/tmp/epheo-microshift-vm${UPGRADE_FROM:+-upgrade}}"
 SSH_PORT="${SSH_PORT:-2222}"
 VM_MEM="${VM_MEM:-8192}"
@@ -378,6 +379,7 @@ EOF
             exit 1
         }
         koc create configmap rollback-marker --from-literal=probe=candidate-only
+        candidate_digest="$(vssh bootc status --json | jq -r '.status.booted.image.imageDigest')"
 
         log "forcing greenboot red on the candidate"
         vssh touch "${FORCE_RED_TRIGGER}"
@@ -408,6 +410,13 @@ EOF
         koc get configmap upgrade-marker -o jsonpath='{.data.probe}' | grep -q pre-upgrade
         [ -z "$(koc get configmap rollback-marker --ignore-not-found -o name)" ] || {
             echo "ERROR: the candidate's configmap survived the rollback" >&2
+            exit 1
+        }
+
+        # Else bootc's timer would bring the same image back, red again.
+        log "assert: updates now skip the rolled-back image"
+        vssh grep -qxF "${candidate_digest}" /var/lib/microshift-update/rolled-back || {
+            echo "ERROR: ${candidate_digest} is not in /var/lib/microshift-update/rolled-back" >&2
             exit 1
         }
 
@@ -451,15 +460,6 @@ wait_microshift
 rollouts_done() {
     koc get daemonsets,deployments -A -o jsonpath='{range .items[*]}{.metadata.generation}|{.status.observedGeneration}|{.status.desiredNumberScheduled}{.spec.replicas}|{.status.updatedNumberScheduled}{.status.updatedReplicas}|{.status.numberAvailable}{.status.availableReplicas}{"\n"}{end}' 2>/dev/null \
         | awk -F'|' 'NF == 5 { n++; if ($1 != $2 || $4+0 != $3+0 || $5+0 != $3+0) bad = 1 } END { exit (bad || n == 0) }'
-}
-# Graceful node shutdown (for r-drbd) leaves the pods it killed Failed with
-# reason Terminated, shown as Error, until pod GC: only their replacements,
-# covered by rollouts_done, tell whether the new boot settled.
-unsettled_pods() {
-    local killed
-    killed="$(koc get pods -A -o jsonpath='{range .items[?(@.status.reason=="Terminated")]}{.metadata.namespace}/{.metadata.name} {end}' 2>/dev/null)" || true
-    koc get pods -A --no-headers 2>/dev/null \
-        | awk -v killed=" ${killed}" '!/Running|Completed/ && index(killed, " " $1 "/" $2 " ") == 0'
 }
 log "waiting for all pods to be Running/Completed and rollouts done (up to 15m)"
 ok=false
@@ -798,6 +798,32 @@ wait_for 300 "greenboot GREEN on this boot" greenboot_green || {
 
 log "assert: grubenv records boot_success=1"
 vssh grub2-editenv list | grep -q 'boot_success=1'
+
+# multinode-test proves the follow itself; this is the controller's half on
+# every lane, read with a kubelet's credential as a worker reads it.
+want_image="$(vssh bootc status --json | jq -r '.status.booted.image
+    | (.image.image | sub("@.*$"; "") | sub(":[^:/]*$"; "")) + "@" + .imageDigest')"
+published_image() {
+    [ "$(vssh oc --kubeconfig /var/lib/microshift/resources/kubelet/kubeconfig \
+        -n kube-public get configmap microshift-update -o jsonpath='{.data.image}')" = "${want_image}" ]
+}
+wait_for 180 "kube-public/microshift-update to name ${want_image}" published_image || {
+    vssh journalctl -b -u microshift-update-publish --no-pager | tail -20 || true
+    exit 1
+}
+
+log "assert: a node's own credential names it, reads the Volumes, and may take the free update lock"
+NODE_KCFG=/var/lib/microshift/resources/kubelet/kubeconfig
+vssh oc --kubeconfig "${NODE_KCFG}" auth whoami -o jsonpath='{.status.userInfo.username}' \
+    | grep '^system:node:' >/dev/null
+vssh oc --kubeconfig "${NODE_KCFG}" get volumes.r-drbd.io -o name >/dev/null
+lock_holder="$(vssh oc --kubeconfig "${NODE_KCFG}" -n kube-public get configmap microshift-update-lock \
+    -o jsonpath='{.data.holder}')"
+[ -z "${lock_holder}" ] || { echo "ERROR: the update lock is held by '${lock_holder}'" >&2; exit 1; }
+# A server dry run passes admission too: auth can-i would miss NodeRestriction,
+# which refuses a node every Lease but its own.
+vssh sh -c "oc --kubeconfig ${NODE_KCFG} -n kube-public get configmap microshift-update-lock -o json \
+    | oc --kubeconfig ${NODE_KCFG} replace --dry-run=server -f -" >/dev/null
 
 log "assert: no failed systemd units"
 failed="$(vssh systemctl --failed --no-legend | wc -l)"

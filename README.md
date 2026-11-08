@@ -17,7 +17,7 @@ Published at `ghcr.io/epheo/microshift`.
 | r-drbd is the storage driver | [r-drbd](https://github.com/epheo/r-drbd) (DRBD 9 on thin LVM) with its DRBD module built for the image kernel; local volumes on one node, replicated ones on three. See [Storage](#storage) |
 | Air-gapped by default | the full MicroShift payload is embedded as a shared-blob OCI layout and imported into cri-o at boot — first boot needs no registry |
 | [portail](https://github.com/epheo/portail) is the edge | its image is embedded and imported the same way; the router is off and the Gateway API experimental CRDs (TCPRoute, UDPRoute) ship with the image, see [The edge](#the-edge) |
-| Updates must be safe | greenboot MicroShift health gate stays enabled; bootc rollback does the rest |
+| Updates must be safe | greenboot MicroShift health gate stays enabled; bootc rollback does the rest; no node retries an image greenboot rolled back, and workers follow the image the controller booted green, see [Multinode](#multinode-experimental) |
 | Logs are signal, not noise | `patches/0002` (etcd logs every request at warn — missing threshold default) and `patches/0003` (router status watcher hot-loops when `ingress.status: Removed`) |
 | Terminated pod GC is tunable | `patches/0009` adds `kubeControllerManager.terminatedPodGCThreshold`, the pod garbage collector's threshold (default unchanged, 12500): set it lower where graceful node shutdown leaves many terminated pods |
 | Every image can be controller or worker | `microshift-profile` selects the role; `patches/0006`-`0008` add a worker mode where nodes hold no signing keys and OVN runs one interconnect zone per node |
@@ -97,7 +97,8 @@ sudo make vm-test-upgrade  # the same assertions after a real update: boot the
 sudo make multinode-smoke  # worker join in two privileged containers: join
                            # mechanics, certs, cross-node pod/service traffic
 sudo make multinode-test   # two-VM worker join: bootc deploy + firewalld +
-                           # greenboot + the same cross-node dataplane asserts
+                           # greenboot + the same cross-node dataplane asserts,
+                           # then a controller update the worker follows
 make version               # print the version string of the built RPMs
 ```
 
@@ -199,11 +200,35 @@ from the CA the control plane publishes, so control-plane CA rotation does not
 require a re-join. The greenboot gate stays enabled on workers: `microshift
 healthcheck` detects the role and gates on the node being Ready in the cluster.
 
-Updates follow the Kubernetes version skew policy: update the controller
-first, then the workers. A worker never runs a kubelet newer than the
-controller's apiserver: an update that would is refused before it touches the
-node's data, greenboot rolls it back, and the next update timer run retries
-once the controller has moved.
+Updates: the controller leads, workers follow.
+- The controller updates on bootc's own timer, like a single node.
+- Once a boot is green, it publishes the image it booted, by digest, in
+  `kube-public/microshift-update`.
+- Every 5 minutes a worker switches to that image when it runs another one
+  (`microshift-update-follow.timer`); bootc's own timer stays idle on workers.
+- So a worker updates minutes after the controller and never before it, as
+  the Kubernetes version skew policy requires, and never to an image the
+  controller rolled back.
+- Workers pull from the controller's repository: an air-gapped site that
+  mirrors it sets a `registries.conf` mirror.
+- Until a worker has rebooted into the new image, its DaemonSet pods wait for
+  images it does not hold yet, unless it can pull them.
+- Any node records an image greenboot rolled back in
+  `/var/lib/microshift-update/rolled-back`, and its updates skip that image
+  until another one is published. A manual `bootc upgrade --apply` or
+  `bootc switch` still applies it.
+- A worker tracks a digest: after `microshift-profile controller`,
+  `bootc switch` it to a tag to update on its own.
+- One node at a time, the controller included: a node takes the lock
+  `kube-public/microshift-update-lock` before it reboots into an update, and
+  releases it once green again. A node that never comes back loses it after
+  an hour.
+- And only while no r-drbd Volume is Degraded or Provisioning: a second
+  replica down could take a replicated volume below quorum. This is r-drbd's
+  own rule for planned maintenance; a dead node therefore holds back every
+  automatic update until its Volumes recover or are evicted.
+- Backstop: a worker refuses to start a kubelet newer than the controller's
+  apiserver, and greenboot rolls it back.
 
 The firewall follows the profile (workers expose only kubelet and Geneve).
 Note that upgrading a pre-existing install to this revision enables firewalld
@@ -217,7 +242,8 @@ Two suites gate the topology: `multinode-smoke` (containers; join
 mechanics, cert flow, cross-node pod-to-pod, pod-to-service and cluster
 DNS) and `multinode-test` (two QEMU VMs; the same dataplane asserts on a
 real bootc deployment with firewalld running and greenboot green on both
-roles).
+roles, then a controller update the worker follows by digest once the
+update lock is free, and the update gate skipping a rolled-back image).
 
 ## Patch policy
 
