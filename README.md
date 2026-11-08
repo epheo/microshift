@@ -19,7 +19,7 @@ Published at `ghcr.io/epheo/microshift`.
 | [portail](https://github.com/epheo/portail) is the edge | its image is embedded and imported the same way; the router is off and the Gateway API experimental CRDs (TCPRoute, UDPRoute) ship with the image, see [The edge](#the-edge) |
 | Updates must be safe | greenboot MicroShift health gate stays enabled; bootc rollback does the rest; no node retries an image greenboot rolled back, and workers follow the image the controller booted green, see [Multinode](#multinode-experimental) |
 | Logs are signal, not noise | `patches/0002` (etcd logs every request at warn — missing threshold default) and `patches/0003` (router status watcher hot-loops when `ingress.status: Removed`) |
-| Terminated pod GC is tunable | `patches/0009` adds `kubeControllerManager.terminatedPodGCThreshold`, the pod garbage collector's threshold (default unchanged, 12500): set it lower where graceful node shutdown leaves many terminated pods |
+| Terminated pod GC is tunable | `patches/0009` adds `kubeControllerManager.terminatedPodGCThreshold`, the pod garbage collector's threshold (default unchanged, 12500). Graceful node shutdown leaves each pod it stops as `Error` until then, harmless since its replacement runs: set it lower where they pile up |
 | Every image can be controller or worker | `microshift-profile` selects the role; `patches/0006`-`0008` add a worker mode where nodes hold no signing keys and OVN runs one interconnect zone per node |
 | The firewall is on and role-scoped | firewalld enabled with `microshift-controlplane`/`microshift-node` services; etcd is never exposed |
 | Headless and quiet | `bluetooth.service` and `fwupd-refresh.timer` masked; Red Hat client stack (`rhc`, `insights-client`, `subscription-manager`) removed: no radio daemon, no daily LVFS fetch, no registration nag or phone-home |
@@ -211,8 +211,11 @@ Updates: the controller leads, workers follow.
   controller rolled back.
 - Workers pull from the controller's repository: an air-gapped site that
   mirrors it sets a `registries.conf` mirror.
-- Until a worker has rebooted into the new image, its DaemonSet pods wait for
-  images it does not hold yet, unless it can pull them.
+- Before it reboots into an update, the controller announces it: workers
+  download it meanwhile, staged so that no reboot applies it before their
+  turn. Until a worker has rebooted into it, its DaemonSet pods wait for
+  images it does not hold yet, unless it can pull them: a timer run and a
+  reboot, plus the turns of the workers before it.
 - Any node records an image greenboot rolled back in
   `/var/lib/microshift-update/rolled-back`, and its updates skip that image
   until another one is published. A manual `bootc upgrade --apply` or
@@ -221,8 +224,8 @@ Updates: the controller leads, workers follow.
   `bootc switch` it to a tag to update on its own.
 - One node at a time, the controller included: a node takes the lock
   `kube-public/microshift-update-lock` before it reboots into an update, and
-  releases it once green again. A node that never comes back loses it after
-  an hour.
+  releases it as soon as it boots green again. A node that never comes back
+  loses it after an hour.
 - And only while no r-drbd Volume is Degraded or Provisioning: a second
   replica down could take a replicated volume below quorum. This is r-drbd's
   own rule for planned maintenance; a dead node therefore holds back every

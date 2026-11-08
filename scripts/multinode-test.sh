@@ -456,6 +456,10 @@ push_update() {
     cat "${ctx}/digest"
 }
 digest_of() { $1 bootc status --json | jq -r '.status.booted.image.imageDigest'; }
+staged_of() { $1 bootc status --json | jq -r '.status.staged | "\(.image.imageDigest) \(.downloadOnly)"'; }
+boot_id() { $1 cat /proc/sys/kernel/random/boot_id; }
+# An unreachable node reads as no boot id, not as a new one.
+rebooted() { local b; b="$(boot_id "$1")" && [ -n "${b}" ] && [ "${b}" != "$2" ]; }
 lock_holder() { koc -n kube-public get configmap microshift-update-lock -o jsonpath='{.data.holder}'; }
 lock_as() { # lock_as <holder>: a fresh hold, as a node mid-update leaves it
     koc -n kube-public patch configmap microshift-update-lock --type merge -p \
@@ -471,11 +475,10 @@ unlock_all() {
 lock_as vm-test
 update_a="$(push_update update a)"
 log "updating the controller to ${update_a}"
-boot1="$(v1 cat /proc/sys/kernel/random/boot_id)"
+boot1="$(boot_id v1)"
 v1 bootc switch --quiet "${REG}/epheo-microshift:update"
 v1 systemctl reboot || true
-node1_rebooted() { [ "$(v1 cat /proc/sys/kernel/random/boot_id)" != "${boot1}" ]; }
-retry 600 "node1 back from its update" node1_rebooted
+retry 600 "node1 back from its update" rebooted v1 "${boot1}"
 retry 600 "microshift active on node1" microshift_active
 published() {
     [ "$(koc -n kube-public get configmap microshift-update -o jsonpath='{.data.image}')" \
@@ -489,6 +492,8 @@ v2 systemctl start microshift-update-follow.service
 v2 journalctl -u microshift-update-follow -b --no-pager | grep 'vm-test is updating' >/dev/null \
     || die "the worker's follow did not wait for the lock holder"
 [ "$(digest_of v2)" = "${worker_before}" ] || die "the worker updated while another node held the lock"
+[ "$(staged_of v2)" = "${update_a} true" ] \
+    || die "the worker did not download ${update_a} while it waited (staged: $(staged_of v2))"
 unlock_all
 
 log "assert: the worker follows the controller to the same digest"
@@ -499,7 +504,10 @@ retry 900 "all pods Running/Completed after the worker's update" pods_settled
 worker_green() { v2 grub2-editenv list | grep -q 'boot_success=1'; }
 retry 600 "greenboot green on node2's new boot" worker_green
 lock_free() { [ -z "$(lock_holder)" ]; }
-retry 600 "node2 releases the update lock after its green boot" lock_free
+# At boot, not on the next timer run, which may come 6 minutes later.
+[ "$(v2 systemctl is-enabled microshift-update-follow.service)" = enabled ] \
+    || die "the follow does not run at boot"
+retry 120 "node2 releases the update lock after its green boot" lock_free
 
 log "assert: bootc's own update timer stays idle on the worker"
 v2 systemctl start bootc-fetch-apply-updates.service
@@ -518,9 +526,21 @@ v1 systemctl start bootc-fetch-apply-updates.service
 v1 journalctl -u bootc-fetch-apply-updates -b --no-pager | grep "skipping ${update_b}" >/dev/null \
     || die "the controller's update gate did not name ${update_b}"
 v1 sh -c 'echo sha256:0000 > /var/lib/microshift-update/rolled-back'
-log "assert: the gate lets another image through and takes the update lock for it"
+log "assert: the gate lets another image through, announces it and takes the update lock for it"
 v1 /usr/libexec/microshift-update gate || die "the update gate skips an image nobody rolled back"
 [ "$(lock_holder)" = node1 ] || die "the gate passed without taking the update lock (holder: '$(lock_holder)')"
+next="$(koc -n kube-public get configmap microshift-update -o jsonpath='{.data.next}')"
+[ "${next}" = "${REG}/epheo-microshift@${update_b}" ] || die "the gate announced '${next}', not ${update_b}"
+
+# A staged image would otherwise apply at any reboot, ahead of the lock.
+log "assert: the worker downloads the announced image ahead, and a reboot does not apply it"
+v2 systemctl start microshift-update-follow.service
+[ "$(staged_of v2)" = "${update_b} true" ] \
+    || die "the worker did not download ${update_b} ahead (staged: $(staged_of v2))"
+boot2="$(boot_id v2)"
+v2 systemctl reboot || true
+retry 600 "node2 back from a plain reboot" rebooted v2 "${boot2}"
+[ "$(digest_of v2)" = "${update_a}" ] || die "a plain reboot applied the image node2 downloaded ahead"
 unlock_all
 v1 rm -f /var/lib/microshift-update/rolled-back
 
