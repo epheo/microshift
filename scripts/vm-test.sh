@@ -43,6 +43,7 @@ UPGRADE_ALLOW_MISSING="${UPGRADE_ALLOW_MISSING:-}"
 ROLLBACK="${ROLLBACK:-}"
 USHIFT_GITREF="${USHIFT_GITREF:-$(sed -n 's/^USHIFT_GITREF=//p' "$(dirname "$0")/../versions.env")}"
 . "$(dirname "$0")/lib-diag.sh"
+. "$(dirname "$0")/lib-settle.sh"
 WORKDIR="${WORKDIR:-/tmp/epheo-microshift-vm${UPGRADE_FROM:+-upgrade}}"
 SSH_PORT="${SSH_PORT:-2222}"
 VM_MEM="${VM_MEM:-8192}"
@@ -459,15 +460,6 @@ wait_microshift
 rollouts_done() {
     koc get daemonsets,deployments -A -o jsonpath='{range .items[*]}{.metadata.generation}|{.status.observedGeneration}|{.status.desiredNumberScheduled}{.spec.replicas}|{.status.updatedNumberScheduled}{.status.updatedReplicas}|{.status.numberAvailable}{.status.availableReplicas}{"\n"}{end}' 2>/dev/null \
         | awk -F'|' 'NF == 5 { n++; if ($1 != $2 || $4+0 != $3+0 || $5+0 != $3+0) bad = 1 } END { exit (bad || n == 0) }'
-}
-# Graceful node shutdown (for r-drbd) leaves the pods it killed Failed with
-# reason Terminated, shown as Error, until pod GC: only their replacements,
-# covered by rollouts_done, tell whether the new boot settled.
-unsettled_pods() {
-    local killed
-    killed="$(koc get pods -A -o jsonpath='{range .items[?(@.status.reason=="Terminated")]}{.metadata.namespace}/{.metadata.name} {end}' 2>/dev/null)" || true
-    koc get pods -A --no-headers 2>/dev/null \
-        | awk -v killed=" ${killed}" '!/Running|Completed/ && index(killed, " " $1 "/" $2 " ") == 0'
 }
 log "waiting for all pods to be Running/Completed and rollouts done (up to 15m)"
 ok=false

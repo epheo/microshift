@@ -31,6 +31,7 @@ MAC2=52:54:00:45:00:02
 REG="${NET}.1:5000"
 KEEP="${KEEP:-0}"
 . "$(dirname "$0")/lib-diag.sh"
+. "$(dirname "$0")/lib-settle.sh"
 
 log() { echo "--- $*"; }
 die() { echo "FAIL: $*" >&2; exit 1; }
@@ -320,10 +321,9 @@ if echo "${labels}" | grep -q 'node-role.kubernetes.io/control-plane'; then
 fi
 
 pods_settled() {
-    local total bad
+    local total
     total=$(koc get pods -A --no-headers 2>/dev/null | wc -l)
-    bad=$(koc get pods -A --no-headers 2>/dev/null | grep -cvE 'Running|Completed' || true)
-    [ "${total}" -ge 12 ] && [ "${bad}" -eq 0 ]
+    [ "${total}" -ge 12 ] && [ -z "$(unsettled_pods)" ]
 }
 retry 900 "all pods Running/Completed on both nodes" pods_settled
 
