@@ -820,14 +820,18 @@ wait_for 180 "kube-public/microshift-update to name ${want_image}" published_ima
     exit 1
 }
 
-log "assert: a node's own credential names it, reads the Volumes, and finds the update lock free"
+log "assert: a node's own credential names it, reads the Volumes, and may take the free update lock"
 NODE_KCFG=/var/lib/microshift/resources/kubelet/kubeconfig
 vssh oc --kubeconfig "${NODE_KCFG}" auth whoami -o jsonpath='{.status.userInfo.username}' \
     | grep '^system:node:' >/dev/null
 vssh oc --kubeconfig "${NODE_KCFG}" get volumes.r-drbd.io -o name >/dev/null
-lock_holder="$(vssh oc --kubeconfig "${NODE_KCFG}" -n kube-public get lease microshift-update \
-    -o jsonpath='{.spec.holderIdentity}')"
+lock_holder="$(vssh oc --kubeconfig "${NODE_KCFG}" -n kube-public get configmap microshift-update-lock \
+    -o jsonpath='{.data.holder}')"
 [ -z "${lock_holder}" ] || { echo "ERROR: the update lock is held by '${lock_holder}'" >&2; exit 1; }
+# A server dry run passes admission too: auth can-i would miss NodeRestriction,
+# which refuses a node every Lease but its own.
+vssh sh -c "oc --kubeconfig ${NODE_KCFG} -n kube-public get configmap microshift-update-lock -o json \
+    | oc --kubeconfig ${NODE_KCFG} replace --dry-run=server -f -" >/dev/null
 
 log "assert: no failed systemd units"
 failed="$(vssh systemctl --failed --no-legend | wc -l)"

@@ -1,0 +1,7 @@
+# The update lock. No data: MicroShift applies this server-side on every
+# start, which then never touches the holder a node wrote.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: microshift-update-lock
+  namespace: kube-public

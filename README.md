@@ -219,8 +219,8 @@ Updates: the controller leads, workers follow.
   `bootc switch` still applies it.
 - A worker tracks a digest: after `microshift-profile controller`,
   `bootc switch` it to a tag to update on its own.
-- One node at a time, the controller included: a node takes the Lease
-  `kube-public/microshift-update` before it reboots into an update, and
+- One node at a time, the controller included: a node takes the lock
+  `kube-public/microshift-update-lock` before it reboots into an update, and
   releases it once green again. A node that never comes back loses it after
   an hour.
 - And only while no r-drbd Volume is Degraded or Provisioning: a second

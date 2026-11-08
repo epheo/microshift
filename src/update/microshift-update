@@ -16,8 +16,10 @@
 set -euo pipefail
 
 NS=kube-public
-# The ConfigMap with the controller's image, and the Lease one updating node holds.
 NAME=microshift-update
+# Held by the one node updating. A ConfigMap, not a Lease: NodeRestriction
+# lets a node write no Lease but its own, in kube-node-lease.
+LOCK=microshift-update-lock
 ADMIN_KUBECONFIG=/var/lib/microshift/resources/kubeadmin/kubeconfig
 NODE_KUBECONFIG=/var/lib/microshift/resources/kubelet/kubeconfig
 # On /var, so it outlives the deployment that wrote it.
@@ -69,39 +71,32 @@ storage_settled() {
     return 1
 }
 
-lock_expired() {
-    local renew secs
-    renew="$(jq -r '.spec.renewTime // empty' <<<"$1")"
-    secs="$(jq -r '.spec.leaseDurationSeconds // 0' <<<"$1")"
-    [ -z "${renew}" ] || [ $(( $(date -u -d "${renew}" +%s) + secs )) -lt "$(date -u +%s)" ]
-}
+expired() { [ -z "$1" ] || [ "$(date -u -d "$1" +%s)" -lt "$(date -u +%s)" ]; }
 
 # The write carries the resourceVersion just read: two nodes racing for a
 # free lock, one gets a conflict.
 lock() {
-    local me=$1 lease holder now
-    lease="$(noc -n "${NS}" get lease "${NAME}" -o json)" || { echo "cannot read the update lock"; return 1; }
-    holder="$(jq -r '.spec.holderIdentity // empty' <<<"${lease}")"
-    if [ -n "${holder}" ] && [ "${holder}" != "${me}" ] && ! lock_expired "${lease}"; then
+    local me=$1 cm holder expires
+    cm="$(noc -n "${NS}" get configmap "${LOCK}" -o json)" || { echo "cannot read the update lock"; return 1; }
+    holder="$(jq -r '.data.holder // empty' <<<"${cm}")"
+    if [ -n "${holder}" ] && [ "${holder}" != "${me}" ] \
+            && ! expired "$(jq -r '.data.expires // empty' <<<"${cm}")"; then
         echo "${holder} is updating; waiting for it"
         return 1
     fi
-    now="$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)"
-    jq --arg me "${me}" --arg now "${now}" --argjson secs "${LOCK_SECS}" \
-        'del(.metadata.managedFields) | .spec.holderIdentity = $me
-         | .spec.acquireTime = $now | .spec.renewTime = $now
-         | .spec.leaseDurationSeconds = $secs' <<<"${lease}" \
-        | noc replace -f - >/dev/null || { echo "another node took the update lock first"; return 1; }
+    expires="$(date -u -d "+${LOCK_SECS} seconds" +%Y-%m-%dT%H:%M:%SZ)"
+    jq --arg me "${me}" --arg expires "${expires}" \
+        'del(.metadata.managedFields) | .data.holder = $me | .data.expires = $expires' <<<"${cm}" \
+        | noc replace -f - >/dev/null || { echo "could not take the update lock"; return 1; }
 }
 
 # Run on a green boot: an update this node started is over, done or rolled back.
 unlock() {
-    local me=$1 lease
-    lease="$(noc -n "${NS}" get lease "${NAME}" -o json)"
-    [ "$(jq -r '.spec.holderIdentity // empty' <<<"${lease}")" = "${me}" ] || return 0
-    jq 'del(.metadata.managedFields, .spec.holderIdentity, .spec.acquireTime,
-            .spec.renewTime, .spec.leaseDurationSeconds)' \
-        <<<"${lease}" | noc replace -f - >/dev/null
+    local me=$1 cm
+    cm="$(noc -n "${NS}" get configmap "${LOCK}" -o json)"
+    [ "$(jq -r '.data.holder // empty' <<<"${cm}")" = "${me}" ] || return 0
+    jq 'del(.metadata.managedFields, .data.holder, .data.expires)' <<<"${cm}" \
+        | noc replace -f - >/dev/null
     echo "released the update lock"
 }
 

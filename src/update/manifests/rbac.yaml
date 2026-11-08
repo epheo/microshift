@@ -10,9 +10,9 @@ rules:
   resources: [configmaps]
   resourceNames: [microshift-update]
   verbs: [get]
-- apiGroups: [coordination.k8s.io]
-  resources: [leases]
-  resourceNames: [microshift-update]
+- apiGroups: [""]
+  resources: [configmaps]
+  resourceNames: [microshift-update-lock]
   verbs: [get, update]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

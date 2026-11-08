@@ -93,6 +93,9 @@ node_summary() { # node_summary <exec-fn> <name>
     ${fn} sh -c 'ovs-vsctl --timeout=5 show | head -40' 2>&1
     echo "### ${name}: failed units ###"
     ${fn} systemctl list-units --failed --no-pager 2>&1
+    echo "### ${name}: update units (this boot) ###"
+    ${fn} journalctl -b --no-pager -u microshift-update-publish -u microshift-update-follow \
+        -u bootc-fetch-apply-updates 2>&1 | tail -30
     diag_selinux "${fn}" 20 "${name}"
 }
 
@@ -106,6 +109,9 @@ diagnostics() {
         echo "### nodes ###"; koc get nodes -o wide 2>&1
         echo "### non-running pods ###"
         koc get pods -A -o wide --no-headers 2>&1 | grep -vE 'Running|Completed'
+        echo "### update image, lock and Volumes ###"
+        koc -n kube-public get configmap microshift-update microshift-update-lock -o yaml 2>&1
+        koc get volumes.r-drbd.io 2>&1
         echo "### events ###"
         koc get events -A --sort-by='.metadata.creationTimestamp' 2>&1 | tail -30
         echo "### not-ready pod logs ###"
@@ -450,14 +456,14 @@ push_update() {
     cat "${ctx}/digest"
 }
 digest_of() { $1 bootc status --json | jq -r '.status.booted.image.imageDigest'; }
-lock_holder() { koc -n kube-public get lease microshift-update -o jsonpath='{.spec.holderIdentity}'; }
+lock_holder() { koc -n kube-public get configmap microshift-update-lock -o jsonpath='{.data.holder}'; }
 lock_as() { # lock_as <holder>: a fresh hold, as a node mid-update leaves it
-    koc -n kube-public patch lease microshift-update --type merge -p \
-        "{\"spec\":{\"holderIdentity\":\"$1\",\"leaseDurationSeconds\":3600,\"renewTime\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000000Z)\"}}" >/dev/null
+    koc -n kube-public patch configmap microshift-update-lock --type merge -p \
+        "{\"data\":{\"holder\":\"$1\",\"expires\":\"$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)\"}}" >/dev/null
 }
 unlock_all() {
-    koc -n kube-public patch lease microshift-update --type json \
-        -p '[{"op":"remove","path":"/spec/holderIdentity"}]' >/dev/null
+    koc -n kube-public patch configmap microshift-update-lock --type merge \
+        -p '{"data":{"holder":null,"expires":null}}' >/dev/null
 }
 
 # Another node holds the update lock from the start: the worker must wait
