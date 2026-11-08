@@ -4,6 +4,8 @@
 # publishes the exact image it booted. Workers switch to that image and to no
 # other: a worker is then never newer than the control plane (Kubernetes
 # version skew policy), and never meets an update the controller rolled back.
+# Before it reboots, the controller also announces its next image: workers
+# download it meanwhile, so they lack its pod images for one reboot, not a pull.
 # One node at a time, and only while every r-drbd Volume is fully replicated:
 # a second node down could take a replicated volume below quorum.
 # A single node is a controller.
@@ -110,47 +112,71 @@ when() {
     esac
 }
 
-publish() {
-    local digest image me
+# One field manager: a publish without next drops it.
+announce() {
+    local next=${1:-} digest repo args
     digest="$(booted imageDigest)"
     [ -n "${digest}" ] || { echo "bootc reports no booted image" >&2; return 1; }
-    image="$(repo_of "$(booted image.image)")@${digest}"
-    oc --kubeconfig "${ADMIN_KUBECONFIG}" -n "${NS}" create configmap "${NAME}" \
-        --from-literal=image="${image}" \
-        --from-literal=transport="$(booted image.transport)" \
+    repo="$(repo_of "$(booted image.image)")"
+    args=(--from-literal=image="${repo}@${digest}" --from-literal=transport="$(booted image.transport)")
+    [ -z "${next}" ] || args+=(--from-literal=next="${repo}@${next}")
+    oc --kubeconfig "${ADMIN_KUBECONFIG}" -n "${NS}" create configmap "${NAME}" "${args[@]}" \
         --dry-run=client -o yaml \
         | oc --kubeconfig "${ADMIN_KUBECONFIG}" apply --server-side \
             --field-manager=microshift-update -f - >/dev/null
-    echo "published ${image} for workers to follow"
+    echo "published ${repo}@${digest} for workers to follow${next:+; they download ${next} ahead}"
+}
+
+publish() {
+    local me
+    announce
     me="$(node_name)"
     unlock "${me}"
 }
 
+# Staged but locked: no reboot applies it before this node takes the update lock.
+download() {
+    local transport=$1 image=$2
+    [ "$(bootc status --json | jq -r '.status.staged.image.imageDigest // empty')" != "${image##*@}" ] \
+        || return 0
+    echo "downloading ${image} ahead"
+    bootc switch --quiet --download-only --transport "${transport}" "${image}"
+}
+
 follow() {
-    local me target transport image digest
+    local me target transport image next digest booted_digest
     if [ ! -f "${NODE_KUBECONFIG}" ]; then
         echo "not joined to a cluster yet"
         return 0
     fi
     # The controller may be rebooting into its own update: try again later.
     if ! me="$(node_name)" || ! target="$(noc -n "${NS}" get configmap "${NAME}" \
-            -o jsonpath='{.data.transport} {.data.image}')"; then
+            -o jsonpath='{.data.transport} {.data.image} {.data.next}')"; then
         echo "the controller is unreachable or has published nothing yet"
         return 0
     fi
     unlock "${me}"
-    read -r transport image <<<"${target}"
+    read -r transport image next <<<"${target}"
     [ -n "${image}" ] || return 0
     digest="${image##*@}"
-    [ "${digest}" != "$(booted imageDigest)" ] || return 0
+    booted_digest="$(booted imageDigest)"
+    if [ "${digest}" = "${booted_digest}" ]; then
+        if [ -n "${next}" ] && [ "${next##*@}" != "${booted_digest}" ] && ! rolled_back "${next##*@}"; then
+            download "${transport}" "${next}"
+        fi
+        return 0
+    fi
     if rolled_back "${digest}"; then
         echo "not following ${image}: greenboot rolled it back on this node"
         return 0
     fi
+    download "${transport}" "${image}"
     storage_settled || return 0
     lock "${me}" || return 0
     echo "following the controller to ${image}"
-    bootc switch --apply --transport "${transport}" "${image}"
+    # Not switch --apply: with the image already staged it only reboots, and a
+    # locked stage stays unapplied.
+    bootc switch --from-downloaded --apply
 }
 
 gate() {
@@ -177,6 +203,7 @@ gate() {
     me="$(node_name)"
     unlock "${me}"
     storage_settled || exit 1
+    announce "${digest}"
     lock "${me}" || exit 1
     echo "updating to ${digest}"
 }

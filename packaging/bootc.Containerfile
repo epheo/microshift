@@ -188,7 +188,8 @@ COPY ./src/update/bootc-fetch-apply-updates.conf \
      /usr/lib/systemd/system/bootc-fetch-apply-updates.service.d/50-microshift-update.conf
 COPY --chmod=755 ./src/update/greenboot-red.sh /etc/greenboot/red.d/50_microshift_update_rolled_back.sh
 COPY ./src/update/manifests/ /usr/lib/microshift/manifests.d/010-microshift-update/
-RUN systemctl enable microshift-update-publish.service microshift-update-follow.timer
+RUN systemctl enable microshift-update-publish.service microshift-update-follow.service \
+        microshift-update-follow.timer
 
 # r-drbd, the storage plane. Its manifests apply from manifests.d like the
 # rest of the payload; its images are listed in a release-info JSON so the

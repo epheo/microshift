@@ -7,3 +7,8 @@ After=greenboot-healthcheck.service microshift.service
 Type=oneshot
 ExecCondition=/usr/libexec/microshift-update when worker
 ExecStart=/usr/libexec/microshift-update follow
+
+# Once per boot as well: a green boot releases the update lock at once, not
+# on the next timer run.
+[Install]
+WantedBy=multi-user.target
