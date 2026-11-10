@@ -251,8 +251,10 @@ RUN crds=/usr/lib/microshift/manifests.d/000-gateway-api/experimental-install.ya
 
 # OpenShift's grants that MicroShift's apiserver bootstrap lacks (storage and
 # snapshot classes for every signed-in user, Gateway API and NAD reads in the
-# stock project roles): consoles such as dotvirt then answer as on OpenShift.
-COPY ./src/rbac/ /usr/lib/microshift/manifests.d/010-openshift-rbac/
+# stock project roles), vendored from the pinned payload's sources by
+# src/rbac/vendor.sh, plus this distribution's experimental route kinds.
+COPY ./src/rbac/kustomization.yaml ./src/rbac/openshift-parity.yaml ./src/rbac/experimental-routes.yaml \
+    /usr/lib/microshift/manifests.d/010-openshift-rbac/
 
 COPY --chmod=755 ./src/embedded-images/import-embedded-images.sh /usr/bin/import-embedded-images.sh
 COPY ./src/embedded-images/import-embedded-images.service /usr/lib/systemd/system/import-embedded-images.service

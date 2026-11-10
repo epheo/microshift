@@ -1,0 +1,25 @@
+# This distribution's own choice, not OpenShift's: the experimental Gateway API
+# route kinds it ships (src/edge/gateway-api) and portail serves, in the stock
+# project roles as OpenShift 5.0 places TLSRoute: view reads, edit and admin write.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: epheo:gateway-api-experimental:aggregate-to-view
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["tcproutes", "udproutes"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: epheo:gateway-api-experimental:aggregate-to-admin
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+rules:
+- apiGroups: ["gateway.networking.k8s.io"]
+  resources: ["tcproutes", "udproutes"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]

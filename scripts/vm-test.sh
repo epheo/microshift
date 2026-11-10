@@ -767,7 +767,7 @@ wait_for 180 "TCPRoute and UDPRoute accepted" routes_accepted || {
     exit 1
 }
 
-log "assert: RBAC answers as OpenShift's (src/rbac)"
+log "assert: RBAC answers as OpenShift 5.0's, experimental routes too (src/rbac)"
 koc create rolebinding rbac-probe-view --clusterrole=view --user=rbac-viewer -n default \
     --dry-run=client -o yaml | koc apply -f - >/dev/null
 koc create rolebinding rbac-probe-edit --clusterrole=edit --user=rbac-editor -n default \
@@ -783,6 +783,9 @@ rbac_parity() {
         can list httproutes.gateway.networking.k8s.io -n default --as=rbac-viewer &&
         ! can create httproutes.gateway.networking.k8s.io -n default --as=rbac-viewer &&
         can create httproutes.gateway.networking.k8s.io -n default --as=rbac-editor &&
+        can create tlsroutes.gateway.networking.k8s.io -n default --as=rbac-editor &&
+        can create tcproutes.gateway.networking.k8s.io -n default --as=rbac-editor &&
+        can list udproutes.gateway.networking.k8s.io -n default --as=rbac-viewer &&
         can list network-attachment-definitions.k8s.cni.cncf.io -n default --as=rbac-admin &&
         ! can list network-attachment-definitions.k8s.cni.cncf.io -n default --as=rbac-editor
 }

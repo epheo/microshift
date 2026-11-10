@@ -73,3 +73,8 @@ if [ "$(grep -c -e "^USHIFT_GITREF=${USHIFT_GITREF}$" -e "^OKD_VERSION_TAG=${OKD
     ! grep -qx "PORTAIL_IMAGE=${PORTAIL_IMAGE}" versions.env; then
     update EPHEO_REV "${EPHEO_REV}" "$((EPHEO_REV + 1))"
 fi
+
+# OpenShift's grants follow the payload: re-vendor them from its sources.
+if ! grep -qx "OKD_VERSION_TAG=${OKD_VERSION_TAG}" versions.env; then
+    ./src/rbac/vendor.sh
+fi
