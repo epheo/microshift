@@ -144,13 +144,15 @@ jobs:
           # build main's head, not the sha the schedule fired on.
           ref: ${{ needs.bump.outputs.sha || (github.event_name == 'schedule' && 'main' || '') }}
 
-      # The RBAC parity roles must be the ones the pinned OKD payload's sources
-      # hold: a hand edit or a missed bump fails here, not on a node.
-      - name: Vendored OpenShift RBAC matches the pinned payload
+      # The RBAC parity roles and configure-ovs must be the ones the pinned OKD
+      # payload's sources hold: a hand edit or a missed bump fails here, not on
+      # a node.
+      - name: Vendored OpenShift files match the pinned payload
         run: |
           ./src/rbac/vendor.sh
-          git diff --exit-code -- src/rbac \
-            || { echo "::error::src/rbac is stale: run src/rbac/vendor.sh and commit"; exit 1; }
+          ./src/ovs/vendor.sh
+          git diff --exit-code -- src/rbac src/ovs \
+            || { echo "::error::src/rbac or src/ovs is stale: run their vendor.sh and commit"; exit 1; }
 
       - name: Build the image
         uses: ./.github/actions/build-image

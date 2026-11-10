@@ -17,27 +17,9 @@ sources="$(mktemp)"
 body="$(mktemp)"
 trap 'rm -f "${refs}" "${sources}" "${body}"' EXIT
 
-# The payload's image-references names each component's source and commit.
-if command -v oc >/dev/null; then
-    oc adm release extract --file=image-references "${release}" > "${refs}"
-else
-    ctr="$(podman create -q "${release}")"
-    podman cp "${ctr}:/release-manifests/image-references" - | tar -xO > "${refs}"
-    podman rm -f "${ctr}" >/dev/null
-fi
-
-# fetch <component> <path>: the file at the commit the payload built it from.
-fetch() {
-    local repo commit
-    read -r repo commit < <(jq -r --arg n "$1" '.spec.tags[] | select(.name == $n) | .annotations |
-        "\(.["io.openshift.build.source-location"] // "") \(.["io.openshift.build.commit.id"] // "")"' "${refs}")
-    if [ -z "${repo}" ] || [ -z "${commit}" ]; then
-        echo "no source or commit for $1 in ${release}" >&2
-        return 1
-    fi
-    echo "${repo#https://} ${2} @ ${commit}" >> "${sources}"
-    curl -fsSL --retry 3 "${repo/github.com/raw.githubusercontent.com}/${commit}/$2"
-}
+# shellcheck source=src/lib/payload-source.sh
+source src/lib/payload-source.sh
+payload_refs
 
 # named <names...>: the objects so named in a YAML stream on stdin, each one
 # required.
