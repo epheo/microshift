@@ -21,9 +21,13 @@
 # Usage: DIST_IMAGE=epheo-microshift ./scripts/smoke-test.sh
 #        CLEAN=1 ./scripts/smoke-test.sh   # tear down the smoke container/VG
 set -euo pipefail
+# shellcheck source=scripts/lib-container-nic.sh
+source "$(dirname "$0")/lib-container-nic.sh"
 
 DIST_IMAGE="${DIST_IMAGE:-epheo-microshift}"
 NAME="${NAME:-epheo-microshift-smoke}"
+NET="${NET:-epheo-microshift-smoke}"
+NET_PREFIX="${NET_PREFIX:-10.89.202}"
 LVM_DISK="${LVM_DISK:-/var/lib/epheo-microshift-smoke/lvmdisk.image}"
 VG_NAME="myvg1" # the VG microshift-r-drbd-default-pool turns into a Pool
 KUBECONFIG_IN_CONTAINER="/var/lib/microshift/resources/kubeadmin/kubeconfig"
@@ -36,6 +40,7 @@ koc() { pexec oc --kubeconfig "${KUBECONFIG_IN_CONTAINER}" "$@"; }
 
 clean() {
     sudo podman rm -f "${NAME}" 2>/dev/null || true
+    sudo podman network rm -f "${NET}" 2>/dev/null || true
     if [ -f "${LVM_DISK}" ]; then
         sudo vgremove -f -y "${VG_NAME}" 2>/dev/null || true
         local dev
@@ -52,6 +57,13 @@ diagnostics() {
     pexec journalctl -u microshift --no-pager -n 80 2>&1 || true
     log "DIAGNOSTICS: import-embedded-images journal"
     pexec journalctl -u import-embedded-images --no-pager -n 20 2>&1 || true
+    for u in microshift-ovs-init NetworkManager; do
+        log "DIAGNOSTICS: ${u} journal (last 40 lines)"
+        pexec journalctl -u "${u}" --no-pager -n 40 2>&1 || true
+    done
+    log "DIAGNOSTICS: ovs-vsctl show, ip -br addr"
+    pexec ovs-vsctl --timeout=5 show 2>&1 || true
+    pexec ip -br addr 2>&1 || true
 }
 
 if [ "${CLEAN:-0}" = "1" ]; then
@@ -87,19 +99,24 @@ fi
 
 # --- 3. Boot the image as a container ---------------------------------------
 sudo podman rm -f "${NAME}" 2>/dev/null || true
+sudo podman network rm -f "${NET}" 2>/dev/null || true
+nic_network "${NET}" "${NET_PREFIX}"
 log "starting ${NAME} from ${DIST_IMAGE}"
 vol_opts=(--tty --volume /dev:/dev)
 for device in input snd dri; do
     [ -d "/dev/${device}" ] && vol_opts+=(--tmpfs "/dev/${device}")
 done
-sudo podman run --privileged -d \
+sudo podman create --privileged \
     --ulimit nofile=524288:524288 \
     --dns-search=. \
     "${vol_opts[@]}" \
     --tmpfs /var/lib/containers \
+    --network "${NET}" --ip "${NET_PREFIX}.10" \
     --name "${NAME}" \
     --hostname "${NAME}" \
     "${DIST_IMAGE}" >/dev/null
+nic_install "${NAME}" "${NET_PREFIX}.10" "${NET_PREFIX}.1"
+sudo podman start "${NAME}" >/dev/null
 
 trap 'rc=$?; [ ${rc} -ne 0 ] && diagnostics; exit ${rc}' EXIT
 

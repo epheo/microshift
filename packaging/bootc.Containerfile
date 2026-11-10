@@ -158,6 +158,14 @@ RUN mkdir -p /etc/containers/registries.d && \
 COPY --chmod=755 ./src/ovs/configure-ovs.sh /usr/libexec/microshift-configure-ovs.sh
 COPY ./src/ovs/microshift-ovs-init.conf \
      /usr/lib/systemd/system/microshift-ovs-init.service.d/50-openshift-configure-ovs.conf
+# In /etc and sorting after MicroShift's 10-microshift-ignore-devices.conf:
+# NetworkManager reads /etc/NetworkManager/conf.d after /usr/lib, the later
+# [device] match-device wins, and this list is a superset.
+COPY ./src/ovs/nm-ignore-sdn.conf /etc/NetworkManager/conf.d/sdn.conf
+COPY ./src/ovs/ovs-vswitchd-restart.conf \
+     /usr/lib/systemd/system/ovs-vswitchd.service.d/10-ovs-vswitchd-restart.conf
+COPY ./src/ovs/ovsdb-server-restart.conf \
+     /usr/lib/systemd/system/ovsdb-server.service.d/10-ovsdb-restart.conf
 
 # Role-scoped firewalld services; postinstall bakes the controller baseline
 # and microshift-profile switches roles post-deploy.

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Thibaut Lapierre <root@epheo.eu>
 Date: Fri, 6 Nov 2026 00:00:00 +0000
-Subject: [PATCH 06/14] multinode: worker role
+Subject: [PATCH 06/15] multinode: worker role
 
 A worker role for multinode: `microshift run --worker` starts kubelet and
 networking only, and `microshift add-node --worker` joins it.

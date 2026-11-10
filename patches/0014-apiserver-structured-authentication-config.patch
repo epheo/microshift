@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Thibaut Lapierre <root@epheo.eu>
 Date: Tue, 10 Nov 2026 14:50:56 +0100
-Subject: [PATCH 14/14] apiserver: structured authentication config
+Subject: [PATCH 14/15] apiserver: structured authentication config
 
 apiServer.authenticationConfig names a structured authentication
 configuration file that kube-apiserver takes as --authentication-config:

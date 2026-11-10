@@ -21,8 +21,7 @@ REGISTRY_IMAGE="${REGISTRY_IMAGE:-quay.io/libpod/registry:2.8}"
 REG_NAME=epheo-microshift-multinode-registry
 VM_MEM="${VM_MEM:-5120}"
 BR=ushift-mn-br0
-# Keep guest networks out of 10.42-10.44: pods, services, and the
-# apiserver advertise address (10.44.0.0 on br-ex) live there.
+# Keep guest networks out of 10.42-10.43: pods and services live there.
 NET=192.168.101
 IP1=$NET.11
 IP2=$NET.12
@@ -89,7 +88,7 @@ node_summary() { # node_summary <exec-fn> <name>
     local fn=$1 name=$2
     echo "### ${name}: bootc status ###"; ${fn} bootc status 2>&1
     echo "### ${name}: br-ex, routes, cni ###"
-    ${fn} sh -c 'hostname; ip -br addr show br-ex 2>/dev/null; ip route show 10.44.0.0/32; ls /etc/cni/net.d/ 2>/dev/null' 2>&1
+    ${fn} sh -c 'hostname; ip -br addr show br-ex 2>/dev/null; ovs-vsctl --timeout=5 list-ports br-ex; ls /etc/cni/net.d/ 2>/dev/null' 2>&1
     echo "### ${name}: ovs-vsctl show ###"
     ${fn} sh -c 'ovs-vsctl --timeout=5 show | head -40' 2>&1
     echo "### ${name}: failed units ###"
@@ -381,8 +380,8 @@ fetch mn-echo-node2 "http://${CIP}:80" | grep -q 'mn-echo' \
 koc exec mn-echo-node2 -- python3 -c \
     "import socket; print(socket.getaddrinfo('kubernetes.default.svc.cluster.local', 443)[0][4][0])" \
     | grep -q '10\.43\.' || die "cluster DNS does not resolve from a worker pod"
-# The endpoint behind the default kubernetes service must answer from a
-# worker pod: this is the route-to-advertise-address path (patches/0008).
+# The endpoint behind the default kubernetes service, the controller's node
+# IP, must answer from a worker pod: the shared gateway reaches it on-link.
 apiserver_code="$(koc exec mn-echo-node2 -- python3 -c "
 import urllib.request, urllib.error, ssl
 ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE

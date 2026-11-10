@@ -532,6 +532,54 @@ vssh /usr/bin/import-embedded-images.sh | { ! grep -q '^importing'; }
 # no extra registry pull, no docker.io rate limits.
 util_img="$(koc -n openshift-ovn-kubernetes get pods -o jsonpath='{.items[0].spec.containers[0].image}')"
 
+# OpenShift's topology: the NIC is a port of br-ex, br-ex holds the node IP,
+# OVN-K runs the shared gateway, and global forwarding stays off. On the
+# upgrade lanes this proves a node from a no-uplink release converted.
+log "assert: br-ex holds the node IP and the uplink, OVN-K runs the shared gateway"
+node_ip="$(koc get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')"
+uplink="$(vssh nmcli -g connection.interface-name connection show ovs-if-phys0)"
+[ -n "${uplink}" ] && [ "$(vssh ovs-vsctl port-to-br "${uplink}")" = br-ex ] || {
+    echo "ERROR: no uplink in br-ex (ovs-if-phys0 names '${uplink}')" >&2; exit 1; }
+vssh ip -4 -o addr show dev br-ex | grep -qF " ${node_ip}/" || {
+    echo "ERROR: br-ex does not hold the node IP ${node_ip}" >&2; exit 1; }
+koc -n openshift-ovn-kubernetes get configmap ovnkube-config -o jsonpath='{.data.ovnkube\.conf}' \
+    | grep -qx '\s*mode=shared' || { echo "ERROR: OVN-K is not in shared gateway mode" >&2; exit 1; }
+[ "$(vssh sysctl -n net.ipv4.ip_forward)" = 0 ] || {
+    echo "ERROR: global IPv4 forwarding is on, want OpenShift's Restricted" >&2; exit 1; }
+
+# The kubernetes endpoint is the node IP: a pod reaches it through the
+# management port, a host-network pod through the gateway router's hairpin.
+# Both must be served the certificate that validates 10.43.0.1, not the
+# external one that also names the node IP's host.
+log "assert: pods and host-network pods validate the API certificate at 10.43.0.1"
+koc create namespace o7-probe --dry-run=client -o yaml | koc apply -f - >/dev/null
+koc label namespace o7-probe pod-security.kubernetes.io/enforce=privileged --overwrite >/dev/null
+for host_network in false true; do
+    koc apply -f - <<EOF >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: api-client-${host_network}
+  namespace: o7-probe
+spec:
+  hostNetwork: ${host_network}
+  restartPolicy: Never
+  containers:
+  - name: client
+    image: ${util_img}
+    command: ["sleep", "3600"]
+EOF
+    wait_pod_running "api-client-${host_network}" o7-probe
+    koc -n o7-probe exec "api-client-${host_network}" -- python3 -c '
+import ssl, urllib.request, urllib.error
+ctx = ssl.create_default_context(cafile="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+try:
+    urllib.request.urlopen("https://10.43.0.1/healthz", timeout=10, context=ctx)
+except urllib.error.HTTPError:
+    pass' || { echo "ERROR: hostNetwork=${host_network} pod failed TLS to 10.43.0.1" >&2; exit 1; }
+done
+koc delete namespace o7-probe --wait=false >/dev/null
+
 # Separates a Pool that never comes up from a PVC that never binds, and
 # keeps the pod wait below for provisioning alone.
 pool_available() {
@@ -804,12 +852,14 @@ EOF
 done
 
 # A tenant egress tier that keeps the API and nothing else on any host: allow
-# the kubernetes endpoint (the advertise address, 6443), then deny every node.
-# ANP rules apply after the Service DNAT, and the nodes peer covers the
-# advertise address too, hence the allow first.
-log "assert: an ANP allowing the API endpoint and denying all nodes leaves tenants the API alone"
+# the kubernetes endpoint (node IP, 6443), then deny every node. ANP rules
+# apply after the Service DNAT, and the nodes peer covers the endpoint too,
+# hence the allow first.
+log "assert: the kubernetes endpoint is the node IP, as on OpenShift"
 api_ip="$(koc -n default get endpointslices -l kubernetes.io/service-name=kubernetes \
     -o jsonpath='{.items[0].endpoints[0].addresses[0]}')"
+[ "${api_ip}" = "${node_ip}" ] || { echo "ERROR: kubernetes endpoint ${api_ip}, node IP ${node_ip}" >&2; exit 1; }
+log "assert: an ANP allowing the API endpoint and denying all nodes leaves tenants the API alone"
 for port in 18080 10250 22 6443; do
     expect yes efw-probe client "${node_ip}" "${port}" "node port ${port} before the ANP"
 done
@@ -842,7 +892,8 @@ spec:
           operator: Exists
 EOF
 expect yes efw-probe client kubernetes.default.svc.cluster.local 443 "the API Service under the API-only ANP"
-for target in "${node_ip} 18080" "${node_ip} 10250" "${node_ip} 22" "${node_ip} 6443" "${api_ip} 10250"; do
+expect yes efw-probe client "${node_ip}" 6443 "the API endpoint under the API-only ANP"
+for target in "${node_ip} 18080" "${node_ip} 10250" "${node_ip} 22"; do
     # shellcheck disable=SC2086 # "IP PORT" splits into expect's two arguments
     expect no efw-probe client ${target} "${target} under the API-only ANP"
 done

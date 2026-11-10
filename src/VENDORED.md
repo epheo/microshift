@@ -25,6 +25,11 @@ vendored with attribution; if upstream adds a license, it applies to them.
 `src/r-drbd/base/` is epheo/r-drbd's deploy/base at `R_DRBD_COMMIT`, verbatim
 (`src/r-drbd/vendor.sh`); the rest of `src/r-drbd/` is this distribution's.
 
+`src/ovs/` holds OpenShift's br-ex setup from openshift/machine-config-operator
+at the commit the pinned OKD payload names, verbatim (`src/ovs/vendor.sh`):
+`configure-ovs.sh`, `nm-ignore-sdn.conf` and the two OVS restart drop-ins.
+`microshift-ovs-init.conf` and `vendor.sh` are this distribution's.
+
 `src/embedded-images/` is NOT vendored — it is this distribution's own
 boot-time image import mechanism (originally developed in the konstruct lab
 repo).
