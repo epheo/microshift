@@ -28,7 +28,7 @@ vendored with attribution; if upstream adds a license, it applies to them.
 `src/ovs/` holds OpenShift's br-ex setup from openshift/machine-config-operator
 at the commit the pinned OKD payload names, verbatim (`src/ovs/vendor.sh`):
 `configure-ovs.sh`, `nm-ignore-sdn.conf` and the two OVS restart drop-ins.
-`microshift-ovs-init.conf` and `vendor.sh` are this distribution's.
+`microshift-ovs-init.conf`, `nodeip-hint.sh` and `vendor.sh` are this distribution's.
 
 `src/cni/plugins-image` pins the pinned OKD payload's container-networking-plugins
 image (`src/cni/vendor.sh`); the build copies host-device from it.

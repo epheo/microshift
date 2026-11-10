@@ -161,6 +161,7 @@ RUN mkdir -p /etc/containers/registries.d && \
 # br-ex takes the node's NIC, as on OpenShift: its configure-ovs.sh, vendored
 # from the payload by src/ovs/vendor.sh, runs in place of MicroShift's.
 COPY --chmod=755 ./src/ovs/configure-ovs.sh /usr/libexec/microshift-configure-ovs.sh
+COPY --chmod=755 ./src/ovs/nodeip-hint.sh /usr/libexec/microshift-nodeip-hint
 COPY ./src/ovs/microshift-ovs-init.conf \
      /usr/lib/systemd/system/microshift-ovs-init.service.d/50-openshift-configure-ovs.conf
 # In /etc and sorting after MicroShift's 10-microshift-ignore-devices.conf:
