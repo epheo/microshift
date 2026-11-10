@@ -11,7 +11,8 @@
 # EgressFirewall cuts one namespace off a node address, AdminNetworkPolicy
 # networks and nodes peers do too, a NetworkPolicy overrides a
 # BaselineAdminNetworkPolicy Deny, Multus refuses a pod another namespace's
-# NAD, the
+# NAD, the apiserver takes JWTs from an issuer named in
+# apiServer.authenticationConfig, the
 # embedded portail image is started with pull policy Never, the API
 # accepts TCPRoute and UDPRoute objects, and RBAC answers as OpenShift's
 # does for signed-in users and the stock project roles (src/rbac).
@@ -791,6 +792,52 @@ EOF
     expect yes efw-probe client "${node_ip}" 18080 "after the ANP is deleted"
 done
 
+# A tenant egress tier that keeps the API and nothing else on any host: allow
+# the kubernetes endpoint (the advertise address, 6443), then deny every node.
+# ANP rules apply after the Service DNAT, and the nodes peer covers the
+# advertise address too, hence the allow first.
+log "assert: an ANP allowing the API endpoint and denying all nodes leaves tenants the API alone"
+api_ip="$(koc -n default get endpointslices -l kubernetes.io/service-name=kubernetes \
+    -o jsonpath='{.items[0].endpoints[0].addresses[0]}')"
+for port in 18080 10250 22 6443; do
+    expect yes efw-probe client "${node_ip}" "${port}" "node port ${port} before the ANP"
+done
+koc apply -f - <<EOF
+apiVersion: policy.networking.k8s.io/v1alpha1
+kind: AdminNetworkPolicy
+metadata:
+  name: anp-api-only
+spec:
+  priority: 20
+  subject:
+    namespaces:
+      matchLabels:
+        kubernetes.io/metadata.name: efw-probe
+  egress:
+  - name: allow-api
+    action: Allow
+    to:
+    - networks: ["${api_ip}/32"]
+    ports:
+    - portNumber:
+        protocol: TCP
+        port: 6443
+  - name: deny-nodes
+    action: Deny
+    to:
+    - nodes:
+        matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: Exists
+EOF
+expect yes efw-probe client kubernetes.default.svc.cluster.local 443 "the API Service under the API-only ANP"
+for target in "${node_ip} 18080" "${node_ip} 10250" "${node_ip} 22" "${node_ip} 6443" "${api_ip} 10250"; do
+    # shellcheck disable=SC2086 # "IP PORT" splits into expect's two arguments
+    expect no efw-probe client ${target} "${target} under the API-only ANP"
+done
+expect yes default l2test-probe "${node_ip}" 10250 "kubelet from a namespace outside the ANP subject"
+koc delete adminnetworkpolicy anp-api-only >/dev/null
+
 # A BaselineAdminNetworkPolicy Deny holds until a NetworkPolicy allows the
 # traffic: the baseline is the default, a namespace's own policy overrides it.
 log "assert: a NetworkPolicy overrides a BaselineAdminNetworkPolicy Deny"
@@ -899,6 +946,8 @@ wait_for 120 "Multus to refuse mns-2/crossns its mns-1 NAD" isolation_refused ||
     echo "ERROR: mns-2/crossns runs on another namespace's NAD" >&2
     exit 1
 }
+# Refused for good: it would hold every later settle check.
+koc -n mns-2 delete pod crossns --wait=false >/dev/null
 
 log "assert: the embedded portail image starts from cri-o's store (pull policy Never)"
 portail_ref="$(vssh awk '{print $2}' /usr/lib/embedded-images/manifest | grep '/portail:' | head -1)"
@@ -1013,6 +1062,165 @@ rbac_parity() {
 wait_for 180 "RBAC answers as OpenShift's" rbac_parity || {
     koc get clusterrole basic-user view edit admin -o name >&2 || true
     vssh journalctl -u microshift --no-pager | grep -i kustomiz | tail -20 >&2 || true
+    exit 1
+}
+
+# apiServer.authenticationConfig (patches/0014), as a site layer sets it: a
+# file and a config.d drop-in. Keys and tokens are made on this host; the
+# issuer serves discovery and keys from a host-network pod, which the
+# apiserver reaches as it would a site's identity provider.
+log "assert: the apiserver takes JWTs through apiServer.authenticationConfig"
+oidc="${WORKDIR}/oidc"
+mkdir -p "${oidc}"
+iss="https://${node_ip}:18443"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=oidc-probe \
+    -addext "subjectAltName=IP:${node_ip}" -keyout "${oidc}/tls.key" -out "${oidc}/tls.crt" 2>/dev/null
+openssl genrsa -out "${oidc}/jwt.key" 2048 2>/dev/null
+python3 -I - "${oidc}" "${iss}" <<'PY'
+import base64, json, subprocess, sys, time
+d, iss = sys.argv[1], sys.argv[2]
+def b64(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+mod = subprocess.run(["openssl", "rsa", "-in", f"{d}/jwt.key", "-noout", "-modulus"],
+                     check=True, capture_output=True, text=True).stdout.strip().split("=", 1)[1]
+with open(f"{d}/jwks.json", "w") as f:
+    json.dump({"keys": [{"kty": "RSA", "alg": "RS256", "use": "sig", "kid": "probe",
+                         "n": b64(bytes.fromhex(mod)), "e": "AQAB"}]}, f)
+with open(f"{d}/discovery.json", "w") as f:
+    json.dump({"issuer": iss, "jwks_uri": iss + "/jwks",
+               "id_token_signing_alg_values_supported": ["RS256"]}, f)
+now = int(time.time())
+head = b64(json.dumps({"alg": "RS256", "kid": "probe", "typ": "JWT"}).encode())
+body = b64(json.dumps({"iss": iss, "aud": "microshift-probe", "sub": "probe-alice",
+                       "preferred_username": "alice", "groups": ["/team-a"],
+                       "iat": now, "exp": now + 7200}).encode())
+sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", f"{d}/jwt.key"],
+                     input=f"{head}.{body}".encode(), check=True, capture_output=True).stdout
+with open(f"{d}/token", "w") as f:
+    f.write(f"{head}.{body}.{b64(sig)}")
+PY
+cat > "${oidc}/server.py" <<'PY'
+import http.server, ssl
+docs = {"/.well-known/openid-configuration": open("/issuer/discovery.json", "rb").read(),
+        "/jwks": open("/issuer/jwks.json", "rb").read()}
+class Handler(http.server.BaseHTTPRequestHandler):
+    # Keep-alive: the client closes, so it never sees the server drop TLS
+    # without a close_notify, which OpenSSL 3 clients report as an error.
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        body = docs.get(self.path, b"")
+        self.send_response(200 if body else 404)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+server = http.server.ThreadingHTTPServer(("", 18443), Handler)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain("/issuer/tls.crt", "/issuer/tls.key")
+server.socket = ctx.wrap_socket(server.socket, server_side=True)
+server.serve_forever()
+PY
+# auth_config PREFIX: the site's file, mapping claims under PREFIX. A claim
+# is typed any in CEL: dyn() makes the groups list one map() can range over.
+auth_config() {
+    cat <<EOF
+apiVersion: apiserver.config.k8s.io/v1
+kind: AuthenticationConfiguration
+jwt:
+- issuer:
+    url: ${iss}
+    audiences: [microshift-probe, another-audience]
+    audienceMatchPolicy: MatchAny
+    certificateAuthority: |
+$(sed 's/^/      /' "${oidc}/tls.crt")
+  claimMappings:
+    username:
+      expression: '"$1" + claims.preferred_username'
+    groups:
+      expression: 'dyn(claims.groups).map(g, "$1" + g)'
+EOF
+}
+# A token, not the admin client certificate, which would win over it.
+whoami_as() {
+    vssh oc --kubeconfig=/dev/null --server=https://127.0.0.1:6443 --insecure-skip-tls-verify \
+        --token="$1" auth whoami -o json
+}
+# oidc_user PREFIX: the probe token maps to PREFIXalice in group PREFIX/team-a.
+oidc_user() {
+    local who
+    who="$(whoami_as "$(cat "${oidc}/token")" 2>/dev/null)" || return 1
+    [ "$(jq -r .status.userInfo.username <<<"${who}")" = "$1alice" ] &&
+        jq -e --arg g "$1/team-a" '.status.userInfo.groups | index($g) and index("system:authenticated")' \
+            <<<"${who}" >/dev/null
+}
+auth_config kc: | vssh tee /etc/microshift/oidc-probe.yaml >/dev/null
+printf 'apiServer:\n  authenticationConfig: /etc/microshift/oidc-probe.yaml\n' \
+    | vssh tee /etc/microshift/config.d/90-oidc-probe.yaml >/dev/null
+# The issuer pod does not exist yet: the apiserver must start without it.
+vssh systemctl restart microshift.service
+wait_microshift
+settled() { [ -z "$(unsettled_pods)" ] && rollouts_done; }
+wait_for 600 "pods settled after the restart" settled || { unsettled_pods >&2; exit 1; }
+if oidc_user kc:; then
+    echo "ERROR: the probe token authenticates while its issuer is down" >&2
+    exit 1
+fi
+
+koc create namespace oidc-probe --dry-run=client -o yaml | koc apply -f - >/dev/null
+koc label namespace oidc-probe pod-security.kubernetes.io/enforce=privileged --overwrite >/dev/null
+# Controllers just restarted: a pod in a new namespace is refused until its
+# default ServiceAccount exists.
+wait_for 120 "oidc-probe's default ServiceAccount" koc -n oidc-probe get serviceaccount default || exit 1
+for f in tls.crt tls.key discovery.json jwks.json server.py; do
+    vssh tee "/var/tmp/oidc-probe-${f}" < "${oidc}/${f}" >/dev/null
+done
+koc -n oidc-probe create secret generic issuer \
+    --from-file=tls.crt=/var/tmp/oidc-probe-tls.crt --from-file=tls.key=/var/tmp/oidc-probe-tls.key \
+    --from-file=discovery.json=/var/tmp/oidc-probe-discovery.json \
+    --from-file=jwks.json=/var/tmp/oidc-probe-jwks.json --from-file=server.py=/var/tmp/oidc-probe-server.py >/dev/null
+koc apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: issuer
+  namespace: oidc-probe
+spec:
+  hostNetwork: true
+  restartPolicy: Never
+  containers:
+  - name: issuer
+    image: ${util_img}
+    command: ["python3", "/issuer/server.py"]
+    volumeMounts:
+    - name: issuer
+      mountPath: /issuer
+  volumes:
+  - name: issuer
+    secret:
+      secretName: issuer
+EOF
+wait_pod_running issuer oidc-probe
+wait_for 180 "the probe token to authenticate as kc:alice in kc:/team-a" oidc_user kc: || {
+    whoami_as "$(cat "${oidc}/token")" >&2 || true
+    vssh journalctl -u microshift --no-pager | grep -i -e jwt -e oidc -e authenticat | tail -20 >&2 || true
+    exit 1
+}
+
+log "assert: client certificates and ServiceAccount tokens still authenticate"
+koc get node >/dev/null
+sa_user="$(whoami_as "$(koc -n default create token default --duration=10m)" | jq -r .status.userInfo.username)"
+[ "${sa_user}" = system:serviceaccount:default:default ] || {
+    echo "ERROR: a ServiceAccount token authenticates as '${sa_user}'" >&2
+    exit 1
+}
+
+log "assert: an edit to the authentication file applies without a restart"
+pid="$(vssh systemctl show -p MainPID --value microshift.service)"
+auth_config kc2: | vssh sh -c 'cat > /etc/microshift/oidc-probe.yaml.new && mv /etc/microshift/oidc-probe.yaml.new /etc/microshift/oidc-probe.yaml'
+wait_for 180 "the probe token to authenticate as kc2:alice" oidc_user kc2: || exit 1
+[ "$(vssh systemctl show -p MainPID --value microshift.service)" = "${pid}" ] || {
+    echo "ERROR: microshift.service restarted while the file was edited" >&2
     exit 1
 }
 

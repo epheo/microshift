@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Thibaut Lapierre <root@epheo.eu>
 Date: Fri, 6 Nov 2026 00:00:00 +0000
-Subject: [PATCH 08/13] multinode: ovn interconnect zones
+Subject: [PATCH 08/14] multinode: ovn interconnect zones
 
 Upstream's multinode OVN cannot host CA-less workers: its master
 DaemonSet needs the master label and its components use the kubeadmin

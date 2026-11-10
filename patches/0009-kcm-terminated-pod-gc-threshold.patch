@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Thibaut Lapierre <root@epheo.eu>
 Date: Fri, 6 Nov 2026 00:00:00 +0000
-Subject: [PATCH 09/13] kcm: terminated pod gc threshold
+Subject: [PATCH 09/14] kcm: terminated pod gc threshold
 
 kubeControllerManager.terminatedPodGCThreshold sets the pod garbage
 collector's threshold (default unchanged, 12500). Graceful node shutdown
