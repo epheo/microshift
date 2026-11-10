@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Thibaut Lapierre <root@epheo.eu>
 Date: Fri, 6 Nov 2026 00:00:00 +0000
-Subject: [PATCH 09/12] kcm: terminated pod gc threshold
+Subject: [PATCH 09/13] kcm: terminated pod gc threshold
 
 kubeControllerManager.terminatedPodGCThreshold sets the pod garbage
 collector's threshold (default unchanged, 12500). Graceful node shutdown
@@ -12,13 +12,14 @@ Upstream: no KCM config section as of 5.0.
 Covered by: config and KCM unit tests.
 ---
  .../config/config-openapi-spec.json           | 16 ++++++++++
+ docs/user/howto_config.md                     |  4 +++
  packaging/microshift/config.yaml              |  6 ++++
  pkg/config/config.go                          | 11 +++++++
  pkg/config/config_test.go                     | 22 ++++++++++++++
  pkg/config/kubecontrollermanager.go           | 29 +++++++++++++++++++
  pkg/controllers/kube-controller-manager.go    |  1 +
  .../kube-controller-manager_test.go           |  1 +
- 7 files changed, 86 insertions(+)
+ 8 files changed, 90 insertions(+)
  create mode 100644 pkg/config/kubecontrollermanager.go
 
 diff --git a/cmd/generate-config/config/config-openapi-spec.json b/cmd/generate-config/config/config-openapi-spec.json
@@ -55,6 +56,28 @@ index e677bbe94bd1e37631dda8f6cc33af81873514d1..d7e87fbc339374e75155edfb08ff56a6
      "kubelet": {
        "description": "Settings specified in this section are transferred as-is into the Kubelet config."
      },
+diff --git a/docs/user/howto_config.md b/docs/user/howto_config.md
+index 2ae85bb83ed61e959a199e023c1515b310c797bc..b373b0f2b04dfee16cf13d3c1624edc66baf88e6 100644
+--- a/docs/user/howto_config.md
++++ b/docs/user/howto_config.md
+@@ -141,6 +141,8 @@ ingress:
+         threadCount: 0
+         tlsInspectDelay: ""
+         tunnelTimeout: ""
++kubeControllerManager:
++    terminatedPodGCThreshold: 0
+ kubelet:
+ manifests:
+     kustomizePaths: []
+@@ -310,6 +312,8 @@ ingress:
+         threadCount: 0
+         tlsInspectDelay: 5s
+         tunnelTimeout: 1h
++kubeControllerManager:
++    terminatedPodGCThreshold: 12500
+ kubelet:
+ manifests:
+     kustomizePaths:
 diff --git a/packaging/microshift/config.yaml b/packaging/microshift/config.yaml
 index a6171e6c76669e39d3829d0ea9769eb511d683e3..f0ce27443ec3de0f436dcdb8d7257455d5f7ddee 100644
 --- a/packaging/microshift/config.yaml

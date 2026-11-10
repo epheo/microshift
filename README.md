@@ -15,6 +15,7 @@ Published at `ghcr.io/epheo/microshift`.
 | Cluster-wide policies | `patches/0011` adds `enable-admin-network-policy=true`, the AdminNetworkPolicy and BaselineAdminNetworkPolicy CRDs (taken at build time from the payload's cluster-network-operator) to MicroShift's CRD list, and the OVN controller's rights to read them and write their status: a namespace's NetworkPolicy cannot override an admin Deny |
 | Per-namespace egress rules | `patches/0012` turns on `enable-egress-firewall` and adds the EgressFirewall CRD (taken at build time from the payload's cluster-network-operator) to MicroShift's CRD list. CIDRs and DNS names work; wildcard names need DNSNameResolver, off here as in OpenShift 5.0's default |
 | Multus enabled | `microshift-multus` (config.d toggle + cri-o default-network drop-in) |
+| Pods attach only to their namespace's networks | `patches/0013` runs Multus with namespace isolation, as OpenShift does: a pod may name NADs in its own namespace or in `network.multus.globalNamespaces` (default OpenShift's: `default`, `openshift-multus`, `openshift-sriov-network-operator`, `openshift-cnv`). A non-empty list replaces it; to share none, name an admin-only namespace such as `openshift-multus`, since Multus reads an empty list as `default` |
 | r-drbd is the storage driver | [r-drbd](https://github.com/epheo/r-drbd) (DRBD 9 on thin LVM) with its DRBD module built for the image kernel; local volumes on one node, replicated ones on three. See [Storage](#storage) |
 | Air-gapped by default | the full MicroShift payload is embedded as a shared-blob OCI layout and imported into cri-o at boot — first boot needs no registry |
 | [portail](https://github.com/epheo/portail) is the edge | its image is embedded and imported the same way; the router is off and the Gateway API experimental CRDs (TCPRoute, UDPRoute) ship with the image, see [The edge](#the-edge) |
@@ -114,6 +115,11 @@ egress). Its opinion assertions are functional, not existence checks:
 - an AdminNetworkPolicy Deny does the same on the cluster network;
 - an EgressFirewall Deny cuts one namespace off a node address, and
   removing it restores the path;
+- AdminNetworkPolicy egress Denies to a networks peer and to a nodes peer
+  do the same, and a NetworkPolicy overrides a BaselineAdminNetworkPolicy
+  Deny;
+- Multus attaches a pod to its own namespace's NAD and to `default`'s, and
+  refuses another namespace's;
 - the router is not deployed;
 - the embedded portail image starts from cri-o's store with pull policy
   Never, and a re-pointed embedded tag is re-imported;
