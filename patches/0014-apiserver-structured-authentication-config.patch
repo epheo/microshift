@@ -1,0 +1,208 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Thibaut Lapierre <root@epheo.eu>
+Date: Tue, 10 Nov 2026 14:50:56 +0100
+Subject: [PATCH 14/14] apiserver: structured authentication config
+
+apiServer.authenticationConfig names a structured authentication
+configuration file that kube-apiserver takes as --authentication-config:
+JWT issuers, audiences and claim mappings, a site's OIDC provider for
+instance. Client certificates and ServiceAccount tokens keep working
+beside it, and kube-apiserver reloads the file when it changes. A config.d
+drop-in can set it, so a site layer ships a file and a drop-in, no code.
+
+The path must be absolute. The kube-apiserver controller fails the start
+naming the setting when the file is missing. The file must not configure
+anonymous authentication: MicroShift sets --anonymous-auth.
+
+Upstream: no authentication setting as of 5.0.
+Covered by: config unit tests; vm-test (a token from an HTTPS issuer pod
+authenticates with a prefixed username and mapped groups, a file edit
+applies without a restart, the apiserver starts with the issuer down).
+---
+ .../config/config-openapi-spec.json           |  4 ++++
+ docs/user/howto_config.md                     |  2 ++
+ packaging/microshift/config.yaml              |  8 +++++++
+ pkg/config/apiserver.go                       | 10 +++++++++
+ pkg/config/config.go                          |  9 ++++++++
+ pkg/config/config_test.go                     | 22 +++++++++++++++++++
+ pkg/controllers/kube-apiserver.go             | 11 ++++++++++
+ 7 files changed, 66 insertions(+)
+
+diff --git a/cmd/generate-config/config/config-openapi-spec.json b/cmd/generate-config/config/config-openapi-spec.json
+index da71d82b71017e2e2e95a4e2fbe26048f38c4bce..941b24728dbe5e2ac909f31eff83d6de4f3bcad4 100755
+--- a/cmd/generate-config/config/config-openapi-spec.json
++++ b/cmd/generate-config/config/config-openapi-spec.json
+@@ -62,6 +62,10 @@
+             }
+           }
+         },
++        "authenticationConfig": {
++          "description": "AuthenticationConfig is the absolute path of a structured authentication\nconfiguration file (apiserver.config.k8s.io AuthenticationConfiguration),\nhanded to kube-apiserver as --authentication-config: JWT issuers,\naudiences and claim mappings. Client certificates and ServiceAccount\ntokens keep working beside it. kube-apiserver reloads the file when it\nchanges. The file must not configure anonymous authentication, which\nMicroShift already sets with --anonymous-auth.",
++          "type": "string"
++        },
+         "featureGates": {
+           "type": "object",
+           "required": [
+diff --git a/docs/user/howto_config.md b/docs/user/howto_config.md
+index 8f24fc9f68f1e5ad82e50545f1eedd097728832d..1264054174c9e2cb9651d1cdf9953e975a79acac 100644
+--- a/docs/user/howto_config.md
++++ b/docs/user/howto_config.md
+@@ -14,6 +14,7 @@ apiServer:
+         maxFileSize: 0
+         maxFiles: 0
+         profile: ""
++    authenticationConfig: ""
+     featureGates:
+         customNoUpgrade:
+             disabled: []
+@@ -186,6 +187,7 @@ apiServer:
+         maxFileSize: 200
+         maxFiles: 10
+         profile: Default
++    authenticationConfig: ""
+     featureGates:
+         customNoUpgrade:
+             disabled: []
+diff --git a/packaging/microshift/config.yaml b/packaging/microshift/config.yaml
+index f031bdeb58e1ba4eb94b8cbb805da15070f34979..3fd232c32bbb48fe21c07e2322586d25decd1f21 100644
+--- a/packaging/microshift/config.yaml
++++ b/packaging/microshift/config.yaml
+@@ -14,6 +14,14 @@ apiServer:
+         maxFiles: 10
+         # profile is the OpenShift profile specifying a specific logging policy
+         profile: Default
++    # AuthenticationConfig is the absolute path of a structured authentication
++    # configuration file (apiserver.config.k8s.io AuthenticationConfiguration),
++    # handed to kube-apiserver as --authentication-config: JWT issuers,
++    # audiences and claim mappings. Client certificates and ServiceAccount
++    # tokens keep working beside it. kube-apiserver reloads the file when it
++    # changes. The file must not configure anonymous authentication, which
++    # MicroShift already sets with --anonymous-auth.
++    authenticationConfig: ""
+     featureGates:
+         # CustomNoUpgrade is used to enable/disable feature gates that block x- and y-stream upgrades.
+         customNoUpgrade:
+diff --git a/pkg/config/apiserver.go b/pkg/config/apiserver.go
+index 8d31d1bc61607c817027e1b0dc4d680de51e7010..e58c15d3413764f52075173cfb9d9dbb2029969f 100644
+--- a/pkg/config/apiserver.go
++++ b/pkg/config/apiserver.go
+@@ -32,6 +32,16 @@ type ApiServer struct {
+ 
+ 	FeatureGates FeatureGates `json:"featureGates"`
+ 
++	// AuthenticationConfig is the absolute path of a structured authentication
++	// configuration file (apiserver.config.k8s.io AuthenticationConfiguration),
++	// handed to kube-apiserver as --authentication-config: JWT issuers,
++	// audiences and claim mappings. Client certificates and ServiceAccount
++	// tokens keep working beside it. kube-apiserver reloads the file when it
++	// changes. The file must not configure anonymous authentication, which
++	// MicroShift already sets with --anonymous-auth.
++	// +kubebuilder:validation:Optional
++	AuthenticationConfig string `json:"authenticationConfig,omitempty"`
++
+ 	// The URL and Port of the API server cannot be changed by the user.
+ 	URL  string `json:"-"`
+ 	Port int    `json:"-"`
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index bacb24b4a3026cfddd04067247c1ab7876d21a6b..4b1075761d59768553584c4ebe3c28e0f7667978 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -11,6 +11,7 @@ import (
+ 	"net/url"
+ 	"os"
+ 	"os/exec"
++	"path/filepath"
+ 	"slices"
+ 	"strings"
+ 	"time"
+@@ -297,6 +298,9 @@ func (c *Config) incorporateUserSettings(u *Config) {
+ 	if u.ApiServer.TLS.MinVersion != "" {
+ 		c.ApiServer.TLS.MinVersion = u.ApiServer.TLS.MinVersion
+ 	}
++	if u.ApiServer.AuthenticationConfig != "" {
++		c.ApiServer.AuthenticationConfig = u.ApiServer.AuthenticationConfig
++	}
+ 
+ 	if u.Debugging.LogLevel != "" {
+ 		c.Debugging.LogLevel = u.Debugging.LogLevel
+@@ -605,6 +609,11 @@ func (c *Config) validate() error {
+ 	if !isValidIPAddress(c.ApiServer.AdvertiseAddress) {
+ 		return fmt.Errorf("error validating apiServer.advertiseAddress (%q)", c.ApiServer.AdvertiseAddress)
+ 	}
++	// kube-apiserver resolves a relative path against its own working
++	// directory, not the config file's.
++	if c.ApiServer.AuthenticationConfig != "" && !filepath.IsAbs(c.ApiServer.AuthenticationConfig) {
++		return fmt.Errorf("apiServer.authenticationConfig must be an absolute path, got %q", c.ApiServer.AuthenticationConfig)
++	}
+ 	if c.ApiServer.SkipInterface {
+ 		err := checkAdvertiseAddressConfigured(c.ApiServer.AdvertiseAddress)
+ 		if err != nil {
+diff --git a/pkg/config/config_test.go b/pkg/config/config_test.go
+index 4be881bffcb01de656b947c3ffc39d5a9e30e2e5..2cac6168f76445a82559d195118449444b1d236d 100644
+--- a/pkg/config/config_test.go
++++ b/pkg/config/config_test.go
+@@ -289,6 +289,19 @@ func TestGetActiveConfigFromYAML(t *testing.T) {
+ 				return c
+ 			}(),
+ 		},
++		{
++			name: "api-server-authentication-config",
++			config: dedent(`
++            apiServer:
++              authenticationConfig: /etc/microshift/authentication.yaml
++            `),
++			expected: func() *Config {
++				c := mkDefaultConfig()
++				c.ApiServer.AuthenticationConfig = "/etc/microshift/authentication.yaml"
++				assert.NoError(t, c.updateComputedValues())
++				return c
++			}(),
++		},
+ 		{
+ 			name: "multus-global-namespaces-default",
+ 			config: dedent(`
+@@ -663,6 +676,15 @@ func TestValidate(t *testing.T) {
+ 			}(),
+ 			expectErr: true,
+ 		},
++		{
++			name: "api-server-authentication-config-relative",
++			config: func() *Config {
++				c := mkDefaultConfig()
++				c.ApiServer.AuthenticationConfig = "authentication.yaml"
++				return c
++			}(),
++			expectErr: true,
++		},
+ 		{
+ 			name: "multus-global-namespace-invalid",
+ 			config: func() *Config {
+diff --git a/pkg/controllers/kube-apiserver.go b/pkg/controllers/kube-apiserver.go
+index 70cb89dcdcec8c643d4c70a255342a81140bd5a0..dc75b5ae9b73cf8aa5752a0dcebc2d3e4bf99863 100644
+--- a/pkg/controllers/kube-apiserver.go
++++ b/pkg/controllers/kube-apiserver.go
+@@ -173,6 +173,14 @@ func (s *KubeAPIServer) configure(ctx context.Context, cfg *config.Config) error
+ 	if err != nil {
+ 		return fmt.Errorf("failed to convert feature gates to CLI flags: %w", err)
+ 	}
++
++	// Checked here so a missing file names the setting, not a kube-apiserver
++	// flag error.
++	if p := cfg.ApiServer.AuthenticationConfig; p != "" {
++		if _, err := os.Stat(p); err != nil {
++			return fmt.Errorf("apiServer.authenticationConfig: %w", err)
++		}
++	}
+ 	// Inject required feature gates into the feature-gates argument.
+ 	enabledRequiredFGs := make(sets.Set[string], 0)
+ 	for _, fg := range config.RequiredFeatureGates {
+@@ -269,6 +277,9 @@ func (s *KubeAPIServer) configure(ctx context.Context, cfg *config.Config) error
+ 		},
+ 		ServicesNodePortRange: cfg.Network.ServiceNodePortRange,
+ 	}
++	if p := cfg.ApiServer.AuthenticationConfig; p != "" {
++		overrides.APIServerArguments["authentication-config"] = kubecontrolplanev1.Arguments{p}
++	}
+ 
+ 	overridesBytes, err := json.Marshal(overrides)
+ 	if err != nil {
