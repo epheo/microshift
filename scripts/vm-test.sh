@@ -787,7 +787,10 @@ rbac_parity() {
         can create tcproutes.gateway.networking.k8s.io -n default --as=rbac-editor &&
         can list udproutes.gateway.networking.k8s.io -n default --as=rbac-viewer &&
         can list network-attachment-definitions.k8s.cni.cncf.io -n default --as=rbac-admin &&
-        ! can list network-attachment-definitions.k8s.cni.cncf.io -n default --as=rbac-editor
+        ! can list network-attachment-definitions.k8s.cni.cncf.io -n default --as=rbac-editor &&
+        # OVN-K's host-network-namespace, whose label NetworkPolicies admit
+        # host-network sources by (a host-network Gateway data plane).
+        koc get namespace -l policy-group.network.openshift.io/host-network -o name | grep -qx namespace/openshift-host-network
 }
 wait_for 180 "RBAC answers as OpenShift's" rbac_parity || {
     koc get clusterrole basic-user view edit admin -o name >&2 || true
