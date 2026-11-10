@@ -7,7 +7,8 @@
 # The opinion assertions are functional, not existence checks: a PVC is
 # provisioned and written, an OVN-K layer2 secondary network is attached,
 # a MultiNetworkPolicy cuts a pod off that network and its removal restores
-# it, an AdminNetworkPolicy does the same on the cluster network, the
+# it, an AdminNetworkPolicy does the same on the cluster network, an
+# EgressFirewall cuts one namespace off a node address, the
 # embedded portail image is started with pull policy Never, the API
 # accepts TCPRoute and UDPRoute objects, and RBAC answers as OpenShift's
 # does for signed-in users and the stock project roles (src/rbac).
@@ -165,15 +166,16 @@ greenboot_green() {
         | grep -qiE 'Status is GREEN|health-check passed'
 }
 
+# wait_pod_running POD [NAMESPACE]
 wait_pod_running() {
-    local pod=$1 phase=""
+    local pod=$1 ns=${2:-default} phase=""
     for _ in $(seq 60); do
-        phase="$(koc get pod "${pod}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+        phase="$(koc -n "${ns}" get pod "${pod}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
         [ "${phase}" = "Running" ] && return 0
         sleep 5
     done
-    echo "ERROR: pod ${pod} never became Running (phase=${phase})" >&2
-    koc describe pod "${pod}" >&2 || true
+    echo "ERROR: pod ${ns}/${pod} never became Running (phase=${phase})" >&2
+    koc -n "${ns}" describe pod "${pod}" >&2 || true
     return 1
 }
 
@@ -485,7 +487,8 @@ ${ok} || { echo "ERROR: pods did not settle (total=${total} not-ready=${bad})" >
 # when one does not.
 log "assert: ovnkube-config carries the patched-in flags natively"
 ovnkube_conf="$(koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkube\.conf}')"
-for flag in enable-multi-network enable-multi-networkpolicy enable-admin-network-policy; do
+for flag in enable-multi-network enable-multi-networkpolicy enable-admin-network-policy \
+    enable-egress-firewall; do
     echo "${ovnkube_conf}" | grep -qE "^[[:space:]]*${flag}=true[[:space:]]*$" || {
         echo "ERROR: ${flag}=true missing from ovnkube-config:" >&2
         echo "${ovnkube_conf}" >&2
@@ -685,6 +688,75 @@ l2_expect no "under an AdminNetworkPolicy Deny"
 koc delete adminnetworkpolicy anptest-deny >/dev/null
 l2_expect yes "after the AdminNetworkPolicy is deleted"
 
+# reach NS POD IP PORT: a TCP connect from that pod, 3s timeout.
+reach() {
+    koc -n "$1" exec "$2" -- python3 -c \
+        'import socket, sys; socket.create_connection((sys.argv[1], int(sys.argv[2])), 3)' "$3" "$4" \
+        >/dev/null 2>&1
+}
+# expect WANT NS POD IP PORT WHAT: retries cover OVN programming the path.
+expect() {
+    local want=$1 got
+    for _ in $(seq 20); do
+        if reach "$2" "$3" "$4" "$5"; then got=yes; else got=no; fi
+        [ "${got}" = "${want}" ] && return 0
+        sleep 3
+    done
+    echo "ERROR: $2/$3 to $4:$5 reachable=${got}, want ${want} ($6)" >&2
+    return 1
+}
+
+# On the default network: a node address cut off for one namespace only,
+# and restored when the EgressFirewall goes.
+log "assert: an EgressFirewall Deny cuts one namespace off a node address"
+node_ip="$(koc get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')"
+koc create namespace efw-probe --dry-run=client -o yaml | koc apply -f - >/dev/null
+koc label namespace efw-probe pod-security.kubernetes.io/enforce=privileged --overwrite >/dev/null
+koc apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client
+  namespace: efw-probe
+spec:
+  restartPolicy: Never
+  containers:
+  - name: client
+    image: ${util_img}
+    command: ["sleep", "3600"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: efw-target
+spec:
+  hostNetwork: true
+  restartPolicy: Never
+  containers:
+  - name: server
+    image: ${util_img}
+    command: ["python3", "-m", "http.server", "18080"]
+EOF
+wait_pod_running client efw-probe
+wait_pod_running efw-target
+expect yes efw-probe client "${node_ip}" 18080 "before any EgressFirewall"
+koc apply -f - <<EOF
+apiVersion: k8s.ovn.org/v1
+kind: EgressFirewall
+metadata:
+  name: default
+  namespace: efw-probe
+spec:
+  egress:
+  - type: Deny
+    to:
+      cidrSelector: ${node_ip}/32
+EOF
+expect no efw-probe client "${node_ip}" 18080 "under an EgressFirewall Deny"
+expect yes default l2test-probe "${node_ip}" 18080 "from a namespace without one"
+koc -n efw-probe delete egressfirewall default >/dev/null
+expect yes efw-probe client "${node_ip}" 18080 "after the EgressFirewall is deleted"
+
 log "assert: the embedded portail image starts from cri-o's store (pull policy Never)"
 portail_ref="$(vssh awk '{print $2}' /usr/lib/embedded-images/manifest | grep '/portail:' | head -1)"
 koc apply -f - <<EOF
@@ -787,7 +859,13 @@ rbac_parity() {
         can create tcproutes.gateway.networking.k8s.io -n default --as=rbac-editor &&
         can list udproutes.gateway.networking.k8s.io -n default --as=rbac-viewer &&
         can list network-attachment-definitions.k8s.cni.cncf.io -n default --as=rbac-admin &&
-        ! can list network-attachment-definitions.k8s.cni.cncf.io -n default --as=rbac-editor
+        ! can list network-attachment-definitions.k8s.cni.cncf.io -n default --as=rbac-editor &&
+        # OpenShift leaves EgressFirewall to cluster admins; dotvirt grants it
+        # to project admins with a role of its own, which relies on this.
+        ! can create egressfirewalls.k8s.ovn.org -n default --as=rbac-admin &&
+        # OVN-K's host-network-namespace, whose label NetworkPolicies admit
+        # host-network sources by (a host-network Gateway data plane).
+        koc get namespace -l policy-group.network.openshift.io/host-network -o name | grep -qx namespace/openshift-host-network
 }
 wait_for 180 "RBAC answers as OpenShift's" rbac_parity || {
     koc get clusterrole basic-user view edit admin -o name >&2 || true

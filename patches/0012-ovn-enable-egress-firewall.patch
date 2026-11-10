@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Thibaut Lapierre <root@epheo.eu>
+Date: Tue, 10 Nov 2026 11:35:07 +0100
+Subject: [PATCH 12/12] ovn: enable egress firewall
+
+enable-egress-firewall=true, the EgressFirewall CRD in MicroShift's CRD
+list so it exists before OVN-K starts, and the cluster manager's right to
+patch its status. Upstream ships the flag off and no CRD, so no
+k8s.ovn.org kind is served; dotvirt treats EgressFirewall as a tenant
+kind, as on OpenShift.
+
+The CRD file is not carried: the SRPM stage writes
+assets/crd/egressfirewall.crd.yaml from the payload's
+cluster-network-operator (src/image/payload-crds.sh), so it always matches
+the OVN-K that ships with it. Single-node ovnkube runs with the admin
+kubeconfig; the zones node role already carries OpenShift's reads.
+
+CIDRs and DNS names work, names through ovnkube's own resolver. Wildcard
+names need DNSNameResolver, off here as in OpenShift 5.0's default
+(TechPreviewNoUpgrade only).
+
+Upstream: no config knob as of 5.0.
+Covered by: vm-test (an EgressFirewall Deny cuts a pod off a node address,
+other namespaces keep it, its removal restores it).
+---
+ assets/components/ovn/common/clusterrole-controller.yaml | 7 +++++++
+ assets/components/ovn/common/configmap.yaml              | 2 +-
+ pkg/assets/crd.go                                        | 1 +
+ 3 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/assets/components/ovn/common/clusterrole-controller.yaml b/assets/components/ovn/common/clusterrole-controller.yaml
+index 323394004c7077593cb33a8f9d6c889c497434e5..8aaa4e18682cacd85e3abbbcca12f768906df4af 100644
+--- a/assets/components/ovn/common/clusterrole-controller.yaml
++++ b/assets/components/ovn/common/clusterrole-controller.yaml
+@@ -170,3 +170,10 @@ rules:
+   - baselineadminnetworkpolicies/status
+   verbs:
+   - patch
++# enable-egress-firewall: zone controllers write each EgressFirewall's status
++# and the cluster manager clears stale zone entries from it, as with ANP.
++- apiGroups: ["k8s.ovn.org"]
++  resources:
++  - egressfirewalls/status
++  verbs:
++  - patch
+diff --git a/assets/components/ovn/common/configmap.yaml b/assets/components/ovn/common/configmap.yaml
+index b9d6899434ee0e7e541e6695df30ef22668be72e..0c7a9334f3ab2cca71f359b0d0b524d3301963ed 100644
+--- a/assets/components/ovn/common/configmap.yaml
++++ b/assets/components/ovn/common/configmap.yaml
+@@ -27,7 +27,7 @@ data:
+ 
+     [ovnkubernetesfeature]
+     enable-egress-ip=false
+-    enable-egress-firewall=false
++    enable-egress-firewall=true
+     enable-egress-qos=false
+     enable-multi-network=true
+     enable-multi-networkpolicy=true
+diff --git a/pkg/assets/crd.go b/pkg/assets/crd.go
+index ec21e1c12ea26936d2e732cf51c51fd4a38b847d..29b5c1f377617d0b9813cf7c90b1f678f2c5314e 100644
+--- a/pkg/assets/crd.go
++++ b/pkg/assets/crd.go
+@@ -42,6 +42,7 @@ var (
+ 		"crd/multi-networkpolicy.crd.yaml",
+ 		"crd/admin-network-policy.crd.yaml",
+ 		"crd/baseline-admin-network-policy.crd.yaml",
++		"crd/egressfirewall.crd.yaml",
+ 		"components/lvms/topolvm.io_logicalvolumes.yaml",
+ 		"components/lvms/lvm.topolvm.io_lvmclusters.yaml",
+ 		"components/lvms/lvm.topolvm.io_lvmvolumegroupnodestatuses.yaml",

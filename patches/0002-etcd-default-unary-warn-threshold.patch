@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Thibaut Lapierre <root@epheo.eu>
 Date: Fri, 6 Nov 2026 00:00:00 +0000
-Subject: [PATCH 02/11] etcd: default unary warn threshold
+Subject: [PATCH 02/12] etcd: default unary warn threshold
 
 The vendored etcd defines DefaultWarningUnaryRequestDuration but never
 applies it to embed configs. The threshold stays 0 and the v3rpc
