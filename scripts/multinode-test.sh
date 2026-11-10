@@ -413,6 +413,24 @@ greenboot_checks v2 worker
 log "assert: the worker restarts without the bootstrap kubeconfig"
 v2 systemctl restart microshift || die "worker microshift failed to restart after the join"
 retry 300 "both nodes Ready after the worker restart" both_ready
+# A Ready node can still leave new pods without networking: a restart that
+# reran configure-ovs cleared ovn-remote under the running ovnkube.
+log "assert: a new pod on the worker gets its network after the restart"
+koc apply -f - <<EOF >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mn-after-restart
+spec:
+  nodeSelector: {kubernetes.io/hostname: node2}
+  containers:
+  - name: probe
+    image: ${util_img}
+    command: ["sleep", "3600"]
+EOF
+after_restart_up() { koc get pod mn-after-restart --no-headers 2>/dev/null | grep -q ' Running'; }
+retry 180 "a new pod Running on node2 after its restart" after_restart_up
+koc delete pod mn-after-restart --wait=false >/dev/null
 
 # --- 9. A down worker does not fail the control plane's greenboot ---------------
 # Counting the worker's unavailable DaemonSet pods would turn the control
