@@ -60,6 +60,16 @@ RUN test -n "${DRBD_VERSION}" -a -n "${DRBD_SHA256}" && \
     make -C "/tmp/drbd-${DRBD_VERSION}" kmp-rpm KDIR="/usr/src/kernels/${kver}" \
         RPMOPT='--define "debug_package %{nil}"'
 
+# ovnkube for primary user-defined networks (patches/0015), until the payload
+# ships kubelet-cgroup-path: src/ovn/build-ovnkube.sh says why, and fails the
+# build once this stage must go. The builder has Go; the release JSON names
+# the OVN-Kubernetes image MicroShift runs.
+FROM ${RPM_IMAGE} AS ovnkube
+COPY --chmod=755 ./src/ovn/build-ovnkube.sh /tmp/ovn/build-ovnkube.sh
+COPY ./src/ovn/*.patch /tmp/ovn/
+RUN dnf -y install --setopt=install_weak_deps=False git-core skopeo && \
+    /tmp/ovn/build-ovnkube.sh /home/microshift/microshift/assets/release/release-x86_64.json /tmp/ovnkube
+
 FROM ${BOOTC_IMAGE_URL}:${BOOTC_IMAGE_TAG}
 
 # Pinned in versions.env; the Makefile passes it.
@@ -191,6 +201,8 @@ COPY ./src/update/manifests/ /usr/lib/microshift/manifests.d/010-microshift-upda
 RUN systemctl enable microshift-update-publish.service microshift-update-follow.service \
         microshift-update-follow.timer
 
+COPY --from=ovnkube --chmod=755 /tmp/ovnkube /usr/libexec/microshift-ovnkube
+
 # r-drbd, the storage plane. Its manifests apply from manifests.d like the
 # rest of the payload; its images are listed in a release-info JSON so the
 # payload embed below carries them.
@@ -250,9 +262,10 @@ RUN crds=/usr/lib/microshift/manifests.d/000-gateway-api/experimental-install.ya
     echo "${GATEWAY_API_SHA256}  ${crds}" | sha256sum -c -
 
 # OpenShift's grants that MicroShift's apiserver bootstrap lacks (storage and
-# snapshot classes for every signed-in user, Gateway API and NAD reads in the
-# stock project roles), vendored from the pinned payload's sources by
-# src/rbac/vendor.sh, plus this distribution's experimental route kinds.
+# snapshot classes for every signed-in user, Gateway API, NAD and UDN rights
+# in the stock project roles), its host-network namespace and UDN label
+# policy, vendored from the pinned payload's sources by src/rbac/vendor.sh,
+# plus this distribution's experimental route kinds.
 COPY ./src/rbac/kustomization.yaml ./src/rbac/openshift-parity.yaml ./src/rbac/experimental-routes.yaml \
     /usr/lib/microshift/manifests.d/010-openshift-rbac/
 

@@ -15,6 +15,7 @@ Published at `ghcr.io/epheo/microshift`.
 | Cluster-wide policies | `patches/0011` adds `enable-admin-network-policy=true`, the AdminNetworkPolicy and BaselineAdminNetworkPolicy CRDs (taken at build time from the payload's cluster-network-operator) to MicroShift's CRD list, and the OVN controller's rights to read them and write their status: a namespace's NetworkPolicy cannot override an admin Deny |
 | Per-namespace egress rules | `patches/0012` turns on `enable-egress-firewall` and adds the EgressFirewall CRD (taken at build time from the payload's cluster-network-operator) to MicroShift's CRD list. CIDRs and DNS names work; wildcard names need DNSNameResolver, off here as in OpenShift 5.0's default |
 | Multus enabled | `microshift-multus` (config.d toggle + cri-o default-network drop-in) |
+| Primary networks per project | `patches/0015` turns on `enable-network-segmentation`, `enable-preconfigured-udn-addresses` and the cluster manager's `--enable-persistent-ips`, adds the UserDefinedNetwork, ClusterUserDefinedNetwork and IPAMClaim CRDs, and lets primary networks reach MicroShift's DNS Service. `patches/0016` moves OVN-K to OpenShift's masquerade subnets (`169.254.0.0/17`, `fd69::/112`), which hold one masquerade address per user-defined network; the firewall trusts `169.254.0.0/17`. `src/rbac` vendors OpenShift's UDN rights for edit and view and the policy that freezes `k8s.ovn.org/primary-user-defined-network` once a namespace exists. The 5.0 OVN-K needs two fixes for MicroShift: `kubelet-cgroup-path` (ovn-kubernetes #6735, OpenShift 5.1), so kubelet probes reach primary-network pods from microshift.service, and primary networks reaching DNS and the API over a `br-ex` without an uplink (not upstream yet). `src/ovn/build-ovnkube.sh` rebuilds the payload's own `ovnkube` with `src/ovn/*.patch` and every OVN-K container runs it. The script fails the build when the payload already carries a fix, so each patch goes when upstream has it |
 | Sign-in through a site's identity provider | `patches/0014` adds `apiServer.authenticationConfig`: the absolute path of a structured AuthenticationConfiguration file (JWT issuers, audiences, claim mappings), passed to kube-apiserver as `--authentication-config` and reloaded when it changes. A site layer ships the file and a `config.d` drop-in. Client certificates and ServiceAccount tokens keep working; the file must not configure `anonymous`, which MicroShift sets |
 | Pods attach only to their namespace's networks | `patches/0013` runs Multus with namespace isolation, as OpenShift does: a pod may name NADs in its own namespace or in `network.multus.globalNamespaces` (default OpenShift's: `default`, `openshift-multus`, `openshift-sriov-network-operator`, `openshift-cnv`). A non-empty list replaces it; to share none, name an admin-only namespace such as `openshift-multus`, since Multus reads an empty list as `default` |
 | r-drbd is the storage driver | [r-drbd](https://github.com/epheo/r-drbd) (DRBD 9 on thin LVM) with its DRBD module built for the image kernel; local volumes on one node, replicated ones on three. See [Storage](#storage) |
@@ -121,6 +122,11 @@ egress). Its opinion assertions are functional, not existence checks:
   Deny;
 - Multus attaches a pod to its own namespace's NAD and to `default`'s, and
   refuses another namespace's;
+- two primary ClusterUserDefinedNetworks isolate their namespaces from each
+  other and from the default network, each still reaches DNS and the API,
+  a kubelet readiness probe reaches a primary-network pod while a shell on
+  the node does not, and an IPAMClaim keeps a pod's address across a
+  recreate;
 - with `apiServer.authenticationConfig` set from a drop-in, MicroShift
   starts while the JWT issuer is down, a token from it then authenticates
   with a mapped username and groups, client certificates and ServiceAccount

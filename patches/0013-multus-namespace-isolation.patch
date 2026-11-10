@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Thibaut Lapierre <root@epheo.eu>
 Date: Tue, 10 Nov 2026 11:45:47 +0100
-Subject: [PATCH 13/14] multus: namespace isolation
+Subject: [PATCH 13/16] multus: namespace isolation
 
 Multus runs with namespace isolation, as OpenShift's network operator
 renders it: a pod attaches only to NetworkAttachmentDefinitions in its own

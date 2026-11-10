@@ -1,0 +1,294 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Thibaut Lapierre <root@epheo.eu>
+Date: Tue, 10 Nov 2026 11:35:45 +0100
+Subject: [PATCH 15/16] ovn: enable network segmentation
+
+UserDefinedNetwork and ClusterUserDefinedNetwork served, primary networks
+included, as on OpenShift: enable-network-segmentation and
+enable-preconfigured-udn-addresses in ovnkube.conf, --enable-persistent-ips
+on the cluster manager (OpenShift passes it there alone), the UDN, CUDN
+and IPAMClaim CRDs in MicroShift's CRD list so they exist before OVN-K
+starts, and the cluster manager's rights to render NADs and own the
+networks' status, and mirror each Service's EndpointSlices into the networks
+that use it. Needs 0001.
+
+With segmentation on, OVN-K isolates primary networks from the host and
+lets only kubelet's cgroup through, for probes. The 5.0 OVN-K looks for a
+cgroup named kubelet.service, absent here: kubelet runs inside
+microshift.service, and ovnkube-node exits. ovn-kubernetes #6735 adds
+kubelet-cgroup-path (OpenShift 5.1). Until the payload carries it, every
+container that runs ovnkube mounts /usr/libexec/microshift-ovnkube, the
+image's own ovnkube rebuilt by src/ovn/build-ovnkube.sh with #6735 and a fix
+for UDN traffic to DNS and the API over a br-ex without an uplink, and
+[ovnkubenode] names microshift.service. The node side also mounts
+systemd's private socket, as OpenShift does, so the rule follows
+microshift.service restarts. Once the payload carries both fixes the
+ovnkube mounts go; the setting and the socket stay.
+
+udn-allowed-default-services names MicroShift's DNS Service: OVN-K's
+default, kube-system/kube-dns, does not exist here. dns-service-namespace
+and dns-service-name give the same Service to the DHCP OVN-K serves VMs on
+a primary layer2 network.
+
+The CRD files are not carried: the SRPM stage writes them from the
+payload's cluster-network-operator (src/image/payload-crds.sh). The
+namespace-label admission policy and the UDN user roles come from the same
+operator through src/rbac/vendor.sh.
+
+Upstream: no config knob as of 5.0.
+Covered by: vm-test (two primary CUDNs isolate their namespaces from each
+other and from the default network, each still reaches DNS and the API, a
+kubelet readiness probe passes into one, an IPAMClaim keeps a pod's
+address across a recreate) and multinode-test (a primary CUDN spans
+nodes).
+---
+ .../ovn/common/clusterrole-controller.yaml    | 57 +++++++++++++++++++
+ assets/components/ovn/common/configmap.yaml   | 10 ++++
+ .../ovn/single-node/master/daemonset.yaml     | 25 +++++++-
+ .../ovn/zones/master/daemonset.yaml           | 12 +++-
+ .../components/ovn/zones/node/daemonset.yaml  | 19 +++++++
+ pkg/assets/crd.go                             |  3 +
+ 6 files changed, 124 insertions(+), 2 deletions(-)
+
+diff --git a/assets/components/ovn/common/clusterrole-controller.yaml b/assets/components/ovn/common/clusterrole-controller.yaml
+index 8aaa4e18682cacd85e3abbbcca12f768906df4af..5ff087fe8fae2d39b14d662ecfd1cd847eb1552e 100644
+--- a/assets/components/ovn/common/clusterrole-controller.yaml
++++ b/assets/components/ovn/common/clusterrole-controller.yaml
+@@ -177,3 +177,60 @@ rules:
+   - egressfirewalls/status
+   verbs:
+   - patch
++# enable-network-segmentation: the cluster manager renders each UDN and CUDN
++# into NADs in the namespaces it selects, deletes them with the network, and
++# owns the networks' status and finalizers. Same crash loop when forbidden.
++- apiGroups: ["k8s.ovn.org"]
++  resources:
++  - userdefinednetworks
++  - clusteruserdefinednetworks
++  verbs:
++  - get
++  - list
++  - watch
++  - patch
++  - update
++- apiGroups: ["k8s.ovn.org"]
++  resources:
++  - userdefinednetworks/status
++  - clusteruserdefinednetworks/status
++  verbs:
++  - patch
++  - update
++- apiGroups: ["k8s.ovn.org"]
++  resources:
++  - userdefinednetworks/finalizers
++  - clusteruserdefinednetworks/finalizers
++  verbs:
++  - update
++- apiGroups: ["k8s.cni.cncf.io"]
++  resources:
++  - network-attachment-definitions
++  verbs:
++  - delete
++# It also mirrors each Service's EndpointSlices into every user-defined
++# network, with the pods' addresses there: without these, a UDN Service has
++# no endpoints.
++- apiGroups: ["discovery.k8s.io"]
++  resources:
++  - endpointslices
++  verbs:
++  - get
++  - create
++  - update
++  - delete
++# --enable-persistent-ips: the cluster manager records each claimed address
++# in the IPAMClaim's status, so a VM keeps it across restarts and migrations.
++- apiGroups: ["k8s.cni.cncf.io"]
++  resources:
++  - ipamclaims
++  verbs:
++  - get
++  - list
++  - watch
++- apiGroups: ["k8s.cni.cncf.io"]
++  resources:
++  - ipamclaims/status
++  verbs:
++  - patch
++  - update
+diff --git a/assets/components/ovn/common/configmap.yaml b/assets/components/ovn/common/configmap.yaml
+index 0c7a9334f3ab2cca71f359b0d0b524d3301963ed..81bc5da4936c04c1e8742a3e4fcc43de3239de94 100644
+--- a/assets/components/ovn/common/configmap.yaml
++++ b/assets/components/ovn/common/configmap.yaml
+@@ -13,6 +13,7 @@ data:
+     encap-port="6081"
+     enable-lflow-cache=false
+     lflow-cache-limit-kb=870
++    udn-allowed-default-services="default/kubernetes,openshift-dns/dns-default"
+ 
+     [kubernetes]
+     service-cidrs={{.ServiceCIDR}}
+@@ -23,6 +24,8 @@ data:
+     kubeconfig={{.KubeconfigPath}}
+ {{- end }}
+     host-network-namespace="openshift-host-network"
++    dns-service-namespace="openshift-dns"
++    dns-service-name="dns-default"
+     platform-type="BareMetal"
+ 
+     [ovnkubernetesfeature]
+@@ -32,6 +35,13 @@ data:
+     enable-multi-network=true
+     enable-multi-networkpolicy=true
+     enable-admin-network-policy=true
++    enable-network-segmentation=true
++    enable-preconfigured-udn-addresses=true
++
++    [ovnkubenode]
++    # kubelet runs inside microshift.service: UDN host isolation lets this
++    # cgroup's sockets reach primary-network pods, for kubelet probes.
++    kubelet-cgroup-path="system.slice/microshift.service"
+ 
+     [gateway]
+     mode=local
+diff --git a/assets/components/ovn/single-node/master/daemonset.yaml b/assets/components/ovn/single-node/master/daemonset.yaml
+index fabae2eddea010711ba7103b60e672d0134b6b09..0849795dc2bd18c6f4cf6940c59633f3f4603b7c 100644
+--- a/assets/components/ovn/single-node/master/daemonset.yaml
++++ b/assets/components/ovn/single-node/master/daemonset.yaml
+@@ -318,7 +318,8 @@ spec:
+             --init-cluster-manager "${K8S_NODE}" \
+             --config-file=/run/ovnkube-config/ovnkube.conf \
+             --loglevel "${OVN_KUBE_LOG_LEVEL}" \
+-            --enable-multicast
++            --enable-multicast \
++            --enable-persistent-ips
+         env:
+         - name: OVN_KUBE_LOG_LEVEL
+           value: "4"
+@@ -327,6 +328,9 @@ spec:
+             fieldRef:
+               fieldPath: spec.nodeName
+         volumeMounts:
++        - mountPath: /usr/bin/ovnkube
++          name: microshift-ovnkube
++          readOnly: true
+         - mountPath: /run/ovnkube-config/
+           name: ovnkube-config
+         - mountPath: {{.KubeconfigDir}}
+@@ -423,6 +427,16 @@ spec:
+           initialDelaySeconds: 5
+           periodSeconds: 5
+         volumeMounts:
++        # UDN host isolation follows the kubelet unit's restarts over systemd's
++        # private socket, as OpenShift mounts it.
++        - mountPath: /run/systemd/private
++          name: run-systemd
++          subPath: private
++          readOnly: true
++          mountPropagation: HostToContainer
++        - mountPath: /usr/bin/ovnkube
++          name: microshift-ovnkube
++          readOnly: true
+         # for checking ovs-configuration service
+         - mountPath: /etc/systemd/system
+           name: systemd-units
+@@ -528,5 +542,14 @@ spec:
+         configMap:
+           name: env-overrides
+           optional: true
++      # The image's ovnkube plus the OVN-K fixes in src/ovn/, built by
++      # src/ovn/build-ovnkube.sh until the payload carries them.
++      - name: microshift-ovnkube
++        hostPath:
++          path: /usr/libexec/microshift-ovnkube
++          type: File
++      - name: run-systemd
++        hostPath:
++          path: /run/systemd
+       tolerations:
+       - operator: "Exists"
+diff --git a/assets/components/ovn/zones/master/daemonset.yaml b/assets/components/ovn/zones/master/daemonset.yaml
+index 18ae72b05b148bf16b8ea79208690574e9433f95..5626a4ee91ae687cb4382c0903360ac21745aeb0 100644
+--- a/assets/components/ovn/zones/master/daemonset.yaml
++++ b/assets/components/ovn/zones/master/daemonset.yaml
+@@ -59,7 +59,8 @@ spec:
+             --init-cluster-manager "${K8S_NODE}" \
+             --config-file=/run/ovnkube-config/ovnkube.conf \
+             --loglevel "${OVN_KUBE_LOG_LEVEL}" \
+-            --enable-multicast
++            --enable-multicast \
++            --enable-persistent-ips
+         env:
+         - name: OVN_KUBE_LOG_LEVEL
+           value: "4"
+@@ -68,6 +69,9 @@ spec:
+             fieldRef:
+               fieldPath: spec.nodeName
+         volumeMounts:
++        - mountPath: /usr/bin/ovnkube
++          name: microshift-ovnkube
++          readOnly: true
+         - mountPath: /run/ovnkube-config/
+           name: ovnkube-config
+         - mountPath: /env
+@@ -88,5 +92,11 @@ spec:
+         configMap:
+           name: env-overrides
+           optional: true
++      # The image's ovnkube plus the OVN-K fixes in src/ovn/, built by
++      # src/ovn/build-ovnkube.sh until the payload carries them.
++      - name: microshift-ovnkube
++        hostPath:
++          path: /usr/libexec/microshift-ovnkube
++          type: File
+       tolerations:
+       - operator: "Exists"
+diff --git a/assets/components/ovn/zones/node/daemonset.yaml b/assets/components/ovn/zones/node/daemonset.yaml
+index 47a78f8cca514f63cd050ffc59fb02e82101689e..e53a6eb3a98d6a214102eccce057f43554047df5 100644
+--- a/assets/components/ovn/zones/node/daemonset.yaml
++++ b/assets/components/ovn/zones/node/daemonset.yaml
+@@ -474,6 +474,16 @@ spec:
+           initialDelaySeconds: 5
+           periodSeconds: 5
+         volumeMounts:
++        # UDN host isolation follows the kubelet unit's restarts over systemd's
++        # private socket, as OpenShift mounts it.
++        - mountPath: /run/systemd/private
++          name: run-systemd
++          subPath: private
++          readOnly: true
++          mountPropagation: HostToContainer
++        - mountPath: /usr/bin/ovnkube
++          name: microshift-ovnkube
++          readOnly: true
+         # for checking ovs-configuration service
+         - mountPath: /etc/systemd/system
+           name: systemd-units
+@@ -575,5 +585,14 @@ spec:
+         configMap:
+           name: env-overrides
+           optional: true
++      # The image's ovnkube plus the OVN-K fixes in src/ovn/, built by
++      # src/ovn/build-ovnkube.sh until the payload carries them.
++      - name: microshift-ovnkube
++        hostPath:
++          path: /usr/libexec/microshift-ovnkube
++          type: File
++      - name: run-systemd
++        hostPath:
++          path: /run/systemd
+       tolerations:
+       - operator: "Exists"
+diff --git a/pkg/assets/crd.go b/pkg/assets/crd.go
+index 29b5c1f377617d0b9813cf7c90b1f678f2c5314e..667aeec111e634108c9e1df9e2a697d2c3afc68d 100644
+--- a/pkg/assets/crd.go
++++ b/pkg/assets/crd.go
+@@ -43,6 +43,9 @@ var (
+ 		"crd/admin-network-policy.crd.yaml",
+ 		"crd/baseline-admin-network-policy.crd.yaml",
+ 		"crd/egressfirewall.crd.yaml",
++		"crd/ipamclaims.crd.yaml",
++		"crd/userdefinednetwork.crd.yaml",
++		"crd/clusteruserdefinednetwork.crd.yaml",
+ 		"components/lvms/topolvm.io_logicalvolumes.yaml",
+ 		"components/lvms/lvm.topolvm.io_lvmclusters.yaml",
+ 		"components/lvms/lvm.topolvm.io_lvmvolumegroupnodestatuses.yaml",

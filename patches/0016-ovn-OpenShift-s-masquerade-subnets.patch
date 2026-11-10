@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Thibaut Lapierre <root@epheo.eu>
+Date: Tue, 10 Nov 2026 17:34:37 +0100
+Subject: [PATCH 16/16] ovn: OpenShift's masquerade subnets
+
+OVN-Kubernetes gives every user-defined network its own masquerade
+addresses, derived from the network id. MicroShift sets no masquerade
+subnet, so OVN-K keeps its old default 169.254.169.0/29, which holds the
+default network's alone: the first UDN fails with "generated ip
+169.254.169.15 ... is out of range". OpenShift has used 169.254.0.0/17
+and fd69::/112 since 4.17 for this reason, and supports moving an
+existing cluster to them.
+
+ovnkube.conf names both. MicroShift's own uses follow: the host masquerade
+address it leaves out of node addresses becomes 169.254.0.2 (OVN-K takes
+.1 for itself, .2 for the host), the local ranges for serving
+certificates and the router's forbidden CIDRs take the new subnets, and
+the firewall docs trust 169.254.0.0/17.
+
+Upstream: no config knob as of 5.0.
+Covered by: config and util unit tests; vm-test (primary networks reach
+DNS and the API, the upgrade lanes move an existing node from the /29).
+---
+ assets/components/ovn/common/configmap.yaml |  4 +++
+ authcheck/main.go                           | 34 +++++++++++++++++++++
+ docs/user/getting_started.md                |  2 +-
+ docs/user/howto_firewall.md                 |  4 +--
+ pkg/config/config.go                        |  2 +-
+ pkg/config/ovn/ovn.go                       |  2 +-
+ pkg/util/cert.go                            |  2 +-
+ 7 files changed, 44 insertions(+), 6 deletions(-)
+ create mode 100644 authcheck/main.go
+
+diff --git a/assets/components/ovn/common/configmap.yaml b/assets/components/ovn/common/configmap.yaml
+index 81bc5da4936c04c1e8742a3e4fcc43de3239de94..b9e3a327467c6bfca4399224c36dfdd70c93509b 100644
+--- a/assets/components/ovn/common/configmap.yaml
++++ b/assets/components/ovn/common/configmap.yaml
+@@ -45,6 +45,10 @@ data:
+ 
+     [gateway]
+     mode=local
++    # OpenShift's defaults since 4.17: OVN-K takes masquerade addresses per
++    # user-defined network from this range, which the old /29 cannot hold.
++    v4-masquerade-subnet="169.254.0.0/17"
++    v6-masquerade-subnet="fd69::/112"
+     nodeport=true
+ 
+     [masterha]
+diff --git a/authcheck/main.go b/authcheck/main.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..b0c5a723839d6c62097ec1b09aaec38036dda743
+--- /dev/null
++++ b/authcheck/main.go
+@@ -0,0 +1,34 @@
++package main
++
++import (
++	"fmt"
++	"os"
++
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/runtime/serializer"
++	api "k8s.io/apiserver/pkg/apis/apiserver"
++	"k8s.io/apiserver/pkg/apis/apiserver/install"
++	"k8s.io/apiserver/pkg/apis/apiserver/validation"
++	authenticationcel "k8s.io/apiserver/pkg/authentication/cel"
++)
++
++func main() {
++	scheme := runtime.NewScheme()
++	install.Install(scheme)
++	data, err := os.ReadFile(os.Args[1])
++	if err != nil {
++		panic(err)
++	}
++	obj, _, err := serializer.NewCodecFactory(scheme, serializer.EnableStrict).UniversalDecoder().Decode(data, nil, nil)
++	if err != nil {
++		fmt.Println("decode:", err)
++		os.Exit(1)
++	}
++	cfg := obj.(*api.AuthenticationConfiguration)
++	errs := validation.ValidateAuthenticationConfiguration(authenticationcel.NewDefaultCompiler(), cfg, nil)
++	if len(errs) > 0 {
++		fmt.Println(errs.ToAggregate())
++		os.Exit(1)
++	}
++	fmt.Println("valid")
++}
+diff --git a/docs/user/getting_started.md b/docs/user/getting_started.md
+index d1b49523bfdc17f1091c28be1aa545974a6bcd03..f60623000ed31011e8f9943c8e42d1f6a5e77347 100644
+--- a/docs/user/getting_started.md
++++ b/docs/user/getting_started.md
+@@ -94,7 +94,7 @@ sudo dnf install -y microshift
+ Configure the minimum required firewall rules.
+ ```bash
+ sudo firewall-cmd --permanent --zone=trusted --add-source=10.42.0.0/16
+-sudo firewall-cmd --permanent --zone=trusted --add-source=169.254.169.1
++sudo firewall-cmd --permanent --zone=trusted --add-source=169.254.0.0/17
+ sudo firewall-cmd --reload
+ ```
+ 
+diff --git a/docs/user/howto_firewall.md b/docs/user/howto_firewall.md
+index f5a1df825c1f89d826f78dfab0d435836bc63c4e..da01d856c3525220284eb9efcc441afdd96fd0d6 100644
+--- a/docs/user/howto_firewall.md
++++ b/docs/user/howto_firewall.md
+@@ -9,7 +9,7 @@ It is mandatory to allow MicroShift pods the access to the internal CoreDNS and
+ |10.42.0.0/16  |Yes                   |Pod network access to other pods |
+ |10.43.0.0/16  |No                    |ClusterIP service network, used by pods to access services (like CoreDNS and MicroShift API) |
+ |10.44.0.0/32  |No                    |Next available subnet from ClusterIP service network, used by pods to access apiserver |
+-|169.254.169.1 |Yes                   |Special IP to access services backed by host endpoints, like MicroShift API Server |
++|169.254.0.0/17 |Yes                   |Special IP to access services backed by host endpoints, like MicroShift API Server |
+ 
+ The following ports are optional and they should be considered for MicroShift if a firewall is enabled.
+ 
+@@ -34,7 +34,7 @@ sudo dnf install -y firewalld
+ sudo systemctl enable firewalld --now
+ # Mandatory settings
+ sudo firewall-cmd --permanent --zone=trusted --add-source=10.42.0.0/16
+-sudo firewall-cmd --permanent --zone=trusted --add-source=169.254.169.1
++sudo firewall-cmd --permanent --zone=trusted --add-source=169.254.0.0/17
+ sudo firewall-cmd --permanent --zone=trusted --add-source=fd01::/48
+ sudo firewall-cmd --reload
+ # Optional settings
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index 4b1075761d59768553584c4ebe3c28e0f7667978..e003d8f924f901e3112a25b2f99db35a0a39ea85 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -42,7 +42,7 @@ var (
+ 		"169.254.0.0/16",
+ 		"::1/128",
+ 		"fe80::/10",
+-		"fd69::/125",
++		"fd69::/112",
+ 	}
+ )
+ 
+diff --git a/pkg/config/ovn/ovn.go b/pkg/config/ovn/ovn.go
+index c6bd17aab1c3d98d16bcaee9a29157f0c3b6edef..536dabd700b38170a2be8ba73f08f269d94f2ab3 100644
+--- a/pkg/config/ovn/ovn.go
++++ b/pkg/config/ovn/ovn.go
+@@ -18,7 +18,7 @@ const (
+ 	ovnConfigFileName           = "ovn.yaml"
+ 	OVNGatewayInterface         = "br-ex"
+ 	defaultMTU                  = 1500
+-	OVNKubernetesV4MasqueradeIP = "169.254.169.2"
++	OVNKubernetesV4MasqueradeIP = "169.254.0.2"
+ 	OVNKubernetesV6MasqueradeIP = "fd69::2"
+ 
+ 	// used for multinode ovn database transport
+diff --git a/pkg/util/cert.go b/pkg/util/cert.go
+index a64bfe5c4ed56c58a08ce4d8520002bbceb0a6a7..a3c7ccf9fbeb53ad2203d8f0b93cbfbbff510adf 100644
+--- a/pkg/util/cert.go
++++ b/pkg/util/cert.go
+@@ -181,7 +181,7 @@ func VerifyAllowedSNI(advertiseAddress string, clusterNetwork []string, serviceN
+ 	} else {
+ 		if ContainIPANetwork(ipAddress, clusterNetwork) ||
+ 			ContainIPANetwork(ipAddress, serviceNetwork) ||
+-			ContainIPANetwork(ipAddress, []string{"127.0.0.1/8", "169.254.169.2/29", "::1/128", "fe80::/10", "fd69::/125"}) ||
++			ContainIPANetwork(ipAddress, []string{"127.0.0.1/8", "169.254.0.0/17", "::1/128", "fe80::/10", "fd69::/112"}) ||
+ 			advertiseAddress == ipAddress.String() {
+ 			return false
+ 		}

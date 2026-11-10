@@ -15,7 +15,9 @@ fi
 # Configure network and add some useful utilities
 dnf install -y firewalld jq bash-completion
 firewall-offline-cmd --zone=trusted --add-source=10.42.0.0/16
-firewall-offline-cmd --zone=trusted --add-source=169.254.169.1
+# OVN-K's masquerade subnet (patches/0016): pod traffic to host endpoints
+# arrives from it, from one address per user-defined network.
+firewall-offline-cmd --zone=trusted --add-source=169.254.0.0/17
 # Role-scoped services from src/firewall; microshift-profile drops the
 # controlplane service on workers. etcd stays closed: workers never dial it,
 # and full-replica secondaries are not a shape this image supports.
