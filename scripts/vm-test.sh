@@ -900,6 +900,50 @@ done
 expect yes default l2test-probe "${node_ip}" 10250 "kubelet from a namespace outside the ANP subject"
 koc delete adminnetworkpolicy anp-api-only >/dev/null
 
+# The same tier with no IP in it: the API is 6443 on control-plane nodes, so a
+# re-addressed node or a new controller needs no edit. Workers carry only
+# node-role.kubernetes.io/worker.
+log "assert: an ANP allowing 6443 on control-plane nodes and denying all nodes leaves tenants the API alone"
+koc apply -f - <<EOF
+apiVersion: policy.networking.k8s.io/v1alpha1
+kind: AdminNetworkPolicy
+metadata:
+  name: anp-api-by-role
+spec:
+  priority: 20
+  subject:
+    namespaces:
+      matchLabels:
+        kubernetes.io/metadata.name: efw-probe
+  egress:
+  - name: allow-api
+    action: Allow
+    to:
+    - nodes:
+        matchExpressions:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+    ports:
+    - portNumber:
+        protocol: TCP
+        port: 6443
+  - name: deny-nodes
+    action: Deny
+    to:
+    - nodes:
+        matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: Exists
+EOF
+expect yes efw-probe client kubernetes.default.svc.cluster.local 443 "the API Service under the API-by-role ANP"
+expect yes efw-probe client "${node_ip}" 6443 "the API endpoint under the API-by-role ANP"
+for target in "${node_ip} 18080" "${node_ip} 10250" "${node_ip} 22"; do
+    # shellcheck disable=SC2086 # "IP PORT" splits into expect's two arguments
+    expect no efw-probe client ${target} "${target} under the API-by-role ANP"
+done
+expect yes default l2test-probe "${node_ip}" 10250 "kubelet from a namespace outside the ANP subject"
+koc delete adminnetworkpolicy anp-api-by-role >/dev/null
+
 # A BaselineAdminNetworkPolicy Deny holds until a NetworkPolicy allows the
 # traffic: the baseline is the default, a namespace's own policy overrides it.
 log "assert: a NetworkPolicy overrides a BaselineAdminNetworkPolicy Deny"
@@ -1010,6 +1054,43 @@ wait_for 120 "Multus to refuse mns-2/crossns its mns-1 NAD" isolation_refused ||
 }
 # Refused for good: it would hold every later settle check.
 koc -n mns-2 delete pod crossns --wait=false >/dev/null
+
+# host-device, from OpenShift's CNI plugins image and linked into /run/cni/bin
+# at boot, moves a host link into a pod: a dummy here, an SR-IOV VF on a site.
+# Multus refills /run/cni/bin with its own plugins when it restarts, so the
+# link must outlive a Multus restart.
+log "assert: host-device moves a host link into a pod, after a Multus restart"
+vssh ip link add hd-probe type dummy
+multus_pod() {
+    koc -n openshift-multus get pods -l app=multus \
+        -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{end}'
+}
+old_multus="$(multus_pod)"
+koc -n openshift-multus delete pod -l app=multus >/dev/null
+multus_replaced() { local p; p="$(multus_pod)"; [ -n "${p}" ] && [ "${p}" != "${old_multus}" ]; }
+wait_for 180 "a new Multus pod past its init container" multus_replaced
+vssh test -x /run/cni/bin/host-device || {
+    vssh ls -l /run/cni/bin >&2 || true
+    echo "ERROR: /run/cni/bin/host-device is gone after a Multus restart" >&2; exit 1; }
+koc apply -f - <<EOF
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: hostdev
+  namespace: mns-1
+spec:
+  config: '{"cniVersion": "0.3.1", "name": "hostdev", "type": "host-device", "device": "hd-probe"}'
+EOF
+attach_pod mns-1 hostdev hostdev
+wait_pod_running hostdev mns-1
+koc -n mns-1 exec hostdev -- ip -o link show net1 >/dev/null || {
+    echo "ERROR: the hostdev pod has no net1" >&2; exit 1; }
+if vssh ip link show hd-probe >/dev/null 2>&1; then
+    echo "ERROR: hd-probe is still on the host" >&2; exit 1
+fi
+koc -n mns-1 delete pod hostdev >/dev/null
+wait_for 60 "hd-probe back on the host" vssh ip link show hd-probe
+vssh ip link del hd-probe
 
 log "assert: the embedded portail image starts from cri-o's store (pull policy Never)"
 portail_ref="$(vssh awk '{print $2}' /usr/lib/embedded-images/manifest | grep '/portail:' | head -1)"
@@ -1126,6 +1207,22 @@ wait_for 180 "RBAC answers as OpenShift's" rbac_parity || {
     vssh journalctl -u microshift --no-pager | grep -i kustomiz | tail -20 >&2 || true
     exit 1
 }
+
+# CVE-2020-8554: a Service's spec.externalIPs would let a project claim any
+# address. OpenShift's ExternalIPRanger, with no allowed CIDR, refuses them to
+# anyone who cannot create services/externalips; a project admin cannot.
+log "assert: a project admin can create a Service, but not one with externalIPs"
+eip_service() { # eip_service EXTERNAL_IPS_JSON: a server-side dry run as rbac-admin
+    koc -n default create --dry-run=server --as=rbac-admin -o name -f - <<EOF
+{"apiVersion": "v1", "kind": "Service", "metadata": {"name": "eip-probe"},
+ "spec": {"ports": [{"port": 80}], "externalIPs": $1}}
+EOF
+}
+eip_service '[]' >/dev/null
+if out="$(eip_service '["192.0.2.10"]' 2>&1)"; then
+    echo "ERROR: rbac-admin set spec.externalIPs: ${out}" >&2; exit 1
+fi
+grep -qi 'externalIP' <<<"${out}" || { echo "ERROR: unexpected refusal: ${out}" >&2; exit 1; }
 
 # apiServer.authenticationConfig (patches/0014), as a site layer sets it: a
 # file and a config.d drop-in. Keys and tokens are made on this host; the

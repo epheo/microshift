@@ -30,6 +30,9 @@ at the commit the pinned OKD payload names, verbatim (`src/ovs/vendor.sh`):
 `configure-ovs.sh`, `nm-ignore-sdn.conf` and the two OVS restart drop-ins.
 `microshift-ovs-init.conf` and `vendor.sh` are this distribution's.
 
+`src/cni/plugins-image` pins the pinned OKD payload's container-networking-plugins
+image (`src/cni/vendor.sh`); the build copies host-device from it.
+
 `src/embedded-images/` is NOT vendored — it is this distribution's own
 boot-time image import mechanism (originally developed in the konstruct lab
 repo).

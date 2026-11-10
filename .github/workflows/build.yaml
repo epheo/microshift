@@ -151,8 +151,9 @@ jobs:
         run: |
           ./src/rbac/vendor.sh
           ./src/ovs/vendor.sh
-          git diff --exit-code -- src/rbac src/ovs \
-            || { echo "::error::src/rbac or src/ovs is stale: run their vendor.sh and commit"; exit 1; }
+          ./src/cni/vendor.sh
+          git diff --exit-code -- src/rbac src/ovs src/cni \
+            || { echo "::error::src/rbac, src/ovs or src/cni is stale: run their vendor.sh and commit"; exit 1; }
 
       - name: Build the image
         uses: ./.github/actions/build-image
