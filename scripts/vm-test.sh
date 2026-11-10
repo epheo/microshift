@@ -1092,6 +1092,66 @@ koc -n mns-1 delete pod hostdev >/dev/null
 wait_for 60 "hd-probe back on the host" vssh ip link show hd-probe
 vssh ip link del hd-probe
 
+# Host-network clients reach a Service through a NetworkPolicy that admits
+# only OVN-K's host-network namespace label, as a host-network Gateway data
+# plane does. The shared gateway SNATs host traffic to the gateway router's
+# join IP, local gateway to the management port's: OVN-K's host-network
+# address set holds both. Without the label the host is refused.
+log "assert: a NetworkPolicy admits host-network traffic by the host-network namespace label alone"
+hn_label=policy-group.network.openshift.io/host-network
+koc create namespace hn-probe --dry-run=client -o yaml | koc apply -f - >/dev/null
+koc label namespace hn-probe pod-security.kubernetes.io/enforce=privileged --overwrite >/dev/null
+koc apply -f - <<EOF >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: server
+  namespace: hn-probe
+  labels:
+    app: hn-server
+spec:
+  containers:
+  - name: server
+    image: ${util_img}
+    command: ["python3", "-m", "http.server", "8080"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: server
+  namespace: hn-probe
+spec:
+  selector:
+    app: hn-server
+  ports:
+  - port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: host-network-only
+  namespace: hn-probe
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          ${hn_label}: ""
+EOF
+wait_pod_running server hn-probe
+hn_svc="$(koc -n hn-probe get service server -o jsonpath='{.spec.clusterIP}')"
+host_reaches() { vssh curl -s -o /dev/null -m 3 "http://${hn_svc}:8080/"; }
+host_refused() { ! host_reaches; }
+wait_for 60 "the host to reach the Service under the host-network policy" host_reaches
+koc label namespace openshift-host-network "${hn_label}-" >/dev/null
+wait_for 60 "the host refused once the label is gone" host_refused || {
+    koc label namespace openshift-host-network "${hn_label}=" --overwrite >/dev/null; exit 1; }
+koc label namespace openshift-host-network "${hn_label}=" --overwrite >/dev/null
+wait_for 60 "the host to reach the Service again with the label back" host_reaches
+koc delete namespace hn-probe --wait=false >/dev/null
+
 log "assert: the embedded portail image starts from cri-o's store (pull policy Never)"
 portail_ref="$(vssh awk '{print $2}' /usr/lib/embedded-images/manifest | grep '/portail:' | head -1)"
 koc apply -f - <<EOF
