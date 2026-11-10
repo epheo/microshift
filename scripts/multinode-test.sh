@@ -4,7 +4,8 @@
 # services in place, join the second VM with 'microshift-profile worker'
 # + 'microshift add-node --worker', and assert the result is a working
 # cluster: both nodes Ready, every pod Running, cross-node pod-to-pod
-# and pod-to-service traffic, cluster DNS from a worker pod, and
+# and pod-to-service traffic, cluster DNS from a worker pod, a primary
+# user-defined network spanning both nodes, and
 # greenboot health checks green on both roles. Then the controller takes an
 # update from a registry on the host and the worker must follow it.
 #
@@ -394,6 +395,64 @@ except urllib.error.HTTPError as e:
 ")"
 echo "${apiserver_code}" | grep -qE '200|401|403' \
     || die "apiserver VIP unreachable from a worker pod (got '${apiserver_code}')"
+
+# A primary network spans the nodes' interconnect zones (patches/0013 on
+# 0008's zones), and its pods still resolve through cluster DNS.
+log "assert: a primary ClusterUserDefinedNetwork spans both nodes"
+koc apply -f - <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mn-udn
+  labels:
+    k8s.ovn.org/primary-user-defined-network: ""
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: k8s.ovn.org/v1
+kind: ClusterUserDefinedNetwork
+metadata:
+  name: mn-udn
+spec:
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: mn-udn
+  network:
+    topology: Layer2
+    layer2:
+      role: Primary
+      subnets: ["10.200.9.0/24"]
+EOF
+udn_nad() { koc -n mn-udn get network-attachment-definitions mn-udn >/dev/null 2>&1; }
+retry 120 "CUDN mn-udn rendered into its namespace" udn_nad
+for n in 1 2; do
+    koc apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mn-udn-node${n}
+  namespace: mn-udn
+  labels: {app: mn-udn}
+spec:
+  nodeSelector: {kubernetes.io/hostname: node${n}}
+  containers:
+  - name: echo
+    image: ${util_img}
+    command: ["/bin/bash","-c","mkdir -p /tmp/www && cd /tmp/www && echo mn-udn-node${n} > index.html && exec python3 -m http.server 8080"]
+EOF
+done
+udn_up() { [ "$(koc -n mn-udn get pods -l app=mn-udn --no-headers 2>/dev/null | grep -c ' Running')" -eq 2 ]; }
+retry 300 "both primary-network pods Running" udn_up
+udn_ip_of() { koc -n mn-udn exec "$1" -- ip -o -4 addr show dev ovn-udn1 | awk '{print $4}' | cut -d/ -f1; }
+UDN_N1="$(udn_ip_of mn-udn-node1)"
+case "${UDN_N1}" in 10.200.9.*) ;; *) die "mn-udn-node1 has '${UDN_N1}' on ovn-udn1, want 10.200.9.x" ;; esac
+udn_fetch() { # udn_fetch <pod> <url>
+    koc -n mn-udn exec "$1" -- python3 -c "import urllib.request; print(urllib.request.urlopen('$2', timeout=5).read().decode().strip())" 2>/dev/null
+}
+udn_answers() { [ "$(udn_fetch mn-udn-node2 "http://${UDN_N1}:8080")" = "mn-udn-node1" ]; }
+retry 120 "worker pod reaches controller pod on the primary network" udn_answers
+koc -n mn-udn exec mn-udn-node2 -- python3 -c \
+    "import socket; print(socket.getaddrinfo('kubernetes.default.svc.cluster.local', 443)[0][4][0])" \
+    | grep -q '10\.43\.' || die "cluster DNS does not resolve from a worker pod on a primary network"
 
 # --- 7. greenboot gates both roles ---------------------------------------------
 # Run the packaged check scripts directly: that is exactly what greenboot

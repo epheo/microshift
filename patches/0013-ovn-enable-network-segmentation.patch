@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Thibaut Lapierre <root@epheo.eu>
+Date: Tue, 10 Nov 2026 11:35:45 +0100
+Subject: [PATCH 13/13] ovn: enable network segmentation
+
+UserDefinedNetwork and ClusterUserDefinedNetwork served, primary networks
+included, as on OpenShift: enable-network-segmentation and
+enable-preconfigured-udn-addresses in ovnkube.conf, --enable-persistent-ips
+on the cluster manager (OpenShift passes it there alone), the UDN, CUDN
+and IPAMClaim CRDs in MicroShift's CRD list so they exist before OVN-K
+starts, and the cluster manager's rights to render NADs and own the
+networks' status. A project gets its own primary network, isolated by
+construction; VMs keep their addresses through IPAMClaims. Needs 0001.
+
+udn-allowed-default-services names MicroShift's DNS Service: OVN-K's
+default, kube-system/kube-dns, does not exist here, and pods on a primary
+UDN would resolve nothing. dns-service-namespace and dns-service-name give
+the same Service to the DHCP OVN-K serves VMs on a primary layer2 network.
+
+The CRD files are not carried: the SRPM stage writes them from the
+payload's cluster-network-operator (src/image/payload-crds.sh). The
+namespace-label admission policy and the UDN user roles come from the same
+operator through src/rbac/vendor.sh.
+
+Upstream: no config knob as of 5.0.
+Covered by: vm-test (two primary CUDNs isolate their namespaces from each
+other and from the default network, each still reaches DNS and the API, an
+IPAMClaim keeps a pod's address across a recreate) and multinode-test (a
+primary CUDN spans nodes).
+---
+ .../ovn/common/clusterrole-controller.yaml    | 46 +++++++++++++++++++
+ assets/components/ovn/common/configmap.yaml   |  5 ++
+ .../ovn/single-node/master/daemonset.yaml     |  3 +-
+ .../ovn/zones/master/daemonset.yaml           |  3 +-
+ pkg/assets/crd.go                             |  3 ++
+ 5 files changed, 58 insertions(+), 2 deletions(-)
+
+diff --git a/assets/components/ovn/common/clusterrole-controller.yaml b/assets/components/ovn/common/clusterrole-controller.yaml
+index 8aaa4e18682cacd85e3abbbcca12f768906df4af..670012aaba049d37cb0ab1308443c2b9821cdcf6 100644
+--- a/assets/components/ovn/common/clusterrole-controller.yaml
++++ b/assets/components/ovn/common/clusterrole-controller.yaml
+@@ -177,3 +177,49 @@ rules:
+   - egressfirewalls/status
+   verbs:
+   - patch
++# enable-network-segmentation: the cluster manager renders each UDN and CUDN
++# into NADs in the namespaces it selects, deletes them with the network, and
++# owns the networks' status and finalizers. Same crash loop when forbidden.
++- apiGroups: ["k8s.ovn.org"]
++  resources:
++  - userdefinednetworks
++  - clusteruserdefinednetworks
++  verbs:
++  - get
++  - list
++  - watch
++  - patch
++  - update
++- apiGroups: ["k8s.ovn.org"]
++  resources:
++  - userdefinednetworks/status
++  - clusteruserdefinednetworks/status
++  verbs:
++  - patch
++  - update
++- apiGroups: ["k8s.ovn.org"]
++  resources:
++  - userdefinednetworks/finalizers
++  - clusteruserdefinednetworks/finalizers
++  verbs:
++  - update
++- apiGroups: ["k8s.cni.cncf.io"]
++  resources:
++  - network-attachment-definitions
++  verbs:
++  - delete
++# --enable-persistent-ips: the cluster manager records each claimed address
++# in the IPAMClaim's status, so a VM keeps it across restarts and migrations.
++- apiGroups: ["k8s.cni.cncf.io"]
++  resources:
++  - ipamclaims
++  verbs:
++  - get
++  - list
++  - watch
++- apiGroups: ["k8s.cni.cncf.io"]
++  resources:
++  - ipamclaims/status
++  verbs:
++  - patch
++  - update
+diff --git a/assets/components/ovn/common/configmap.yaml b/assets/components/ovn/common/configmap.yaml
+index 0c7a9334f3ab2cca71f359b0d0b524d3301963ed..299fef47628b3930d9c27f2489d2476222113e9d 100644
+--- a/assets/components/ovn/common/configmap.yaml
++++ b/assets/components/ovn/common/configmap.yaml
+@@ -13,6 +13,7 @@ data:
+     encap-port="6081"
+     enable-lflow-cache=false
+     lflow-cache-limit-kb=870
++    udn-allowed-default-services="default/kubernetes,openshift-dns/dns-default"
+ 
+     [kubernetes]
+     service-cidrs={{.ServiceCIDR}}
+@@ -23,6 +24,8 @@ data:
+     kubeconfig={{.KubeconfigPath}}
+ {{- end }}
+     host-network-namespace="openshift-host-network"
++    dns-service-namespace="openshift-dns"
++    dns-service-name="dns-default"
+     platform-type="BareMetal"
+ 
+     [ovnkubernetesfeature]
+@@ -32,6 +35,8 @@ data:
+     enable-multi-network=true
+     enable-multi-networkpolicy=true
+     enable-admin-network-policy=true
++    enable-network-segmentation=true
++    enable-preconfigured-udn-addresses=true
+ 
+     [gateway]
+     mode=local
+diff --git a/assets/components/ovn/single-node/master/daemonset.yaml b/assets/components/ovn/single-node/master/daemonset.yaml
+index fabae2eddea010711ba7103b60e672d0134b6b09..68d38796a68f990c213d87763f47d6ecfdef0b27 100644
+--- a/assets/components/ovn/single-node/master/daemonset.yaml
++++ b/assets/components/ovn/single-node/master/daemonset.yaml
+@@ -318,7 +318,8 @@ spec:
+             --init-cluster-manager "${K8S_NODE}" \
+             --config-file=/run/ovnkube-config/ovnkube.conf \
+             --loglevel "${OVN_KUBE_LOG_LEVEL}" \
+-            --enable-multicast
++            --enable-multicast \
++            --enable-persistent-ips
+         env:
+         - name: OVN_KUBE_LOG_LEVEL
+           value: "4"
+diff --git a/assets/components/ovn/zones/master/daemonset.yaml b/assets/components/ovn/zones/master/daemonset.yaml
+index 18ae72b05b148bf16b8ea79208690574e9433f95..2e890361afa0803f648111928e66addf0358d1f5 100644
+--- a/assets/components/ovn/zones/master/daemonset.yaml
++++ b/assets/components/ovn/zones/master/daemonset.yaml
+@@ -59,7 +59,8 @@ spec:
+             --init-cluster-manager "${K8S_NODE}" \
+             --config-file=/run/ovnkube-config/ovnkube.conf \
+             --loglevel "${OVN_KUBE_LOG_LEVEL}" \
+-            --enable-multicast
++            --enable-multicast \
++            --enable-persistent-ips
+         env:
+         - name: OVN_KUBE_LOG_LEVEL
+           value: "4"
+diff --git a/pkg/assets/crd.go b/pkg/assets/crd.go
+index 29b5c1f377617d0b9813cf7c90b1f678f2c5314e..667aeec111e634108c9e1df9e2a697d2c3afc68d 100644
+--- a/pkg/assets/crd.go
++++ b/pkg/assets/crd.go
+@@ -43,6 +43,9 @@ var (
+ 		"crd/admin-network-policy.crd.yaml",
+ 		"crd/baseline-admin-network-policy.crd.yaml",
+ 		"crd/egressfirewall.crd.yaml",
++		"crd/ipamclaims.crd.yaml",
++		"crd/userdefinednetwork.crd.yaml",
++		"crd/clusteruserdefinednetwork.crd.yaml",
+ 		"components/lvms/topolvm.io_logicalvolumes.yaml",
+ 		"components/lvms/lvm.topolvm.io_lvmclusters.yaml",
+ 		"components/lvms/lvm.topolvm.io_lvmvolumegroupnodestatuses.yaml",

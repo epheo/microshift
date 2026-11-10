@@ -56,7 +56,7 @@ COPY --chmod=755 ./src/image/prebuild.sh /tmp/prebuild.sh
 RUN ARCH="x86_64" /tmp/prebuild.sh --replace        "${OKD_RELEASE_IMAGE}" "${OKD_VERSION_TAG}" && \
     ARCH="x86_64" /tmp/prebuild.sh --replace-multus "${OKD_RELEASE_IMAGE}" "${OKD_VERSION_TAG}"
 
-# The policy CRDs patches/0010 and 0011 register, from the same payload's
+# The OVN-Kubernetes CRDs patches/0010 to 0013 register, from the same payload's
 # cluster-network-operator, so they match the OVN-Kubernetes beside them.
 COPY --chmod=755 ./src/image/payload-crds.sh /tmp/payload-crds.sh
 RUN /tmp/payload-crds.sh "${OKD_RELEASE_IMAGE}" "${OKD_VERSION_TAG}" "${HOME}/microshift"

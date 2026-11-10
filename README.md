@@ -13,6 +13,8 @@ Published at `ghcr.io/epheo/microshift`.
 | OVN secondary networks work out of the box | `patches/0001` adds `enable-multi-network=true` to the ovnkube-config template at the source |
 | Secondary networks take policies | `patches/0010` adds `enable-multi-networkpolicy=true` and the MultiNetworkPolicy CRD (taken at build time from the payload's cluster-network-operator) to MicroShift's own CRD list, applied before OVN starts: OVN-Kubernetes waits for it at start |
 | Cluster-wide policies | `patches/0011` adds `enable-admin-network-policy=true`, the AdminNetworkPolicy and BaselineAdminNetworkPolicy CRDs (taken at build time from the payload's cluster-network-operator) to MicroShift's CRD list, and the OVN controller's rights to read them and write their status: a namespace's NetworkPolicy cannot override an admin Deny |
+| Per-namespace egress rules | `patches/0012` turns on `enable-egress-firewall` and adds the EgressFirewall CRD (from the payload's cluster-network-operator) to MicroShift's CRD list. Wildcard DNS names in rules need OpenShift's DNSNameResolver, which MicroShift's CoreDNS lacks; CIDRs and plain names work |
+| Primary networks per project | `patches/0013` turns on `enable-network-segmentation`, `enable-preconfigured-udn-addresses` and the cluster manager's `--enable-persistent-ips`, adds the UserDefinedNetwork, ClusterUserDefinedNetwork and IPAMClaim CRDs, and lets primary networks reach MicroShift's DNS Service. `src/rbac` vendors OpenShift's UDN rights for edit and view, and the policy that freezes `k8s.ovn.org/primary-user-defined-network` after a namespace exists |
 | Multus enabled | `microshift-multus` (config.d toggle + cri-o default-network drop-in) |
 | r-drbd is the storage driver | [r-drbd](https://github.com/epheo/r-drbd) (DRBD 9 on thin LVM) with its DRBD module built for the image kernel; local volumes on one node, replicated ones on three. See [Storage](#storage) |
 | Air-gapped by default | the full MicroShift payload is embedded as a shared-blob OCI layout and imported into cri-o at boot — first boot needs no registry |
@@ -111,6 +113,11 @@ egress). Its opinion assertions are functional, not existence checks:
   NetworkAttachmentDefinition, a MultiNetworkPolicy cuts a pod off it, and
   removing the policy restores it;
 - an AdminNetworkPolicy Deny does the same on the cluster network;
+- two primary ClusterUserDefinedNetworks isolate their namespaces from each
+  other and from the default network, each still reaches DNS and the API,
+  and an IPAMClaim keeps a pod's address across a recreate;
+- an EgressFirewall Deny cuts one namespace off a node address, and
+  removing it restores the path;
 - the router is not deployed;
 - the embedded portail image starts from cri-o's store with pull policy
   Never, and a re-pointed embedded tag is re-imported;

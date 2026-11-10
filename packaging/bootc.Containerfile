@@ -250,9 +250,10 @@ RUN crds=/usr/lib/microshift/manifests.d/000-gateway-api/experimental-install.ya
     echo "${GATEWAY_API_SHA256}  ${crds}" | sha256sum -c -
 
 # OpenShift's grants that MicroShift's apiserver bootstrap lacks (storage and
-# snapshot classes for every signed-in user, Gateway API and NAD reads in the
-# stock project roles), vendored from the pinned payload's sources by
-# src/rbac/vendor.sh, plus this distribution's experimental route kinds.
+# snapshot classes for every signed-in user, Gateway API, NAD and UDN rights
+# in the stock project roles), its host-network namespace and UDN label
+# policy, vendored from the pinned payload's sources by src/rbac/vendor.sh,
+# plus this distribution's experimental route kinds.
 COPY ./src/rbac/kustomization.yaml ./src/rbac/openshift-parity.yaml ./src/rbac/experimental-routes.yaml \
     /usr/lib/microshift/manifests.d/010-openshift-rbac/
 

@@ -7,8 +7,10 @@
 # The opinion assertions are functional, not existence checks: a PVC is
 # provisioned and written, an OVN-K layer2 secondary network is attached,
 # a MultiNetworkPolicy cuts a pod off that network and its removal restores
-# it, an AdminNetworkPolicy does the same on the cluster network, the
-# embedded portail image is started with pull policy Never, the API
+# it, an AdminNetworkPolicy does the same on the cluster network, primary
+# ClusterUserDefinedNetworks isolate their namespaces and an IPAMClaim keeps
+# a pod's address, an EgressFirewall cuts one namespace off a node address,
+# the embedded portail image is started with pull policy Never, the API
 # accepts TCPRoute and UDPRoute objects, and RBAC answers as OpenShift's
 # does for signed-in users and the stock project roles (src/rbac).
 # The fresh-install VM runs with zero egress (restrict=on): going GREEN
@@ -165,15 +167,16 @@ greenboot_green() {
         | grep -qiE 'Status is GREEN|health-check passed'
 }
 
+# wait_pod_running POD [NAMESPACE]
 wait_pod_running() {
-    local pod=$1 phase=""
+    local pod=$1 ns=${2:-default} phase=""
     for _ in $(seq 60); do
-        phase="$(koc get pod "${pod}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+        phase="$(koc -n "${ns}" get pod "${pod}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
         [ "${phase}" = "Running" ] && return 0
         sleep 5
     done
-    echo "ERROR: pod ${pod} never became Running (phase=${phase})" >&2
-    koc describe pod "${pod}" >&2 || true
+    echo "ERROR: pod ${ns}/${pod} never became Running (phase=${phase})" >&2
+    koc -n "${ns}" describe pod "${pod}" >&2 || true
     return 1
 }
 
@@ -485,7 +488,8 @@ ${ok} || { echo "ERROR: pods did not settle (total=${total} not-ready=${bad})" >
 # when one does not.
 log "assert: ovnkube-config carries the patched-in flags natively"
 ovnkube_conf="$(koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkube\.conf}')"
-for flag in enable-multi-network enable-multi-networkpolicy enable-admin-network-policy; do
+for flag in enable-multi-network enable-multi-networkpolicy enable-admin-network-policy \
+    enable-egress-firewall enable-network-segmentation enable-preconfigured-udn-addresses; do
     echo "${ovnkube_conf}" | grep -qE "^[[:space:]]*${flag}=true[[:space:]]*$" || {
         echo "ERROR: ${flag}=true missing from ovnkube-config:" >&2
         echo "${ovnkube_conf}" >&2
@@ -685,6 +689,213 @@ l2_expect no "under an AdminNetworkPolicy Deny"
 koc delete adminnetworkpolicy anptest-deny >/dev/null
 l2_expect yes "after the AdminNetworkPolicy is deleted"
 
+# reach NS POD IP PORT: a TCP connect from that pod, 3s timeout.
+reach() {
+    koc -n "$1" exec "$2" -- python3 -c \
+        'import socket, sys; socket.create_connection((sys.argv[1], int(sys.argv[2])), 3)' "$3" "$4" \
+        >/dev/null 2>&1
+}
+# expect WANT NS POD IP PORT WHAT: retries cover OVN programming the path.
+expect() {
+    local want=$1 got
+    for _ in $(seq 20); do
+        if reach "$2" "$3" "$4" "$5"; then got=yes; else got=no; fi
+        [ "${got}" = "${want}" ] && return 0
+        sleep 3
+    done
+    echo "ERROR: $2/$3 to $4:$5 reachable=${got}, want ${want} ($6)" >&2
+    return 1
+}
+# probe_pods NS: an HTTP server and a client, on whatever network NS gives.
+probe_pods() {
+    koc apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: server
+  namespace: $1
+  labels:
+    app: server
+spec:
+  restartPolicy: Never
+  containers:
+  - name: server
+    image: ${util_img}
+    command: ["python3", "-m", "http.server", "8080"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client
+  namespace: $1
+spec:
+  restartPolicy: Never
+  containers:
+  - name: client
+    image: ${util_img}
+    command: ["sleep", "3600"]
+EOF
+    wait_pod_running server "$1"
+    wait_pod_running client "$1"
+}
+udn_ip() {
+    koc -n "$1" exec "$2" -- ip -o -4 addr show dev ovn-udn1 | awk '{print $4}' | cut -d/ -f1
+}
+
+# Isolation by construction: each namespace group on its own primary layer2
+# network, unreachable from the other and from the default network, while
+# DNS and the API (udn-allowed-default-services) still answer inside it.
+log "assert: primary ClusterUserDefinedNetworks isolate their namespaces"
+for n in 1 2; do
+    koc apply -f - <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: udn-${n}
+  labels:
+    k8s.ovn.org/primary-user-defined-network: ""
+    pod-security.kubernetes.io/enforce: privileged
+    udn-probe: "${n}"
+---
+apiVersion: k8s.ovn.org/v1
+kind: ClusterUserDefinedNetwork
+metadata:
+  name: udn-${n}
+spec:
+  namespaceSelector:
+    matchLabels:
+      udn-probe: "${n}"
+  network:
+    topology: Layer2
+    layer2:
+      role: Primary
+      subnets: ["10.200.${n}.0/24"]
+      ipam:
+        lifecycle: Persistent
+EOF
+done
+for n in 1 2; do
+    nad_rendered() { koc -n "udn-${n}" get network-attachment-definitions "udn-${n}" >/dev/null 2>&1; }
+    wait_for 120 "CUDN udn-${n} rendered into its namespace" nad_rendered || {
+        koc get clusteruserdefinednetwork "udn-${n}" -o yaml >&2 || true
+        exit 1
+    }
+    probe_pods "udn-${n}"
+done
+udn1_ip="$(udn_ip udn-1 server)"
+case "${udn1_ip}" in 10.200.1.*) ;; *)
+    echo "ERROR: udn-1/server has '${udn1_ip}' on ovn-udn1, want 10.200.1.x" >&2
+    koc -n udn-1 get pod server -o yaml >&2 || true
+    exit 1 ;;
+esac
+udn1_pod_ip="$(koc -n udn-1 get pod server -o jsonpath='{.status.podIP}')"
+expect yes udn-1 client "${udn1_ip}" 8080 "same primary network"
+expect no udn-2 client "${udn1_ip}" 8080 "another primary network"
+expect no udn-2 client "${udn1_pod_ip}" 8080 "another primary network, to the pod IP"
+expect no default l2test-probe "${udn1_ip}" 8080 "the default network"
+expect no default l2test-probe "${udn1_pod_ip}" 8080 "the default network, to the pod IP"
+expect yes udn-1 client kubernetes.default.svc.cluster.local 443 "DNS and the API from a primary network"
+
+# How an edge outside the network reaches a Service inside it. Logged, not
+# asserted, until it is decided which of these the distribution promises.
+koc -n udn-1 expose pod server --name=server --port=8080 --type=NodePort >/dev/null
+svc_ip="$(koc -n udn-1 get service server -o jsonpath='{.spec.clusterIP}')"
+node_port="$(koc -n udn-1 get service server -o jsonpath='{.spec.ports[0].nodePort}')"
+node_ip="$(koc get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')"
+expect yes udn-1 client "${svc_ip}" 8080 "its own Service"
+observe() { if "$@"; then echo yes; else echo no; fi; }
+node_get() { vssh curl -fsS -o /dev/null --max-time 3 "http://$1/"; }
+log "observe: UDN Service ClusterIP from the host network: $(observe node_get "${svc_ip}:8080")"
+log "observe: UDN Service ClusterIP from the default network: $(observe reach default l2test-probe "${svc_ip}" 8080)"
+log "observe: UDN Service NodePort from the host network: $(observe node_get "${node_ip}:${node_port}")"
+log "observe: UDN Service NodePort from the default network: $(observe reach default l2test-probe "${node_ip}" "${node_port}")"
+
+# The cluster manager keeps an IPAMClaim's address for whichever pod names
+# it, which is how a VM keeps its IP across restarts and migrations. The
+# annotation is what KubeVirt's ipam controller sets on virt-launcher pods.
+log "assert: an IPAMClaim keeps a pod's address on a primary network"
+koc apply -f - <<EOF
+apiVersion: k8s.cni.cncf.io/v1alpha1
+kind: IPAMClaim
+metadata:
+  name: claimed
+  namespace: udn-1
+spec:
+  network: cluster_udn_udn-1
+  interface: ovn-udn1
+EOF
+# Prints the pod's address; errexit does not reach into $(...), so it returns.
+claimed_pod() {
+    koc apply -f - >/dev/null <<EOF || return 1
+apiVersion: v1
+kind: Pod
+metadata:
+  name: claimed
+  namespace: udn-1
+  annotations:
+    k8s.ovn.org/primary-udn-ipamclaim: claimed
+spec:
+  restartPolicy: Never
+  containers:
+  - name: claimed
+    image: ${util_img}
+    command: ["sleep", "3600"]
+EOF
+    wait_pod_running claimed udn-1 || return 1
+    udn_ip udn-1 claimed
+}
+first_ip="$(claimed_pod)"
+claim_ips="$(koc -n udn-1 get ipamclaim claimed -o jsonpath='{.status.ips[*]}')"
+[ "${claim_ips%/*}" = "${first_ip}" ] || {
+    echo "ERROR: IPAMClaim holds '${claim_ips}', the pod has '${first_ip}'" >&2
+    koc -n udn-1 get ipamclaim claimed -o yaml >&2 || true
+    exit 1
+}
+koc -n udn-1 delete pod claimed --wait=true >/dev/null
+second_ip="$(claimed_pod)"
+[ "${second_ip}" = "${first_ip}" ] || {
+    echo "ERROR: a recreated pod got ${second_ip}, its claim holds ${first_ip}" >&2
+    exit 1
+}
+
+# On the default network: a node address cut off for one namespace only,
+# and restored when the EgressFirewall goes.
+log "assert: an EgressFirewall Deny cuts one namespace off a node address"
+koc create namespace efw-probe --dry-run=client -o yaml | koc apply -f - >/dev/null
+koc label namespace efw-probe pod-security.kubernetes.io/enforce=privileged --overwrite >/dev/null
+probe_pods efw-probe
+koc apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: efw-target
+spec:
+  hostNetwork: true
+  restartPolicy: Never
+  containers:
+  - name: server
+    image: ${util_img}
+    command: ["python3", "-m", "http.server", "18080"]
+EOF
+wait_pod_running efw-target
+expect yes efw-probe client "${node_ip}" 18080 "before any EgressFirewall"
+koc apply -f - <<EOF
+apiVersion: k8s.ovn.org/v1
+kind: EgressFirewall
+metadata:
+  name: default
+  namespace: efw-probe
+spec:
+  egress:
+  - type: Deny
+    to:
+      cidrSelector: ${node_ip}/32
+EOF
+expect no efw-probe client "${node_ip}" 18080 "under an EgressFirewall Deny"
+expect yes default l2test-probe "${node_ip}" 18080 "from a namespace without one"
+koc -n efw-probe delete egressfirewall default >/dev/null
+expect yes efw-probe client "${node_ip}" 18080 "after the EgressFirewall is deleted"
+
 log "assert: the embedded portail image starts from cri-o's store (pull policy Never)"
 portail_ref="$(vssh awk '{print $2}' /usr/lib/embedded-images/manifest | grep '/portail:' | head -1)"
 koc apply -f - <<EOF
@@ -788,6 +999,12 @@ rbac_parity() {
         can list udproutes.gateway.networking.k8s.io -n default --as=rbac-viewer &&
         can list network-attachment-definitions.k8s.cni.cncf.io -n default --as=rbac-admin &&
         ! can list network-attachment-definitions.k8s.cni.cncf.io -n default --as=rbac-editor &&
+        can create userdefinednetworks.k8s.ovn.org -n default --as=rbac-editor &&
+        can list userdefinednetworks.k8s.ovn.org -n default --as=rbac-viewer &&
+        ! can create userdefinednetworks.k8s.ovn.org -n default --as=rbac-viewer &&
+        # OpenShift leaves EgressFirewall to cluster admins; dotvirt grants it
+        # to project admins with a role of its own, which relies on this.
+        ! can create egressfirewalls.k8s.ovn.org -n default --as=rbac-admin &&
         # OVN-K's host-network-namespace, whose label NetworkPolicies admit
         # host-network sources by (a host-network Gateway data plane).
         koc get namespace -l policy-group.network.openshift.io/host-network -o name | grep -qx namespace/openshift-host-network
@@ -795,6 +1012,19 @@ rbac_parity() {
 wait_for 180 "RBAC answers as OpenShift's" rbac_parity || {
     koc get clusterrole basic-user view edit admin -o name >&2 || true
     vssh journalctl -u microshift --no-pager | grep -i kustomiz | tail -20 >&2 || true
+    exit 1
+}
+
+# OVN-K reads the label at namespace creation only: adding or removing it
+# later would move running pods' network under them.
+log "assert: a namespace's primary-network label is frozen once it exists"
+label_frozen() {
+    local out
+    out="$(koc label namespace efw-probe k8s.ovn.org/primary-user-defined-network= --dry-run=server 2>&1 || true)"
+    grep -q 'cannot be added/removed' <<<"${out}"
+}
+wait_for 60 "the primary-network label to be refused on efw-probe" label_frozen || {
+    koc get validatingadmissionpolicy,validatingadmissionpolicybinding >&2 || true
     exit 1
 }
 
