@@ -41,6 +41,7 @@ since stopping ovsdb-server takes ovs-vswitchd and the uplink down.
  .../components/ovn/zones/node/daemonset.yaml  |  13 +-
  .../config/config-openapi-spec.json           |   2 +-
  packaging/microshift/config.yaml              |   9 +-
+ pkg/cmd/addnode_worker.go                     |  10 +-
  pkg/cmd/init.go                               |  35 +++-
  pkg/config/apiserver.go                       |  23 +--
  pkg/config/config.go                          |  59 ++-----
@@ -50,7 +51,7 @@ since stopping ovsdb-server takes ovs-vswitchd and the uplink down.
  pkg/node/netconfig.go                         | 156 +-----------------
  pkg/util/net.go                               |   7 +-
  scripts/microshift-cleanup-data.sh            |   4 +
- 16 files changed, 106 insertions(+), 248 deletions(-)
+ 17 files changed, 111 insertions(+), 253 deletions(-)
 
 diff --git a/assets/components/ovn/common/configmap.yaml b/assets/components/ovn/common/configmap.yaml
 index 0c7a9334f3ab2cca71f359b0d0b524d3301963ed..95ed0e71bc6f192c5a746aff4ce31b6b2882d2a5 100644
@@ -226,6 +227,34 @@ index 3fd232c32bbb48fe21c07e2322586d25decd1f21..9fda6acc7a5f51b5d220276149d1d6a9
      advertiseAddress: ""
      auditLog:
          # maxFileAge is the maximum number of days to retain old audit log files
+diff --git a/pkg/cmd/addnode_worker.go b/pkg/cmd/addnode_worker.go
+index 8ea05a0d6160a5c346504677792f025711a81212..448ded789d222172a3e294b0154a0af4b4e7ea32 100644
+--- a/pkg/cmd/addnode_worker.go
++++ b/pkg/cmd/addnode_worker.go
+@@ -90,9 +90,9 @@ func runAddWorker(ctx context.Context, opts *AddNodeOptions) error {
+ 	}()
+ 
+ 	// The role marker drives role-agnostic tools (healthcheck, greenboot) and
+-	// carries the control plane's routable IP: the worker routes the virtual
+-	// apiserver advertise address through it, and the bootstrap kubeconfig,
+-	// gone after the join, is the only other place that knows it.
++	// carries the control plane's routable IP: ovnkube reaches the apiserver
++	// at it, and the bootstrap kubeconfig, gone after the join, is the only
++	// other place that knows it.
+ 	cpIP, err := resolveControlplaneIP(opts.KubeconfigPath)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to resolve the control plane address: %w", err)
+@@ -147,8 +147,8 @@ func resolveControlplaneIP(kubeconfigPath string) (string, error) {
+ 	if len(addrs) == 0 {
+ 		return "", fmt.Errorf("cannot resolve control plane host %q", host)
+ 	}
+-	// Prefer v4: the advertise address the worker routes through it is v4
+-	// unless the cluster is single-stack v6.
++	// Prefer v4: the controller's advertise address, which ovnkube reaches
++	// it at, is v4 unless the cluster is single-stack v6.
+ 	for _, a := range addrs {
+ 		if ip := net.ParseIP(a); ip != nil && ip.To4() != nil {
+ 			return ip.String(), nil
 diff --git a/pkg/cmd/init.go b/pkg/cmd/init.go
 index 8c8e9ec6ff3affb2e6783a96c1282885b101be04..ccf59b580876185a889ce6eda00a0a638e256075 100644
 --- a/pkg/cmd/init.go
