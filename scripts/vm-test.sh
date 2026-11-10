@@ -8,7 +8,10 @@
 # provisioned and written, an OVN-K layer2 secondary network is attached,
 # a MultiNetworkPolicy cuts a pod off that network and its removal restores
 # it, an AdminNetworkPolicy does the same on the cluster network, an
-# EgressFirewall cuts one namespace off a node address, the
+# EgressFirewall cuts one namespace off a node address, AdminNetworkPolicy
+# networks and nodes peers do too, a NetworkPolicy overrides a
+# BaselineAdminNetworkPolicy Deny, Multus refuses a pod another namespace's
+# NAD, the
 # embedded portail image is started with pull policy Never, the API
 # accepts TCPRoute and UDPRoute objects, and RBAC answers as OpenShift's
 # does for signed-in users and the stock project roles (src/rbac).
@@ -756,6 +759,146 @@ expect no efw-probe client "${node_ip}" 18080 "under an EgressFirewall Deny"
 expect yes default l2test-probe "${node_ip}" 18080 "from a namespace without one"
 koc -n efw-probe delete egressfirewall default >/dev/null
 expect yes efw-probe client "${node_ip}" 18080 "after the EgressFirewall is deleted"
+
+# The same node address through AdminNetworkPolicy's own egress peers:
+# networks (a CIDR) and nodes (a node selector).
+log "assert: AdminNetworkPolicy networks and nodes peers cut a namespace off a node"
+for peer in "networks: [\"${node_ip}/32\"]" "nodes: {matchExpressions: [{key: kubernetes.io/hostname, operator: Exists}]}"; do
+    koc apply -f - <<EOF
+apiVersion: policy.networking.k8s.io/v1alpha1
+kind: AdminNetworkPolicy
+metadata:
+  name: anp-node-deny
+spec:
+  priority: 20
+  subject:
+    namespaces:
+      matchLabels:
+        kubernetes.io/metadata.name: efw-probe
+  egress:
+  - name: deny-node
+    action: Deny
+    to:
+    - ${peer}
+EOF
+    expect no efw-probe client "${node_ip}" 18080 "under an ANP Deny to ${peer%%:*}"
+    expect yes default l2test-probe "${node_ip}" 18080 "from a namespace outside the ANP subject"
+    # The kubernetes Service DNATs to a node address: logged until it is
+    # decided what a tenant egress Deny on nodes should do to API access.
+    if reach efw-probe client kubernetes.default.svc.cluster.local 443; then api=yes; else api=no; fi
+    log "observe: API Service from a namespace under an ANP Deny to ${peer%%:*}: ${api}"
+    koc delete adminnetworkpolicy anp-node-deny >/dev/null
+    expect yes efw-probe client "${node_ip}" 18080 "after the ANP is deleted"
+done
+
+# A BaselineAdminNetworkPolicy Deny holds until a NetworkPolicy allows the
+# traffic: the baseline is the default, a namespace's own policy overrides it.
+log "assert: a NetworkPolicy overrides a BaselineAdminNetworkPolicy Deny"
+koc apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: server
+  namespace: efw-probe
+  labels:
+    app: server
+spec:
+  restartPolicy: Never
+  containers:
+  - name: server
+    image: ${util_img}
+    command: ["python3", "-m", "http.server", "8080"]
+EOF
+wait_pod_running server efw-probe
+efw_server_ip="$(koc -n efw-probe get pod server -o jsonpath='{.status.podIP}')"
+expect yes default l2test-probe "${efw_server_ip}" 8080 "before any baseline"
+koc apply -f - <<EOF
+apiVersion: policy.networking.k8s.io/v1alpha1
+kind: BaselineAdminNetworkPolicy
+metadata:
+  name: default
+spec:
+  subject:
+    namespaces:
+      matchLabels:
+        kubernetes.io/metadata.name: efw-probe
+  ingress:
+  - name: deny-all
+    action: Deny
+    from:
+    - namespaces: {}
+EOF
+expect no default l2test-probe "${efw_server_ip}" 8080 "under a BaselineAdminNetworkPolicy Deny"
+koc apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-default
+  namespace: efw-probe
+spec:
+  podSelector: {}
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: default
+EOF
+expect yes default l2test-probe "${efw_server_ip}" 8080 "with a NetworkPolicy allowing it"
+koc delete baselineadminnetworkpolicy default >/dev/null
+koc -n efw-probe delete networkpolicy allow-default >/dev/null
+
+# Multus namespace isolation (patches/0013): a pod attaches to its own
+# namespace's NADs and to the global namespaces' (default here), never to
+# another namespace's. The refusal comes at CNI ADD, as a sandbox error.
+log "assert: Multus keeps NADs within their namespace"
+for ns in mns-1 mns-2; do
+    koc create namespace "${ns}" --dry-run=client -o yaml | koc apply -f - >/dev/null
+    koc label namespace "${ns}" pod-security.kubernetes.io/enforce=privileged --overwrite >/dev/null
+done
+koc apply -f - <<EOF
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: l2own
+  namespace: mns-1
+spec:
+  config: '{"cniVersion": "0.3.1", "name": "l2own", "type": "ovn-k8s-cni-overlay", "topology": "layer2", "subnets": "10.100.201.0/24", "netAttachDefName": "mns-1/l2own"}'
+EOF
+# attach_pod NS NAME NETWORKS
+attach_pod() {
+    koc apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $2
+  namespace: $1
+  annotations:
+    k8s.v1.cni.cncf.io/networks: $3
+spec:
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: ${util_img}
+    command: ["sleep", "3600"]
+EOF
+}
+attach_pod mns-1 own l2own
+attach_pod mns-2 global default/l2test
+attach_pod mns-2 crossns mns-1/l2own
+wait_pod_running own mns-1
+wait_pod_running global mns-2
+isolation_refused() {
+    koc -n mns-2 get events --field-selector involvedObject.name=crossns \
+        -o jsonpath='{.items[*].message}' | grep -q 'namespace isolation'
+}
+wait_for 120 "Multus to refuse mns-2/crossns its mns-1 NAD" isolation_refused || {
+    koc -n mns-2 describe pod crossns >&2 || true
+    exit 1
+}
+[ "$(koc -n mns-2 get pod crossns -o jsonpath='{.status.phase}')" != Running ] || {
+    echo "ERROR: mns-2/crossns runs on another namespace's NAD" >&2
+    exit 1
+}
 
 log "assert: the embedded portail image starts from cri-o's store (pull policy Never)"
 portail_ref="$(vssh awk '{print $2}' /usr/lib/embedded-images/manifest | grep '/portail:' | head -1)"

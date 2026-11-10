@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Thibaut Lapierre <root@epheo.eu>
+Date: Tue, 10 Nov 2026 11:45:47 +0100
+Subject: [PATCH 13/13] multus: namespace isolation
+
+Multus runs with namespace isolation, as OpenShift's network operator
+renders it: a pod attaches only to NetworkAttachmentDefinitions in its own
+namespace or in network.multus.globalNamespaces, which defaults to
+OpenShift's list (default, openshift-multus,
+openshift-sriov-network-operator, openshift-cnv). Upstream lets any pod
+attach to any namespace's NAD by name, br-ex localnet networks included.
+
+A non-empty globalNamespaces replaces the list. Multus reads an empty one
+as "default", so a site that shares no namespace names an admin-only one.
+Multus refuses a violating reference at CNI ADD: the pod is admitted, then
+fails to start.
+
+Upstream: no namespace isolation as of 5.0.
+Covered by: config unit tests; vm-test (a pod naming another namespace's
+NAD fails to start, its own namespace's and default's attach).
+---
+ assets/components/multus/06-daemonset.yaml    |  2 +
+ .../config/config-openapi-spec.json           | 13 +++++++
+ docs/user/howto_config.md                     |  6 +++
+ packaging/microshift/config.yaml              | 11 ++++++
+ pkg/components/networking.go                  |  1 +
+ pkg/config/config.go                          |  6 ++-
+ pkg/config/config_test.go                     | 39 +++++++++++++++++++
+ pkg/config/network.go                         | 19 +++++++++
+ 8 files changed, 96 insertions(+), 1 deletion(-)
+
+diff --git a/assets/components/multus/06-daemonset.yaml b/assets/components/multus/06-daemonset.yaml
+index 5a92341c9f4c16aa423b0f143de16c689582248a..b5fcfbe53573a3eca52a8739efeee80f512d68bd 100644
+--- a/assets/components/multus/06-daemonset.yaml
++++ b/assets/components/multus/06-daemonset.yaml
+@@ -75,6 +75,8 @@ spec:
+             --readiness-indicator-file=/etc/cni/net.d/10-ovn-kubernetes.conf
+             --cleanup-config-on-exit=true
+             --skip-multus-binary-copy=true
++            --namespace-isolation=true
++            --global-namespaces={{ .MultusGlobalNamespaces }}
+         resources:
+           requests:
+             cpu: 10m
+diff --git a/cmd/generate-config/config/config-openapi-spec.json b/cmd/generate-config/config/config-openapi-spec.json
+index d7e87fbc339374e75155edfb08ff56a65e490a86..da71d82b71017e2e2e95a4e2fbe26048f38c4bce 100755
+--- a/cmd/generate-config/config/config-openapi-spec.json
++++ b/cmd/generate-config/config/config-openapi-spec.json
+@@ -1079,6 +1079,19 @@
+         "multus": {
+           "type": "object",
+           "properties": {
++            "globalNamespaces": {
++              "description": "GlobalNamespaces lists the namespaces whose NetworkAttachmentDefinitions\na pod in any namespace may attach to. Any other reference must stay\nwithin the pod's own namespace, as on OpenShift. A non-empty list\nreplaces the default. Multus reads an empty list as \"default\", so to\nshare no namespace, name one no tenant can write to, such as\nopenshift-multus.",
++              "type": "array",
++              "default": [
++                "default",
++                "openshift-multus",
++                "openshift-sriov-network-operator",
++                "openshift-cnv"
++              ],
++              "items": {
++                "type": "string"
++              }
++            },
+             "status": {
+               "description": "Status controls the deployment of the Multus CNI.\nChanging from \"Enabled\" to \"Disabled\" will not cause Multus CNI to be deleted.\nAllowed values are: unset (disabled), \"Enabled\", or \"Disabled\"",
+               "type": "string",
+diff --git a/docs/user/howto_config.md b/docs/user/howto_config.md
+index b373b0f2b04dfee16cf13d3c1624edc66baf88e6..8f24fc9f68f1e5ad82e50545f1eedd097728832d 100644
+--- a/docs/user/howto_config.md
++++ b/docs/user/howto_config.md
+@@ -150,6 +150,7 @@ network:
+     clusterNetwork: []
+     cniPlugin: ""
+     multus:
++        globalNamespaces: []
+         status: ""
+     serviceNetwork: []
+     serviceNodePortRange: ""
+@@ -326,6 +327,11 @@ network:
+         - 10.42.0.0/16
+     cniPlugin: ""
+     multus:
++        globalNamespaces:
++            - default
++            - openshift-multus
++            - openshift-sriov-network-operator
++            - openshift-cnv
+         status: Disabled
+     serviceNetwork:
+         - 10.43.0.0/16
+diff --git a/packaging/microshift/config.yaml b/packaging/microshift/config.yaml
+index f0ce27443ec3de0f436dcdb8d7257455d5f7ddee..f031bdeb58e1ba4eb94b8cbb805da15070f34979 100644
+--- a/packaging/microshift/config.yaml
++++ b/packaging/microshift/config.yaml
+@@ -695,6 +695,17 @@ network:
+     # Allowed values are: unset or one of ["", "ovnk", "none"]
+     cniPlugin: ""
+     multus:
++        # GlobalNamespaces lists the namespaces whose NetworkAttachmentDefinitions
++        # a pod in any namespace may attach to. Any other reference must stay
++        # within the pod's own namespace, as on OpenShift. A non-empty list
++        # replaces the default. Multus reads an empty list as "default", so to
++        # share no namespace, name one no tenant can write to, such as
++        # openshift-multus.
++        globalNamespaces:
++            - default
++            - openshift-multus
++            - openshift-sriov-network-operator
++            - openshift-cnv
+         # Status controls the deployment of the Multus CNI.
+         # Changing from "Enabled" to "Disabled" will not cause Multus CNI to be deleted.
+         # Allowed values are: unset (disabled), "Enabled", or "Disabled"
+diff --git a/pkg/components/networking.go b/pkg/components/networking.go
+index a329f8ca41189065b3edb6ab3e534c6e5fe0760f..8e4decf133926cd57807899b5c228673880da0f1 100644
+--- a/pkg/components/networking.go
++++ b/pkg/components/networking.go
+@@ -215,6 +215,7 @@ func deployMultus(ctx context.Context, cfg *config.Config, kubeconfigPath string
+ 	if err != nil {
+ 		return fmt.Errorf("error creating Multus render params: %v", err)
+ 	}
++	params["MultusGlobalNamespaces"] = strings.Join(cfg.Network.Multus.GlobalNamespaces, ",")
+ 
+ 	if err := assets.ApplyDaemonSets(ctx, ds, renderTemplate, params, kubeconfigPath); err != nil {
+ 		klog.Warningf("Failed to apply daemonset %v %v", ds, err)
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index b484b5ffc9d7ad28c67c3ea6f57303ea1ec68ae8..bacb24b4a3026cfddd04067247c1ab7876d21a6b 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -140,7 +140,8 @@ func (c *Config) fillDefaults() error {
+ 	c.Network = Network{
+ 		ServiceNodePortRange: "30000-32767",
+ 		Multus: Multus{
+-			Status: MultusDisabled,
++			Status:           MultusDisabled,
++			GlobalNamespaces: defaultMultusGlobalNamespaces,
+ 		},
+ 	}
+ 	c.Etcd = EtcdConfig{
+@@ -252,6 +253,9 @@ func (c *Config) incorporateUserSettings(u *Config) {
+ 	if u.Network.Multus.Status != "" {
+ 		c.Network.Multus.Status = u.Network.Multus.Status
+ 	}
++	if len(u.Network.Multus.GlobalNamespaces) > 0 {
++		c.Network.Multus.GlobalNamespaces = u.Network.Multus.GlobalNamespaces
++	}
+ 
+ 	if u.Etcd.MemoryLimitMB != 0 {
+ 		c.Etcd.MemoryLimitMB = u.Etcd.MemoryLimitMB
+diff --git a/pkg/config/config_test.go b/pkg/config/config_test.go
+index 33fb6503be4bd02ddbbfbb3e149e240ca37caffc..4be881bffcb01de656b947c3ffc39d5a9e30e2e5 100644
+--- a/pkg/config/config_test.go
++++ b/pkg/config/config_test.go
+@@ -289,6 +289,36 @@ func TestGetActiveConfigFromYAML(t *testing.T) {
+ 				return c
+ 			}(),
+ 		},
++		{
++			name: "multus-global-namespaces-default",
++			config: dedent(`
++            network:
++              multus:
++                status: Enabled
++            `),
++			expected: func() *Config {
++				c := mkDefaultConfig()
++				c.Network.Multus.Status = MultusEnabled
++				c.Network.Multus.GlobalNamespaces = []string{"default", "openshift-multus", "openshift-sriov-network-operator", "openshift-cnv"}
++				assert.NoError(t, c.updateComputedValues())
++				return c
++			}(),
++		},
++		{
++			name: "multus-global-namespaces-replaced",
++			config: dedent(`
++            network:
++              multus:
++                globalNamespaces:
++                - openshift-multus
++            `),
++			expected: func() *Config {
++				c := mkDefaultConfig()
++				c.Network.Multus.GlobalNamespaces = []string{"openshift-multus"}
++				assert.NoError(t, c.updateComputedValues())
++				return c
++			}(),
++		},
+ 		{
+ 			name: "kube-controller-manager",
+ 			config: dedent(`
+@@ -633,6 +663,15 @@ func TestValidate(t *testing.T) {
+ 			}(),
+ 			expectErr: true,
+ 		},
++		{
++			name: "multus-global-namespace-invalid",
++			config: func() *Config {
++				c := mkDefaultConfig()
++				c.Network.Multus.GlobalNamespaces = []string{"default,tenant-a"}
++				return c
++			}(),
++			expectErr: true,
++		},
+ 		{
+ 			name: "kube-controller-manager-terminated-pod-gc-threshold-negative",
+ 			config: func() *Config {
+diff --git a/pkg/config/network.go b/pkg/config/network.go
+index 192256ba7ed86ad3f5d09d43318b0549be71f63c..4635fe0d1eed02400bd646862cae62c1f66c1533 100644
+--- a/pkg/config/network.go
++++ b/pkg/config/network.go
+@@ -6,6 +6,7 @@ import (
+ 
+ 	"github.com/apparentlymart/go-cidr/cidr"
+ 	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/apimachinery/pkg/util/validation"
+ )
+ 
+ // CNIPlugin is an enum value that determines whether MicroShift deploys OVNK.
+@@ -44,8 +45,21 @@ type Multus struct {
+ 	// +kubebuilder:validation:Optional
+ 	// +kubebuilder:default=Disabled
+ 	Status MultusStatusEnum `json:"status"`
++
++	// GlobalNamespaces lists the namespaces whose NetworkAttachmentDefinitions
++	// a pod in any namespace may attach to. Any other reference must stay
++	// within the pod's own namespace, as on OpenShift. A non-empty list
++	// replaces the default. Multus reads an empty list as "default", so to
++	// share no namespace, name one no tenant can write to, such as
++	// openshift-multus.
++	// +kubebuilder:validation:Optional
++	// +kubebuilder:default={"default","openshift-multus","openshift-sriov-network-operator","openshift-cnv"}
++	GlobalNamespaces []string `json:"globalNamespaces,omitempty"`
+ }
+ 
++// OpenShift's cluster-network-operator renders Multus with these.
++var defaultMultusGlobalNamespaces = []string{"default", "openshift-multus", "openshift-sriov-network-operator", "openshift-cnv"}
++
+ type Network struct {
+ 	// CNIPlugin is a user defined string value matching one of the above CNI values. MicroShift uses this
+ 	// value to decide whether to deploy the OVN-K as default CNI. An unset field defaults to "" during yaml parsing, and thus
+@@ -132,5 +146,10 @@ func (m Multus) Validate() error {
+ 	if m.Status != MultusEnabled && m.Status != MultusDisabled {
+ 		return fmt.Errorf("invalid multus status: %v", m.Status)
+ 	}
++	for _, ns := range m.GlobalNamespaces {
++		if errs := validation.IsDNS1123Label(ns); len(errs) > 0 {
++			return fmt.Errorf("invalid multus global namespace %q: %v", ns, errs)
++		}
++	}
+ 	return nil
+ }

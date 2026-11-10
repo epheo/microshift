@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Thibaut Lapierre <root@epheo.eu>
 Date: Fri, 6 Nov 2026 00:00:00 +0000
-Subject: [PATCH 07/12] multinode: worker healthcheck
+Subject: [PATCH 07/13] multinode: worker healthcheck
 
 The worker role marker /var/lib/microshift/multinode-worker (it holds the
 control plane IP) makes the healthcheck gate a worker on its own Node
