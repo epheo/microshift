@@ -1,0 +1,101 @@
+# OpenShift's own grants that MicroShift's apiserver bootstrap lacks, copied verbatim
+# (names, aggregation labels and rules) from OpenShift 4.22, so a role means the same
+# on both. Applied from manifests.d; the aggregation controller folds the pieces in.
+
+# Every signed-in user: OpenShift's basic-user, bound to system:authenticated as basic-users,
+# aggregating its pieces. The storage-class rule is what MicroShift lacked; the others
+# name OpenShift APIs MicroShift does not serve, or reads OpenShift grants as well.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: basic-user}
+aggregationRule:
+  clusterRoleSelectors:
+  - matchLabels: {authorization.openshift.io/aggregate-to-basic-user: 'true'}
+rules: []
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: basic-users}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: basic-user}
+subjects:
+- {apiGroup: rbac.authorization.k8s.io, kind: Group, name: 'system:authenticated'}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:openshift:aggregate-to-basic-user
+  labels: {authorization.openshift.io/aggregate-to-basic-user: 'true'}
+rules:
+- apiGroups: ['', user.openshift.io]
+  resourceNames: ['~']
+  resources: [users]
+  verbs: [get]
+- apiGroups: ['', project.openshift.io]
+  resources: [projectrequests]
+  verbs: [list]
+- apiGroups: ['', authorization.openshift.io]
+  resources: [clusterroles]
+  verbs: [get, list]
+- apiGroups: [rbac.authorization.k8s.io]
+  resources: [clusterroles]
+  verbs: [get, list, watch]
+- apiGroups: [storage.k8s.io]
+  resources: [storageclasses]
+  verbs: [get, list]
+- apiGroups: ['', project.openshift.io]
+  resources: [projects]
+  verbs: [list, watch]
+- apiGroups: ['', authorization.openshift.io]
+  resources: [selfsubjectrulesreviews]
+  verbs: [create]
+- apiGroups: [authorization.k8s.io]
+  resources: [selfsubjectaccessreviews]
+  verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:openshift:aggregate-snapshots-to-basic-user
+  labels: {authorization.openshift.io/aggregate-to-basic-user: 'true'}
+rules:
+- apiGroups: [snapshot.storage.k8s.io]
+  resources: [volumesnapshotclasses]
+  verbs: [get, list, watch]
+---
+# Gateway API in the stock project roles: view reads routes, edit and admin write them.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:openshift:gateway-api:aggregate-to-view
+  labels: {rbac.authorization.k8s.io/aggregate-to-view: 'true'}
+rules:
+- apiGroups: [gateway.networking.k8s.io]
+  resources: [gateways]
+  verbs: [get, list, watch]
+- apiGroups: [gateway.networking.k8s.io]
+  resources: [httproutes, grpcroutes, referencegrants, backendtlspolicies]
+  verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:openshift:gateway-api:aggregate-to-admin
+  labels: {rbac.authorization.k8s.io/aggregate-to-admin: 'true', rbac.authorization.k8s.io/aggregate-to-edit: 'true'}
+rules:
+- apiGroups: [gateway.networking.k8s.io]
+  resources: [gateways]
+  verbs: [get, list, watch]
+- apiGroups: [gateway.networking.k8s.io]
+  resources: [httproutes, grpcroutes, referencegrants, backendtlspolicies]
+  verbs: [get, list, watch, create, update, patch, delete, deletecollection]
+---
+# A project admin reads its namespaces' NetworkAttachmentDefinitions.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: net-attach-def-project
+  labels: {rbac.authorization.k8s.io/aggregate-to-admin: 'true'}
+rules:
+- apiGroups: [k8s.cni.cncf.io]
+  resources: [network-attachment-definitions]
+  verbs: [watch, list, get]

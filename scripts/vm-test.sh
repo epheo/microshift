@@ -8,8 +8,9 @@
 # provisioned and written, an OVN-K layer2 secondary network is attached,
 # a MultiNetworkPolicy cuts a pod off that network and its removal restores
 # it, an AdminNetworkPolicy does the same on the cluster network, the
-# embedded portail image is started with pull policy Never, and the API
-# accepts TCPRoute and UDPRoute objects.
+# embedded portail image is started with pull policy Never, the API
+# accepts TCPRoute and UDPRoute objects, and RBAC answers as OpenShift's
+# does for signed-in users and the stock project roles (src/rbac).
 # The fresh-install VM runs with zero egress (restrict=on): going GREEN
 # proves the air-gapped first boot the embedded payload exists for.
 #
@@ -762,6 +763,31 @@ EOF
 }
 wait_for 180 "TCPRoute and UDPRoute accepted" routes_accepted || {
     koc get crd -o name | grep gateway.networking >&2 || true
+    vssh journalctl -u microshift --no-pager | grep -i kustomiz | tail -20 >&2 || true
+    exit 1
+}
+
+log "assert: RBAC answers as OpenShift's (src/rbac)"
+koc create rolebinding rbac-probe-view --clusterrole=view --user=rbac-viewer -n default \
+    --dry-run=client -o yaml | koc apply -f - >/dev/null
+koc create rolebinding rbac-probe-edit --clusterrole=edit --user=rbac-editor -n default \
+    --dry-run=client -o yaml | koc apply -f - >/dev/null
+koc create rolebinding rbac-probe-admin --clusterrole=admin --user=rbac-admin -n default \
+    --dry-run=client -o yaml | koc apply -f - >/dev/null
+# The aggregation controller folds the pieces into basic-user, view, edit
+# and admin after manifests.d applies them.
+can() { [ "$(koc auth can-i "$@" 2>/dev/null)" = yes ]; }
+rbac_parity() {
+    can list storageclasses.storage.k8s.io --as=rbac-anyone --as-group=system:authenticated &&
+        can list volumesnapshotclasses.snapshot.storage.k8s.io --as=rbac-anyone --as-group=system:authenticated &&
+        can list httproutes.gateway.networking.k8s.io -n default --as=rbac-viewer &&
+        ! can create httproutes.gateway.networking.k8s.io -n default --as=rbac-viewer &&
+        can create httproutes.gateway.networking.k8s.io -n default --as=rbac-editor &&
+        can list network-attachment-definitions.k8s.cni.cncf.io -n default --as=rbac-admin &&
+        ! can list network-attachment-definitions.k8s.cni.cncf.io -n default --as=rbac-editor
+}
+wait_for 180 "RBAC answers as OpenShift's" rbac_parity || {
+    koc get clusterrole basic-user view edit admin -o name >&2 || true
     vssh journalctl -u microshift --no-pager | grep -i kustomiz | tail -20 >&2 || true
     exit 1
 }

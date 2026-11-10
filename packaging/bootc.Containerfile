@@ -249,6 +249,11 @@ RUN crds=/usr/lib/microshift/manifests.d/000-gateway-api/experimental-install.ya
         "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/experimental-install.yaml" && \
     echo "${GATEWAY_API_SHA256}  ${crds}" | sha256sum -c -
 
+# OpenShift's grants that MicroShift's apiserver bootstrap lacks (storage and
+# snapshot classes for every signed-in user, Gateway API and NAD reads in the
+# stock project roles): consoles such as dotvirt then answer as on OpenShift.
+COPY ./src/rbac/ /usr/lib/microshift/manifests.d/010-openshift-rbac/
+
 COPY --chmod=755 ./src/embedded-images/import-embedded-images.sh /usr/bin/import-embedded-images.sh
 COPY ./src/embedded-images/import-embedded-images.service /usr/lib/systemd/system/import-embedded-images.service
 RUN systemctl enable import-embedded-images.service
