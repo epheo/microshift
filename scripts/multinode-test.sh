@@ -303,6 +303,19 @@ v2 systemctl enable microshift
 v1 microshift worker-join-kubeconfig --address "${IP1}" --duration 30m > "${WORKDIR}/bootstrap-kubeconfig"
 scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
     -i "${WORKDIR}/id" "${WORKDIR}/bootstrap-kubeconfig" "root@${IP2}:/root/bootstrap-kubeconfig"
+
+# The join token replaces the cluster-admin kubeconfig. Creating CSRs is the
+# control: it proves the probe reads RBAC rather than failing to connect.
+log "assert: the join token creates CSRs and nothing an admin could"
+can_join() { v2 oc --kubeconfig /root/bootstrap-kubeconfig auth can-i "$@" 2>/dev/null || true; }
+[ "$(can_join create certificatesigningrequests)" = yes ] \
+    || die "the join token cannot create CSRs; the probe below proves nothing"
+for probe in "get secrets -n kube-system" "create pods -n default" \
+        "update configmaps -n kube-system" "list nodes"; do
+    # shellcheck disable=SC2086
+    [ "$(can_join ${probe})" = no ] || die "the join token may ${probe}"
+done
+
 v2 microshift add-node --worker --kubeconfig /root/bootstrap-kubeconfig
 
 log "assert: the join left no copy of its credential"
@@ -322,6 +335,38 @@ echo "${labels}" | grep -q 'node-role.kubernetes.io/worker' \
 if echo "${labels}" | grep -q 'node-role.kubernetes.io/control-plane'; then
     die "node2 carries the control-plane label"
 fi
+
+# v2 must succeed for the check to mean anything: a failed ssh inverted by
+# the test would read as 'no key found'.
+log "assert: no signing material on the worker"
+v2 true
+if v2 sh -c 'find /var/lib/microshift/certs -name ca.key 2>/dev/null | grep -q .'; then
+    die "a CA private key is on the worker"
+fi
+if v2 test -f /var/lib/microshift/resources/kube-apiserver/secrets/service-account-key/service-account.key; then
+    die "the service account signing key is on the worker"
+fi
+
+# Root on a worker holds the zone pod's token. It must not be the
+# controller's account: that one writes any ConfigMap, kube-system's
+# kubelet-client-ca included. The status patch is the control: it proves the
+# probe reads RBAC rather than failing for another reason.
+log "assert: the worker's OVN account writes nothing outside its namespace"
+sa=system:serviceaccount:openshift-ovn-kubernetes:ovn-kubernetes-node-limited
+ds_sa="$(koc -n openshift-ovn-kubernetes get ds ovnkube-node -o jsonpath='{.spec.template.spec.serviceAccountName}')"
+[ "${ds_sa}" = ovn-kubernetes-node-limited ] || die "ovnkube-node runs as '${ds_sa}'"
+can() { koc auth can-i --as="${sa}" "$@" 2>/dev/null || true; }
+[ "$(can patch pods --subresource=status -n default)" = yes ] \
+    || die "${sa} cannot patch pod status; the probe below proves nothing"
+for probe in "update configmaps -n kube-system" "patch pods -n default" \
+        "patch nodes" "delete pods -n default"; do
+    # shellcheck disable=SC2086
+    [ "$(can ${probe})" = no ] || die "${sa} may ${probe}"
+done
+
+# The approver ticks every 30s and Ready does not wait for the serving cert.
+kubelet_proxied() { [ "$(koc get --raw /api/v1/nodes/node2/proxy/healthz 2>/dev/null)" = ok ]; }
+retry 120 "the apiserver reaches node2's kubelet over its CSR-issued cert" kubelet_proxied
 
 pods_settled() {
     local total

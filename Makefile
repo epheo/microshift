@@ -86,6 +86,29 @@ rpms-out:
 	$(PODMAN) cp "$$cid:/home/microshift/microshift/_output/rpmbuild/RPMS/." "$$outdir" && \
 	echo "RPMs are available in '$$outdir'"
 
+# CI's RPM cache (scripts/rpm-cache-key.sh). The image stage takes only the
+# RPM repo and the rshared unit from the RPM image, and `make version` reads
+# version.txt there: the cache keeps those, and a stand-in image on the
+# buildroot serves them. A new COPY --from=builder in bootc.Containerfile
+# must be added here, or a cached build fails on it.
+RPM_CACHE ?= /tmp/epheo-microshift-rpm-cache
+RPM_CACHE_PATHS := _output/rpmbuild/RPMS packaging/imagemode/systemd/microshift-make-rshared.service
+
+.PHONY: rpm-cache-save
+rpm-cache-save:
+	@rm -rf "$(RPM_CACHE)" && \
+	cid=$$($(PODMAN) create "$(RPM_IMAGE)") && \
+	trap "$(PODMAN) rm -f $$cid >/dev/null" EXIT && \
+	for p in $(RPM_CACHE_PATHS); do \
+	    mkdir -p "$(RPM_CACHE)/$$(dirname "$$p")" && \
+	    $(PODMAN) cp "$$cid:/home/microshift/microshift/$$p" "$(RPM_CACHE)/$$p" || exit 1; \
+	done
+
+.PHONY: rpm-cache-load
+rpm-cache-load:
+	printf 'FROM %s\nCOPY . /home/microshift/microshift/\n' "$(BUILDROOT_IMAGE)" | \
+	    $(PODMAN) build --pull=never -t "$(RPM_IMAGE)" -f - "$(RPM_CACHE)"
+
 .PHONY: smoke
 smoke:
 	DIST_IMAGE="$(DIST_IMAGE)" ./scripts/smoke-test.sh
@@ -114,14 +137,6 @@ vm-test-upgrade:
 .PHONY: multinode-test
 multinode-test:
 	DIST_IMAGE="$(DIST_IMAGE)" ./scripts/multinode-test.sh
-
-.PHONY: multinode-smoke
-multinode-smoke:
-	DIST_IMAGE="$(DIST_IMAGE)" ./scripts/multinode-smoke.sh
-
-.PHONY: multinode-smoke-clean
-multinode-smoke-clean:
-	DIST_IMAGE="$(DIST_IMAGE)" CLEAN=1 ./scripts/multinode-smoke.sh
 
 .PHONY: smoke-clean
 smoke-clean:

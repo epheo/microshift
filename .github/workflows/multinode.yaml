@@ -1,7 +1,7 @@
 # Two-VM worker-join acceptance against a PUBLISHED image (no source
 # build): the controller + 'microshift add-node --worker' flow with
-# firewalld and greenboot in place. Dispatch-only; branch work runs the
-# same test built from source via multinode-smoke.yaml's vm-join job.
+# firewalld and greenboot in place. Dispatch-only; every build.yaml run
+# already runs the same test on the image it built.
 name: multinode
 
 on:

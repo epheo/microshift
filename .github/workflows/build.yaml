@@ -1,8 +1,12 @@
 name: build
 # The distribution's single CI pipeline:
 #
-#   pull_request          build + test (VM boot + upgrade), no publish
+#   pull_request          build + test, no publish
 #   push to main          build + test + publish
+#
+#   The image is built once; the fresh VM, both upgrade lanes and the
+#   two-VM worker join then run in parallel on it, and publish pushes the
+#   exact image they tested once all of them pass.
 #   workflow_dispatch     build + test (+ publish unless disabled)
 #   daily schedule        check for new z-stream / OKD payload / portail
 #                         releases; if anything moved, commit the bump to
@@ -112,6 +116,8 @@ jobs:
           fi
           echo "rebuild=${rebuild}" >> "${GITHUB_OUTPUT}"
 
+  # Builds the image once and hands it to the test lanes below, which run in
+  # parallel; publish waits for all of them.
   build:
     needs: [bump]
     # Run for every non-schedule event (bump is skipped there); on the daily
@@ -127,18 +133,19 @@ jobs:
         github.event.schedule == '45 5 * * 1'
       )
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 90
     permissions:
-      # contents: write only for the promotion step's API call; checkout
-      # keeps no credentials, so PR code never sees the token.
-      contents: write
-      issues: write
-      packages: write
+      contents: read
+    outputs:
+      # The lanes and publish check out this commit, not the moving ref.
+      sha: ${{ steps.meta.outputs.sha }}
+      version: ${{ steps.meta.outputs.version }}
+      minor: ${{ steps.meta.outputs.minor }}
+      rollback: ${{ steps.rollback.outputs.enabled }}
+      prev_minor: ${{ steps.prev-minor.outputs.minor }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # PR code runs make with packages: write; keep the token out of
-          # .git/config.
           persist-credentials: false
           # A bump run builds the staged bump commit; other scheduled runs
           # build main's head, not the sha the schedule fired on.
@@ -157,14 +164,18 @@ jobs:
 
       - name: Build the image
         uses: ./.github/actions/build-image
-        with:
-          pull-also: quay.io/centos-bootc/bootc-image-builder:latest quay.io/libpod/registry:2.8
 
-      - name: Prepare the runner for VMs
-        uses: ./.github/actions/vm-host
-
-      - name: VM boot test (bootc-image-builder -> qcow2 -> QEMU)
-        run: make vm-test PODMAN="sudo podman"
+      - name: Resolve version string
+        id: meta
+        run: |
+          set -euo pipefail
+          version="$(make --silent version PODMAN='sudo podman')"
+          [ -n "${version}" ] || { echo "::error::empty version string"; exit 1; }
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "version=${version}"
+            echo "minor=$(echo "${USHIFT_GITREF}" | cut -d. -f1,2)"
+          } >> "${GITHUB_OUTPUT}"
 
       # When on, both upgrade lanes first make the candidate go red: greenboot
       # must roll it back and MicroShift restore the data, then it is
@@ -178,21 +189,12 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before || (needs.bump.outputs.sha && github.sha) || '' }}
         run: ./scripts/ci-rollback-needed.sh
 
-      # The fresh-boot qcow2 is no longer needed; reclaim its space before
-      # the second bootc-image-builder run.
-      - name: Upgrade test (previous release -> candidate)
-        env:
-          # Forks have nothing published to upgrade from.
-          UPGRADE_ALLOW_MISSING: ${{ github.repository != 'epheo/microshift' && '1' || '' }}
-        run: |
-          sudo rm -rf /tmp/epheo-microshift-vm/output
-          make vm-test-upgrade PODMAN="sudo podman" ROLLBACK="${{ steps.rollback.outputs.enabled }}" \
-              UPGRADE_FROM="ghcr.io/${{ github.repository_owner }}/microshift:latest"
-
       # Once a crossing publishes, :latest only covers same-minor upgrades,
       # while nodes still on the previous minor cross later on their own.
-      # Skipped while that minor tag is the same image as :latest.
-      - name: Upgrade test (previous minor -> candidate)
+      # Empty (lane skipped) while no older minor tag is published, or while
+      # it is the image :latest already is.
+      - name: Find the previous minor to upgrade from
+        id: prev-minor
         run: |
           set -euo pipefail
           image="ghcr.io/${{ github.repository_owner }}/microshift"
@@ -201,19 +203,55 @@ jobs:
               | jq -r '.Tags[]' | grep -E '^[0-9]+\.[0-9]+$' || true)"
           prev="$(printf '%s\n%s\n' "${minors}" "${pinned}" | grep . | sort -uV \
               | grep -B1 -xF "${pinned}" | head -1)"
-          if [ "${prev}" = "${pinned}" ]; then
-            echo "No minor tag older than ${pinned} is published; skipping."
-            exit 0
-          fi
           digest() { skopeo inspect --retry-times 3 --no-tags "docker://${image}:$1" | jq -r .Digest; }
-          if [ "$(digest "${prev}")" = "$(digest latest)" ]; then
-            echo ":${prev} is the image :latest already upgraded from; skipping."
-            exit 0
+          if [ "${prev}" = "${pinned}" ]; then
+            echo "No minor tag older than ${pinned} is published."
+            prev=""
+          elif [ "$(digest "${prev}")" = "$(digest latest)" ]; then
+            echo ":${prev} is the image :latest already upgrades from."
+            prev=""
           fi
-          sudo rm -rf /tmp/epheo-microshift-vm-upgrade/output
-          WORKDIR=/tmp/epheo-microshift-vm-upgrade-prev \
-              make vm-test-upgrade PODMAN="sudo podman" ROLLBACK="${{ steps.rollback.outputs.enabled }}" \
-                  UPGRADE_FROM="${image}:${prev}"
+          echo "minor=${prev}" >> "${GITHUB_OUTPUT}"
+
+      - name: Save the image for the test lanes
+        run: |
+          set -euo pipefail
+          sudo podman save epheo-microshift | zstd -T0 -3 -q -o /tmp/candidate.tar.zst
+          du -h /tmp/candidate.tar.zst
+
+      - name: Upload the image for the test lanes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: candidate-image
+          path: /tmp/candidate.tar.zst
+          retention-days: 1
+          # zstd already compressed it.
+          compression-level: 0
+          if-no-files-found: error
+
+  # Fresh install: the air-gapped first boot (the VM has no egress).
+  vm-test:
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.build.outputs.sha }}
+
+      - name: Load the candidate image
+        uses: ./.github/actions/candidate
+        with:
+          pull: quay.io/centos-bootc/bootc-image-builder:latest
+
+      - name: Prepare the runner for VMs
+        uses: ./.github/actions/vm-host
+
+      - name: VM boot test (bootc-image-builder -> qcow2 -> QEMU)
+        run: make vm-test PODMAN="sudo podman"
 
       - name: Make VM logs readable
         if: failure()
@@ -223,27 +261,167 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: vm-logs
+          name: vm-test-logs
           # console.log is the serial console; diag.log is the MicroShift,
           # node/pod, OVN-K and crio state dumped by vm-test.sh on failure.
           path: /tmp/epheo-microshift-vm*/*.log
           if-no-files-found: ignore
 
-      - name: Resolve version string
-        id: version
+  # The update path every existing install takes.
+  vm-test-upgrade:
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.build.outputs.sha }}
+
+      - name: Load the candidate image
+        uses: ./.github/actions/candidate
+        with:
+          pull: quay.io/centos-bootc/bootc-image-builder:latest quay.io/libpod/registry:2.8
+
+      - name: Prepare the runner for VMs
+        uses: ./.github/actions/vm-host
+
+      - name: Upgrade test (previous release -> candidate)
+        env:
+          # Forks have nothing published to upgrade from.
+          UPGRADE_ALLOW_MISSING: ${{ github.repository != 'epheo/microshift' && '1' || '' }}
         run: |
-          set -euo pipefail
-          version="$(make --silent version PODMAN='sudo podman')"
-          [ -n "${version}" ] || { echo "::error::empty version string"; exit 1; }
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-          echo "minor=$(echo "${USHIFT_GITREF}" | cut -d. -f1,2)" >> "${GITHUB_OUTPUT}"
+          make vm-test-upgrade PODMAN="sudo podman" ROLLBACK="${{ needs.build.outputs.rollback }}" \
+              UPGRADE_FROM="ghcr.io/${{ github.repository_owner }}/microshift:latest"
+
+      - name: Make VM logs readable
+        if: failure()
+        run: sudo chmod -R a+rX /tmp/epheo-microshift-vm* 2>/dev/null || true
+
+      - name: Upload VM logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vm-test-upgrade-logs
+          path: /tmp/epheo-microshift-vm*/*.log
+          if-no-files-found: ignore
+
+  # Nodes still on the previous minor cross on their own, later.
+  vm-test-upgrade-minor:
+    needs: [build]
+    if: needs.build.outputs.prev_minor != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.build.outputs.sha }}
+
+      - name: Load the candidate image
+        uses: ./.github/actions/candidate
+        with:
+          pull: quay.io/centos-bootc/bootc-image-builder:latest quay.io/libpod/registry:2.8
+
+      - name: Prepare the runner for VMs
+        uses: ./.github/actions/vm-host
+
+      - name: Upgrade test (previous minor -> candidate)
+        run: |
+          make vm-test-upgrade PODMAN="sudo podman" ROLLBACK="${{ needs.build.outputs.rollback }}" \
+              UPGRADE_FROM="ghcr.io/${{ github.repository_owner }}/microshift:${{ needs.build.outputs.prev_minor }}"
+
+      - name: Make VM logs readable
+        if: failure()
+        run: sudo chmod -R a+rX /tmp/epheo-microshift-vm* 2>/dev/null || true
+
+      - name: Upload VM logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vm-test-upgrade-minor-logs
+          path: /tmp/epheo-microshift-vm*/*.log
+          if-no-files-found: ignore
+
+  # Two VMs: a controller and a worker joined with add-node, firewalld and
+  # greenboot in place, then a controller update the worker follows.
+  multinode-test:
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.build.outputs.sha }}
+
+      - name: Load the candidate image
+        uses: ./.github/actions/candidate
+        with:
+          pull: quay.io/centos-bootc/bootc-image-builder:latest quay.io/libpod/registry:2.8
+
+      - name: Prepare the runner for VMs
+        uses: ./.github/actions/vm-host
+        with:
+          dnsmasq: "true"
+
+      - name: Two-VM worker join test
+        run: make multinode-test
+
+      - name: Make VM logs readable
+        if: failure()
+        run: sudo chmod -R a+rX /tmp/epheo-microshift-multinode 2>/dev/null || true
+
+      - name: Upload VM logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: multinode-logs
+          # console{1,2}.log are the serial consoles; multinode-test.sh writes
+          # diag.log (cluster state, per-node microshift and OVS journals) and
+          # diag-summary.log (bootc, br-ex, failed units, SELinux) on failure.
+          path: /tmp/epheo-microshift-multinode/*.log
+          if-no-files-found: ignore
+
+  # Publishes the image every lane tested, byte for byte.
+  publish:
+    needs: [bump, build, vm-test, vm-test-upgrade, vm-test-upgrade-minor, multinode-test]
+    if: |
+      !cancelled() && github.event_name != 'pull_request' &&
+      (github.event_name != 'workflow_dispatch' || inputs.push-image) &&
+      needs.build.result == 'success' &&
+      needs.vm-test.result == 'success' &&
+      needs.vm-test-upgrade.result == 'success' &&
+      (needs.vm-test-upgrade-minor.result == 'success' || needs.vm-test-upgrade-minor.result == 'skipped') &&
+      needs.multinode-test.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      # contents: write only for the promotion step's API call; checkout
+      # keeps no credentials.
+      contents: write
+      issues: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.build.outputs.sha }}
+
+      - name: Load the candidate image
+        uses: ./.github/actions/candidate
 
       # Only a bump that passed every lane reaches main, and only as a
       # fast-forward: if main moved meanwhile, nothing publishes and
       # tomorrow's bump retries on top of it.
       - name: Promote the bump to main
         id: promote
-        if: needs.bump.outputs.changed == 'true' && (github.event_name != 'workflow_dispatch' || inputs.push-image)
+        if: needs.bump.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ needs.bump.outputs.sha }}
@@ -261,17 +439,17 @@ jobs:
           fi
 
       - name: Login to ghcr.io
-        if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.push-image) && steps.promote.outputs.ok != 'false'
+        if: steps.promote.outputs.ok != 'false'
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Push image
-        if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.push-image) && steps.promote.outputs.ok != 'false'
+        if: steps.promote.outputs.ok != 'false'
         run: |
           set -euo pipefail
           image="ghcr.io/${{ github.repository_owner }}/microshift"
-          full="${{ steps.version.outputs.version }}_epheo.${EPHEO_REV}"
-          for tag in "${full}" "${{ steps.version.outputs.minor }}" latest; do
+          full="${{ needs.build.outputs.version }}_epheo.${EPHEO_REV}"
+          for tag in "${full}" "${{ needs.build.outputs.minor }}" latest; do
             sudo podman tag epheo-microshift "${image}:${tag}"
             sudo podman push "${image}:${tag}"
           done
@@ -280,17 +458,17 @@ jobs:
       # Reads back what a fresh client pulls: all three tags one image,
       # labelled with the pins and the commit it was built from.
       - name: Verify the published tags
-        if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.push-image) && steps.promote.outputs.ok != 'false'
+        if: steps.promote.outputs.ok != 'false'
         run: |
           set -euo pipefail
           image="ghcr.io/${{ github.repository_owner }}/microshift"
-          full="${{ steps.version.outputs.version }}_epheo.${EPHEO_REV}"
+          full="${{ needs.build.outputs.version }}_epheo.${EPHEO_REV}"
           # Anonymous: the package is public, and root's podman login left an auth
           # file under the runner's XDG_RUNTIME_DIR that this user cannot read.
           inspect() { skopeo inspect --retry-times 3 --no-creds --no-tags "docker://${image}:$1"; }
           ref="$(inspect "${full}")"
           digest="$(echo "${ref}" | jq -r .Digest)"
-          for tag in "${{ steps.version.outputs.minor }}" latest; do
+          for tag in "${{ needs.build.outputs.minor }}" latest; do
             got="$(inspect "${tag}" | jq -r .Digest)"
             [ "${got}" = "${digest}" ] || { echo "::error:::${tag} is ${got}, :${full} is ${digest}"; exit 1; }
           done
@@ -300,12 +478,12 @@ jobs:
             key="${pair%%=*}"; want="${pair#*=}"
             [ "$(label "${key}")" = "${want}" ] || { echo "::error::label ${key} is '$(label "${key}")', want '${want}'"; exit 1; }
           done
-          echo "verified ${image}:${full} (${digest}) as :${{ steps.version.outputs.minor }} and :latest"
+          echo "verified ${image}:${full} (${digest}) as :${{ needs.build.outputs.minor }} and :latest"
 
   # A bump that went red: one open issue and one PR from auto/bump carry it
   # until a later bump is promoted (which closes the issue).
   report:
-    needs: [bump, build]
+    needs: [bump, build, vm-test, vm-test-upgrade, vm-test-upgrade-minor, multinode-test, publish]
     if: failure() && needs.bump.outputs.changed == 'true' && needs.bump.outputs.stale != 'true'
     runs-on: ubuntu-24.04
     permissions:

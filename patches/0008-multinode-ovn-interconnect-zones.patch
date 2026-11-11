@@ -24,7 +24,7 @@ kubeconfig. Every node here is its own OVN interconnect zone instead:
 
 Community builds run multinode mode by default, so single-node installs
 use these manifests too.
-Covered by: vm-test (single node), multinode-smoke and multinode-test
+Covered by: vm-test (single node) and multinode-test
 (cross-node pod, service and DNS traffic).
 ---
  .../ovn/common/clusterrole-controller.yaml    |  29 ++++

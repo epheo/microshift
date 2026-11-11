@@ -37,7 +37,7 @@ runWorker. Upstream's runAddNode (full etcd replica) is left unused: this
 build refuses those joins.
 
 Carried by decision, not proposed upstream.
-Covered by: unit tests (CSR approver, kubelet config), multinode-smoke
+Covered by: unit tests (CSR approver, kubelet config), multinode-test
 and multinode-test (join, certs, restart without bootstrap kubeconfig).
 ---
  .../core/kubelet-client-ca-reader-role.yaml   |  12 +

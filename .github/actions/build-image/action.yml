@@ -2,11 +2,8 @@ name: Build the image
 description: >-
   Free the runner's disk, load versions.env into the job environment,
   pre-pull the base images, then make srpm, rpm and image (epheo-microshift
-  in root's podman store).
-inputs:
-  pull-also:
-    description: More images to pre-pull, space-separated (what the tests use)
-    default: ""
+  in root's podman store). srpm and rpm come from cache while their inputs
+  are unchanged.
 runs:
   using: composite
   steps:
@@ -19,35 +16,50 @@ runs:
       shell: bash
       run: grep -E '^[A-Z_]+=' versions.env >> "${GITHUB_ENV}"
 
-    # Registry CDNs flake (unexpected EOF mid-blob); pull every base image
-    # with retries up front so the builds run against the local store.
     - name: Pre-pull base images
       shell: bash
-      env:
-        PULL_ALSO: ${{ inputs.pull-also }}
       run: |
-        set -euo pipefail
-        # shellcheck disable=SC2086
-        for img in \
-            quay.io/fedora/fedora:latest \
-            "${BUILDROOT_IMAGE}" \
-            "${BOOTC_IMAGE_URL}:${BOOTC_IMAGE_TAG}" \
-            "$(cat src/cni/plugins-image)" \
-            ${PULL_ALSO}; do
-          for i in $(seq 5); do
-            if sudo podman pull -q "${img}"; then break; fi
-            if [ "${i}" = "5" ]; then echo "ERROR: could not pull ${img}"; exit 1; fi
-            echo "pull failed (attempt ${i}) for ${img}, retrying"; sleep 15
-          done
-        done
+        ./scripts/ci-pull.sh quay.io/fedora/fedora:latest "${BUILDROOT_IMAGE}" \
+            "${BOOTC_IMAGE_URL}:${BOOTC_IMAGE_TAG}" "$(cat src/cni/plugins-image)"
+
+    - name: Key the RPM stages by their inputs
+      id: rpm-key
+      shell: bash
+      run: |
+        key="$(./scripts/rpm-cache-key.sh)"
+        echo "key=rpm-${key}" >> "${GITHUB_OUTPUT}"
+
+    - name: Restore the RPMs these inputs built
+      id: rpm-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: /tmp/epheo-microshift-rpm-cache
+        key: ${{ steps.rpm-key.outputs.key }}
 
     - name: Build SRPM (source + patches + OKD payload swap)
+      if: steps.rpm-cache.outputs.cache-hit != 'true'
       shell: bash
       run: make srpm PODMAN="sudo podman"
 
     - name: Build RPMs (el10)
+      if: steps.rpm-cache.outputs.cache-hit != 'true'
       shell: bash
-      run: make rpm PODMAN="sudo podman"
+      run: |
+        make rpm PODMAN="sudo podman"
+        sudo make rpm-cache-save PODMAN=podman
+        sudo chown -R "$(id -u):$(id -g)" /tmp/epheo-microshift-rpm-cache
+
+    - name: Cache the RPMs
+      if: steps.rpm-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: /tmp/epheo-microshift-rpm-cache
+        key: ${{ steps.rpm-key.outputs.key }}
+
+    - name: Stand in for the RPM image from the cache
+      if: steps.rpm-cache.outputs.cache-hit == 'true'
+      shell: bash
+      run: make rpm-cache-load PODMAN="sudo podman"
 
     - name: Build bootc image
       shell: bash
