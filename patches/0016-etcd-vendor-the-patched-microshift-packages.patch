@@ -1,0 +1,415 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Thibaut Lapierre <root@epheo.eu>
+Date: Wed, 11 Nov 2026 01:08:37 +0100
+Subject: [PATCH 16/16] etcd: vendor the patched microshift packages
+
+microshift-etcd builds against its own vendored copy of MicroShift's
+pkg/config and pkg/util, which the series' changes did not reach. With
+the node IP on br-ex, the stale copy skipped br-ex when no default route
+existed, found no address and exited, so MicroShift never started on an
+isolated network. Regenerated with go mod vendor in etcd/; rerun it last
+whenever a patch changes those packages.
+---
+ .../microshift/pkg/config/apiserver.go        | 33 +++----
+ .../openshift/microshift/pkg/config/config.go | 85 +++++++++----------
+ .../pkg}/config/kubecontrollermanager.go      |  0
+ .../microshift/pkg/config/multinode.go        | 59 ++++++++++++-
+ .../microshift/pkg/config/network.go          | 19 +++++
+ .../openshift/microshift/pkg/util/net.go      |  7 +-
+ 6 files changed, 138 insertions(+), 65 deletions(-)
+ copy {pkg => etcd/vendor/github.com/openshift/microshift/pkg}/config/kubecontrollermanager.go (100%)
+
+diff --git a/etcd/vendor/github.com/openshift/microshift/pkg/config/apiserver.go b/etcd/vendor/github.com/openshift/microshift/pkg/config/apiserver.go
+index 8d31d1bc61607c817027e1b0dc4d680de51e7010..c2b24b0af8f838bb19c44c04d659b928f26df193 100644
+--- a/etcd/vendor/github.com/openshift/microshift/pkg/config/apiserver.go
++++ b/etcd/vendor/github.com/openshift/microshift/pkg/config/apiserver.go
+@@ -14,16 +14,16 @@ import (
+ type ApiServer struct {
+ 	// SubjectAltNames added to API server certs
+ 	SubjectAltNames []string `json:"subjectAltNames"`
+-	// Kube apiserver advertise address to work around the certificates issue
+-	// when requiring external access using the node IP. This will turn into
+-	// the IP configured in the endpoint slice for kubernetes service. Must be
+-	// a reachable IP from pods. Defaults to service network CIDR first
+-	// address.
++	// Kube apiserver advertise address: the IP in the endpoint slice of the
++	// kubernetes service. Must be on a host interface and reachable from
++	// pods and other nodes. Defaults to the node IP, as on OpenShift. It is
++	// served the service-network certificate, never the external one.
+ 	AdvertiseAddress string `json:"advertiseAddress,omitempty"`
+ 	// List of custom certificates used to secure requests to specific host names
+ 	NamedCertificates []NamedCertificateEntry `json:"namedCertificates"`
+ 	// Determines if kube-apiserver controller should configure the
+-	// AdvertiseAddress in the loopback interface. Automatically computed.
++	// AdvertiseAddress on an interface. Always true: the advertise address
++	// is a host address.
+ 	SkipInterface bool `json:"-"`
+ 
+ 	AuditLog AuditLog `json:"auditLog"`
+@@ -32,20 +32,21 @@ type ApiServer struct {
+ 
+ 	FeatureGates FeatureGates `json:"featureGates"`
+ 
++	// AuthenticationConfig is the absolute path of a structured authentication
++	// configuration file (apiserver.config.k8s.io AuthenticationConfiguration),
++	// handed to kube-apiserver as --authentication-config: JWT issuers,
++	// audiences and claim mappings. Client certificates and ServiceAccount
++	// tokens keep working beside it. kube-apiserver reloads the file when it
++	// changes. The file must not configure anonymous authentication, which
++	// MicroShift already sets with --anonymous-auth.
++	// +kubebuilder:validation:Optional
++	AuthenticationConfig string `json:"authenticationConfig,omitempty"`
++
+ 	// The URL and Port of the API server cannot be changed by the user.
+ 	URL  string `json:"-"`
+ 	Port int    `json:"-"`
+ 
+-	// In dual stack mode, ovnk requires ovn.OVNGatewayInterface to have one IP
+-	// per family or else it wont start. When configuring advertiseAddress,
+-	// whether that is manual or automatic, this IP is configured in that
+-	// bridge afterwards in node package. Since there is only one IP, ovnk will
+-	// return an error complaining about the other IP family for the secondary
+-	// cluster/service network gateway. This variable holds all the different
+-	// IP addresses that ovn.OVNGatewayInterface needs. Note that this IP is
+-	// not configurable by users and it will not be used for apiserver
+-	// advertising because of dual stack limitations there. This is only to
+-	// make ovnk work properly.
++	// AdvertiseAddress, as a list for the code that takes one per family.
+ 	AdvertiseAddresses []string `json:"-"`
+ }
+ 
+diff --git a/etcd/vendor/github.com/openshift/microshift/pkg/config/config.go b/etcd/vendor/github.com/openshift/microshift/pkg/config/config.go
+index 35fafe3a26b3458f5dc4b53022cac220c4f3ebf3..3ecef1bc5d56dcdc73190b2e4ae5133cdce68200 100644
+--- a/etcd/vendor/github.com/openshift/microshift/pkg/config/config.go
++++ b/etcd/vendor/github.com/openshift/microshift/pkg/config/config.go
+@@ -11,6 +11,7 @@ import (
+ 	"net/url"
+ 	"os"
+ 	"os/exec"
++	"path/filepath"
+ 	"slices"
+ 	"strings"
+ 	"time"
+@@ -56,6 +57,8 @@ type Config struct {
+ 	Ingress   IngressConfig `json:"ingress"`
+ 	Storage   Storage       `json:"storage"`
+ 	Telemetry Telemetry     `json:"telemetry"`
++
++	KubeControllerManager KubeControllerManagerConfig `json:"kubeControllerManager"`
+ 	// Settings specified in this section are transferred as-is into the Kubelet config.
+ 	// +kubebuilder:validation:Schemaless
+ 	Kubelet map[string]any `json:"kubelet"`
+@@ -138,7 +141,8 @@ func (c *Config) fillDefaults() error {
+ 	c.Network = Network{
+ 		ServiceNodePortRange: "30000-32767",
+ 		Multus: Multus{
+-			Status: MultusDisabled,
++			Status:           MultusDisabled,
++			GlobalNamespaces: defaultMultusGlobalNamespaces,
+ 		},
+ 	}
+ 	c.Etcd = EtcdConfig{
+@@ -198,6 +202,7 @@ func (c *Config) fillDefaults() error {
+ 	c.Kubelet = nil
+ 	c.GenericDevicePlugin = genericDevicePluginDefaults()
+ 	c.Telemetry = telemetryDefaults()
++	c.KubeControllerManager = kubeControllerManagerDefaults()
+ 	c.DNS = dnsDefaults()
+ 	c.C2CC = C2CC{
+ 		DNS:           C2CCDNS{CacheTTL: ptr.To(10), CacheNegativeTTL: ptr.To(10)},
+@@ -249,6 +254,9 @@ func (c *Config) incorporateUserSettings(u *Config) {
+ 	if u.Network.Multus.Status != "" {
+ 		c.Network.Multus.Status = u.Network.Multus.Status
+ 	}
++	if len(u.Network.Multus.GlobalNamespaces) > 0 {
++		c.Network.Multus.GlobalNamespaces = u.Network.Multus.GlobalNamespaces
++	}
+ 
+ 	if u.Etcd.MemoryLimitMB != 0 {
+ 		c.Etcd.MemoryLimitMB = u.Etcd.MemoryLimitMB
+@@ -290,6 +298,9 @@ func (c *Config) incorporateUserSettings(u *Config) {
+ 	if u.ApiServer.TLS.MinVersion != "" {
+ 		c.ApiServer.TLS.MinVersion = u.ApiServer.TLS.MinVersion
+ 	}
++	if u.ApiServer.AuthenticationConfig != "" {
++		c.ApiServer.AuthenticationConfig = u.ApiServer.AuthenticationConfig
++	}
+ 
+ 	if u.Debugging.LogLevel != "" {
+ 		c.Debugging.LogLevel = u.Debugging.LogLevel
+@@ -398,6 +409,10 @@ func (c *Config) incorporateUserSettings(u *Config) {
+ 	if u.Telemetry.Proxy != "" {
+ 		c.Telemetry.Proxy = u.Telemetry.Proxy
+ 	}
++
++	if u.KubeControllerManager.TerminatedPodGCThreshold != 0 {
++		c.KubeControllerManager.TerminatedPodGCThreshold = u.KubeControllerManager.TerminatedPodGCThreshold
++	}
+ 	if len(u.Ingress.ServingCertificateSecret) != 0 {
+ 		c.Ingress.ServingCertificateSecret = u.Ingress.ServingCertificateSecret
+ 	}
+@@ -541,39 +556,19 @@ func (c *Config) updateComputedValues() error {
+ 	}
+ 	c.Network.DNS = clusterDNS
+ 
+-	// If KAS advertise address configured, we do not want to apply
+-	// the IP to the internal interface.
+-	if c.userSettings != nil && len(c.userSettings.ApiServer.AdvertiseAddress) != 0 {
+-		c.ApiServer.SkipInterface = true
+-	}
+-
+-	// If we have no advertise address, pick one.
++	// The node IP is the apiserver endpoint, as on OpenShift. br-ex holds it
++	// and the shared gateway reaches it from pods, host-network pods and
++	// other nodes; a virtual address off the node's subnet would need a route
++	// on every gateway router. Nothing is added to an interface.
++	c.ApiServer.SkipInterface = true
+ 	if len(c.ApiServer.AdvertiseAddress) == 0 {
+-		// Since the KAS advertise address was not provided we will default to the
+-		// next immediate subnet after the service CIDR. This is due to the fact
+-		// that using the actual apiserver service IP as an endpoint slice breaks
+-		// host network pods trying to reach apiserver, as the VIP 10.43.0.1:443 is
+-		// not translated to 10.43.0.1:6443. It remains unchanged and therefore
+-		// connects to the ingress router instead, triggering all sorts of errors.
+-		ip, err := firstIPFromNextSubnet(c.Network.ServiceNetwork[0])
+-		if err != nil {
+-			return fmt.Errorf("unable to compute AdvertiseAddress: %s", err)
++		c.ApiServer.AdvertiseAddress = c.Node.NodeIP
++		if c.IsIPv4() && c.IsIPv6() &&
++			netutils.IPFamilyOfString(c.Node.NodeIP) != netutils.IPFamilyOfCIDRString(c.Network.ServiceNetwork[0]) {
++			c.ApiServer.AdvertiseAddress = c.Node.NodeIPV6
+ 		}
+-		c.ApiServer.AdvertiseAddress = ip
+ 	}
+-
+-	// Use this variable instead, as we may be in dual stack ip an need to
+-	// configure one extra IP address in the ovn gateway interface. Pick
+-	// the IP family that was not used for the advertise address and add
+-	// the first valid IP for the next subnet.
+ 	c.ApiServer.AdvertiseAddresses = []string{c.ApiServer.AdvertiseAddress}
+-	if c.IsIPv4() && c.IsIPv6() {
+-		ip, err := firstIPFromNextSubnet(c.Network.ServiceNetwork[1])
+-		if err != nil {
+-			return fmt.Errorf("unable to compute secondary address for br-ex: %s", err)
+-		}
+-		c.ApiServer.AdvertiseAddresses = append(c.ApiServer.AdvertiseAddresses, ip)
+-	}
+ 
+ 	c.ApiServer.TLS.UpdateValues()
+ 
+@@ -594,7 +589,14 @@ func (c *Config) validate() error {
+ 	if !isValidIPAddress(c.ApiServer.AdvertiseAddress) {
+ 		return fmt.Errorf("error validating apiServer.advertiseAddress (%q)", c.ApiServer.AdvertiseAddress)
+ 	}
+-	if c.ApiServer.SkipInterface {
++	// kube-apiserver resolves a relative path against its own working
++	// directory, not the config file's.
++	if c.ApiServer.AuthenticationConfig != "" && !filepath.IsAbs(c.ApiServer.AuthenticationConfig) {
++		return fmt.Errorf("apiServer.authenticationConfig must be an absolute path, got %q", c.ApiServer.AuthenticationConfig)
++	}
++	// The node IP default is not checked here, as before it became the
++	// default; a user-set address must already be on the host.
++	if c.ApiServer.SkipInterface && !c.advertisesNodeIP() {
+ 		err := checkAdvertiseAddressConfigured(c.ApiServer.AdvertiseAddress)
+ 		if err != nil {
+ 			return err
+@@ -656,12 +658,6 @@ func (c *Config) validate() error {
+ 		) {
+ 			return fmt.Errorf("subjectAltNames must not contain kubernetes service names")
+ 		}
+-		if stringSliceContains(
+-			c.ApiServer.SubjectAltNames,
+-			c.ApiServer.AdvertiseAddresses...,
+-		) {
+-			return fmt.Errorf("subjectAltNames must not contain apiserver advertise address IPs")
+-		}
+ 	}
+ 
+ 	if c.Etcd.MemoryLimitMB > 0 && c.Etcd.MemoryLimitMB < EtcdMinimumMemoryLimit {
+@@ -670,13 +666,6 @@ func (c *Config) validate() error {
+ 		)
+ 	}
+ 
+-	if c.ApiServer.SkipInterface {
+-		err := checkAdvertiseAddressConfigured(c.ApiServer.AdvertiseAddresses[0])
+-		if err != nil {
+-			return err
+-		}
+-	}
+-
+ 	switch c.Ingress.Status {
+ 	case StatusManaged, StatusRemoved:
+ 	default:
+@@ -726,6 +715,10 @@ func (c *Config) validate() error {
+ 		return fmt.Errorf("error validating telemetry: %v", err)
+ 	}
+ 
++	if err := c.KubeControllerManager.validate(); err != nil {
++		return fmt.Errorf("error validating kubeControllerManager: %v", err)
++	}
++
+ 	if err := c.GenericDevicePlugin.validate(); err != nil {
+ 		return fmt.Errorf("error validating Generic Device Plugin configuration: %v", err)
+ 	}
+@@ -811,6 +804,10 @@ func getAllHostnames() ([]string, error) {
+ 	return allHostnames, nil
+ }
+ 
++func (c *Config) advertisesNodeIP() bool {
++	return c.ApiServer.AdvertiseAddress == c.Node.NodeIP || c.ApiServer.AdvertiseAddress == c.Node.NodeIPV6
++}
++
+ func checkAdvertiseAddressConfigured(advertiseAddress string) error {
+ 	addrs, err := net.InterfaceAddrs()
+ 	if err != nil {
+diff --git a/pkg/config/kubecontrollermanager.go b/etcd/vendor/github.com/openshift/microshift/pkg/config/kubecontrollermanager.go
+similarity index 100%
+copy from pkg/config/kubecontrollermanager.go
+copy to etcd/vendor/github.com/openshift/microshift/pkg/config/kubecontrollermanager.go
+diff --git a/etcd/vendor/github.com/openshift/microshift/pkg/config/multinode.go b/etcd/vendor/github.com/openshift/microshift/pkg/config/multinode.go
+index 37bd5b773fae5fdb1796b6d7ffb5f9cdf05ca47b..7f7d34af868367443b7d292d8712c85335e688b3 100644
+--- a/etcd/vendor/github.com/openshift/microshift/pkg/config/multinode.go
++++ b/etcd/vendor/github.com/openshift/microshift/pkg/config/multinode.go
+@@ -1,14 +1,71 @@
+ package config
+ 
++import (
++	"net"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"k8s.io/klog/v2"
++)
++
+ type MultiNodeConfig struct {
+ 	Enabled bool `json:"enabled"`
++	// only one controlplane node is supported
++	// IP address of control plane node
++	Controlplane string `json:"controlplane"`
++	// Worker runs only the node services; the control plane is remote
++	Worker bool `json:"worker"`
+ }
+ 
+ // ConfigMultiNode populates multinode configurations to Config.MultiNode
+-func ConfigMultiNode(c *Config, enabled bool) *Config {
++func ConfigMultiNode(c *Config, enabled bool, worker bool) *Config {
+ 	if !enabled {
+ 		return c
+ 	}
+ 	c.MultiNode.Enabled = enabled
++	c.MultiNode.Controlplane = c.Node.NodeIP
++	c.MultiNode.Worker = worker
++	if worker {
++		// After a join the marker records the control plane's routable IP
++		// (the default above is this node's own, which is only right on
++		// the control plane itself).
++		if ip := WorkerControlplane(); ip != "" {
++			c.MultiNode.Controlplane = ip
++		}
++	}
+ 	return c
+ }
++
++// WorkerControlplane returns the control plane IP recorded by
++// 'add-node --worker', or "" before a join.
++func WorkerControlplane() string {
++	data, err := os.ReadFile(WorkerMarkerPath())
++	if err != nil {
++		return ""
++	}
++	ip := strings.TrimSpace(string(data))
++	if net.ParseIP(ip) == nil {
++		return ""
++	}
++	return ip
++}
++
++// WorkerMarkerPath is written by 'add-node --worker' so role-agnostic tools
++// (healthcheck, greenboot) can tell a worker from a control plane node.
++func WorkerMarkerPath() string {
++	return filepath.Join(DataDir, "multinode-worker")
++}
++
++func IsWorkerNode() bool {
++	_, err := os.Stat(WorkerMarkerPath())
++	if err == nil {
++		return true
++	}
++	if !os.IsNotExist(err) {
++		// A stat failure that is not "absent" (permission, SELinux) must not
++		// silently flip a worker to the control-plane health path.
++		klog.Warningf("cannot stat worker marker %s, assuming control-plane role: %v", WorkerMarkerPath(), err)
++	}
++	return false
++}
+diff --git a/etcd/vendor/github.com/openshift/microshift/pkg/config/network.go b/etcd/vendor/github.com/openshift/microshift/pkg/config/network.go
+index 192256ba7ed86ad3f5d09d43318b0549be71f63c..4635fe0d1eed02400bd646862cae62c1f66c1533 100644
+--- a/etcd/vendor/github.com/openshift/microshift/pkg/config/network.go
++++ b/etcd/vendor/github.com/openshift/microshift/pkg/config/network.go
+@@ -6,6 +6,7 @@ import (
+ 
+ 	"github.com/apparentlymart/go-cidr/cidr"
+ 	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/apimachinery/pkg/util/validation"
+ )
+ 
+ // CNIPlugin is an enum value that determines whether MicroShift deploys OVNK.
+@@ -44,8 +45,21 @@ type Multus struct {
+ 	// +kubebuilder:validation:Optional
+ 	// +kubebuilder:default=Disabled
+ 	Status MultusStatusEnum `json:"status"`
++
++	// GlobalNamespaces lists the namespaces whose NetworkAttachmentDefinitions
++	// a pod in any namespace may attach to. Any other reference must stay
++	// within the pod's own namespace, as on OpenShift. A non-empty list
++	// replaces the default. Multus reads an empty list as "default", so to
++	// share no namespace, name one no tenant can write to, such as
++	// openshift-multus.
++	// +kubebuilder:validation:Optional
++	// +kubebuilder:default={"default","openshift-multus","openshift-sriov-network-operator","openshift-cnv"}
++	GlobalNamespaces []string `json:"globalNamespaces,omitempty"`
+ }
+ 
++// OpenShift's cluster-network-operator renders Multus with these.
++var defaultMultusGlobalNamespaces = []string{"default", "openshift-multus", "openshift-sriov-network-operator", "openshift-cnv"}
++
+ type Network struct {
+ 	// CNIPlugin is a user defined string value matching one of the above CNI values. MicroShift uses this
+ 	// value to decide whether to deploy the OVN-K as default CNI. An unset field defaults to "" during yaml parsing, and thus
+@@ -132,5 +146,10 @@ func (m Multus) Validate() error {
+ 	if m.Status != MultusEnabled && m.Status != MultusDisabled {
+ 		return fmt.Errorf("invalid multus status: %v", m.Status)
+ 	}
++	for _, ns := range m.GlobalNamespaces {
++		if errs := validation.IsDNS1123Label(ns); len(errs) > 0 {
++			return fmt.Errorf("invalid multus global namespace %q: %v", ns, errs)
++		}
++	}
+ 	return nil
+ }
+diff --git a/etcd/vendor/github.com/openshift/microshift/pkg/util/net.go b/etcd/vendor/github.com/openshift/microshift/pkg/util/net.go
+index ba5c111c95f6c3871cc2c620806f13b7cc06a56b..95de6e3825134b97c339437f146d0e1a702df701 100644
+--- a/etcd/vendor/github.com/openshift/microshift/pkg/util/net.go
++++ b/etcd/vendor/github.com/openshift/microshift/pkg/util/net.go
+@@ -215,9 +215,6 @@ func selectIPFromHostInterface(nodeIP string) (string, error) {
+ 	})
+ 	// get list of interfaces
+ 	for _, i := range ifaces {
+-		if i.Name == "br-ex" {
+-			continue
+-		}
+ 		addrs, err := i.Addrs()
+ 		if err != nil {
+ 			klog.Warningf("failed to get IPs for interface %s: %v", i.Name, err)
+@@ -229,7 +226,9 @@ func selectIPFromHostInterface(nodeIP string) (string, error) {
+ 			if err != nil {
+ 				return "", fmt.Errorf("unable to parse CIDR for interface %q: %s", i.Name, err)
+ 			}
+-			if ip.IsLoopback() {
++			// br-ex holds the node IP with OVN-K's link-local masquerade
++			// addresses beside it.
++			if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+ 				continue
+ 			}
+ 			if nodeIP != "" && nodeIP != ip.String() {

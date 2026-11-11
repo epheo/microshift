@@ -287,6 +287,10 @@ applies (`git am --3way`, with the old base fetched for the 3-way merge):
 resolve, `git am --continue`, then `export`. CI keeps applying with plain
 `git apply`, so a patch that only applies by 3-way still fails the build.
 
+microshift-etcd builds against its own vendored copy of MicroShift's `pkg/`.
+The last patch regenerates it (`go mod vendor` in `etcd/`): redo it whenever
+a patch changes `pkg/config` or `pkg/util`, or etcd runs on stale config code.
+
 `export` writes a file that is mostly an upstream file as a copy plus hunks
 (`--find-copies-harder -C75%`): the zones DaemonSet in `patches/0008` is
 upstream's single-node master DaemonSet with the zone changes on top, so

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Thibaut Lapierre <root@epheo.eu>
 Date: Tue, 10 Nov 2026 22:26:39 +0100
-Subject: [PATCH 15/15] ovn: shared gateway, the node IP as apiserver endpoint
+Subject: [PATCH 15/16] ovn: shared gateway, the node IP as apiserver endpoint
 
 OVN-Kubernetes runs in shared gateway mode with the node's NIC in br-ex,
 OpenShift's topology: the image's configure-ovs moves the uplink and its
