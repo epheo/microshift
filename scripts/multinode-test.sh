@@ -81,6 +81,10 @@ node_journals() { # node_journals <exec-fn> <name>
     echo "### ${name}: journalctl -u microshift (this boot) ###"
     ${fn} journalctl -u microshift --no-pager -b 2>&1
     diag_ovs_journals "${fn}" "${name}"
+    echo "### ${name}: journalctl -u firewalld (this boot) ###"
+    ${fn} journalctl -u firewalld --no-pager -b 2>&1 | tail -100
+    echo "### ${name}: journal tail, all units ###"
+    ${fn} journalctl --no-pager -b -n 400 2>&1
 }
 
 # Short enough that both nodes' worth goes to the job log verbatim.
