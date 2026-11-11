@@ -666,6 +666,20 @@ for t in "${IP2} 10250" "${IP2} 22" "${IP1} 10250"; do
     # shellcheck disable=SC2086
     uw "worker-deny-${t// /-}" mn_expect no uw-p1 b ${t} "${t} from a worker under the API-only ANP"
 done
+# Whether the worker pod's UDN port is in the ANP's port groups on node2.
+anp_diag() {
+    local n2 nb
+    n2="$(koc -n openshift-ovn-kubernetes get pods -l app=ovnkube-node --field-selector spec.nodeName=node2 \
+        -o jsonpath='{.items[0].metadata.name}')"
+    nb=(koc -n openshift-ovn-kubernetes exec "${n2}" -c nbdb -- ovn-nbctl --no-leader-only)
+    echo "== node2 port groups (name, external_ids, ports):" >&2
+    "${nb[@]}" --format=csv --data=bare --no-headings --columns=name,external_ids,ports list Port_Group \
+        | grep -i -e anp -e admin | cut -c1-400 >&2 || true
+    echo "== node2 ports of uw-p1/b (uuid, name):" >&2
+    "${nb[@]}" --format=csv --data=bare --no-headings --columns=_uuid,name list Logical_Switch_Port \
+        | grep 'uw-p1_b' >&2 || true
+}
+case "${uw_failed}" in *worker-deny*) anp_diag ;; esac
 koc delete adminnetworkpolicy uw-api-only >/dev/null
 
 # Ask 5 across nodes: a LoadBalancer with externalTrafficPolicy Local, its one
@@ -893,7 +907,7 @@ edge_mac="$(koc -n uw-edge exec edge -- cat /sys/class/net/net1/address)"
 n1_ovnk="$(koc -n openshift-ovn-kubernetes get pods -l app=ovnkube-node --field-selector spec.nodeName=node1 -o jsonpath='{.items[0].metadata.name}')"
 edge_ps="$(koc -n openshift-ovn-kubernetes exec "${n1_ovnk}" -c nbdb -- ovn-nbctl --no-leader-only \
     --format=csv --data=bare --no-headings --columns=name,port_security list Logical_Switch_Port 2>/dev/null \
-    | grep 'uw-edge_edge' || true)"
+    | grep 'uw-edge_edge' | grep -F "${EDGE_T}" || true)"
 log "observe: edge transit port: ${edge_ps}"
 case "${edge_ps}" in *"${edge_mac} ${EDGE_T}"*) ;; *)
     echo "ERROR: the edge's transit port does not pin ${edge_mac} ${EDGE_T}: '${edge_ps}'" >&2

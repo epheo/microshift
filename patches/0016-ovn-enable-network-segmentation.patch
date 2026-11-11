@@ -42,19 +42,19 @@ kubelet readiness probe passes into one, an IPAMClaim keeps a pod's
 address across a recreate) and multinode-test (a primary CUDN spans
 nodes).
 ---
- .../ovn/common/clusterrole-controller.yaml    | 57 +++++++++++++++++++
- assets/components/ovn/common/configmap.yaml   | 10 ++++
- .../ovn/single-node/master/daemonset.yaml     | 25 +++++++-
+ .../ovn/common/clusterrole-controller.yaml    | 65 +++++++++++++++++++
+ assets/components/ovn/common/configmap.yaml   | 10 +++
+ .../ovn/single-node/master/daemonset.yaml     | 25 ++++++-
  .../ovn/zones/master/daemonset.yaml           | 12 +++-
- .../components/ovn/zones/node/daemonset.yaml  | 19 +++++++
+ .../components/ovn/zones/node/daemonset.yaml  | 19 ++++++
  pkg/assets/crd.go                             |  3 +
- 6 files changed, 124 insertions(+), 2 deletions(-)
+ 6 files changed, 132 insertions(+), 2 deletions(-)
 
 diff --git a/assets/components/ovn/common/clusterrole-controller.yaml b/assets/components/ovn/common/clusterrole-controller.yaml
-index 8aaa4e18682cacd85e3abbbcca12f768906df4af..5ff087fe8fae2d39b14d662ecfd1cd847eb1552e 100644
+index 8aaa4e18682cacd85e3abbbcca12f768906df4af..290b77313f97fdecf94812ba3ac1e073ed421894 100644
 --- a/assets/components/ovn/common/clusterrole-controller.yaml
 +++ b/assets/components/ovn/common/clusterrole-controller.yaml
-@@ -177,3 +177,60 @@ rules:
+@@ -177,3 +177,68 @@ rules:
    - egressfirewalls/status
    verbs:
    - patch
@@ -100,6 +100,14 @@ index 8aaa4e18682cacd85e3abbbcca12f768906df4af..5ff087fe8fae2d39b14d662ecfd1cd84
 +  - create
 +  - update
 +  - delete
++# The mirrored slices are owned by their Service (blockOwnerDeletion), which
++# the apiserver only lets a client set with update on services/finalizers:
++# without it every mirror is forbidden. OpenShift's control plane holds it.
++- apiGroups: [""]
++  resources:
++  - services/finalizers
++  verbs:
++  - update
 +# --enable-persistent-ips: the cluster manager records each claimed address
 +# in the IPAMClaim's status, so a VM keeps it across restarts and migrations.
 +- apiGroups: ["k8s.cni.cncf.io"]

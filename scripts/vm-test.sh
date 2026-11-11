@@ -1431,6 +1431,24 @@ for port in 18080 6443 10250 22; do
     rec "node-${port}" expect yes udn-1 client "${node_ip}" "${port}" "node port ${port} from a primary network, no policy"
 done
 rec node-18080-udn2 expect yes udn-2 client "${node_ip}" 18080 "the node from another primary network, no policy"
+# Where a primary-network pod's connect to its own node stops: the packets
+# on the node during one attempt, and the host's routes and rules for it.
+udn_node_diag() {
+    local cap
+    cap="$(mktemp)"
+    koc -n openshift-ovn-kubernetes exec ds/ovnkube-node -c ovnkube-controller -- \
+        timeout 15 tcpdump -nni any -c 16 'tcp port 18080' > "${cap}" 2>&1 &
+    sleep 3
+    reach udn-1 client "${node_ip}" 18080 || true
+    wait
+    echo "== on the node, tcp port 18080, during a connect from udn-1/client:" >&2
+    cat "${cap}" >&2
+    rm -f "${cap}"
+    vssh sh -c 'ip rule; ip route show table all | grep -e 169.254.0 -e 10.200.1 | head -20
+        nft list ruleset | grep -n -i -e udn -e 169.254.0 | head -40
+        firewall-cmd --get-active-zones' >&2 || true
+}
+case "${udn_failed}" in *node-18080*) udn_node_diag ;; esac
 
 # Ask 1: AdminNetworkPolicy egress Deny through networks and nodes peers.
 for peer in "networks: [\"${node_ip}/32\"]" "nodes: {matchExpressions: [{key: kubernetes.io/hostname, operator: Exists}]}"; do
