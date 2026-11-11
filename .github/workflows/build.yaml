@@ -165,6 +165,9 @@ jobs:
       - name: Build the image
         uses: ./.github/actions/build-image
 
+      - name: Build the CI tools image (QEMU, dnsmasq)
+        run: make ci-tools PODMAN="sudo podman"
+
       - name: Resolve version string
         id: meta
         run: |
@@ -216,7 +219,7 @@ jobs:
       - name: Save the image for the test lanes
         run: |
           set -euo pipefail
-          sudo podman save epheo-microshift | zstd -T0 -3 -q -o /tmp/candidate.tar.zst
+          sudo podman save -m epheo-microshift epheo-ci-tools | zstd -T0 -3 -q -o /tmp/candidate.tar.zst
           du -h /tmp/candidate.tar.zst
 
       - name: Upload the image for the test lanes
@@ -404,8 +407,6 @@ jobs:
 
       - name: Prepare the runner for VMs
         uses: ./.github/actions/vm-host
-        with:
-          dnsmasq: "true"
 
       - name: Two-VM worker join test
         run: make multinode-test

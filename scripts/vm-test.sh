@@ -35,7 +35,8 @@
 # is installed again and the suite runs on it as usual.
 #
 # Requires root-capable podman (bootc-image-builder is a privileged container
-# reading the root containers-storage) and qemu-system-x86_64. Uses KVM when
+# reading the root containers-storage) and qemu-system-x86_64, or QEMU_IMAGE
+# (scripts/lib-qemu.sh). Uses KVM when
 # /dev/kvm exists, falls back to TCG (slow) otherwise. Upgrade mode also
 # needs jq on the host.
 #
@@ -50,6 +51,7 @@ ROLLBACK="${ROLLBACK:-}"
 USHIFT_GITREF="${USHIFT_GITREF:-$(sed -n 's/^USHIFT_GITREF=//p' "$(dirname "$0")/../versions.env")}"
 . "$(dirname "$0")/lib-diag.sh"
 . "$(dirname "$0")/lib-settle.sh"
+. "$(dirname "$0")/lib-qemu.sh"
 WORKDIR="${WORKDIR:-/tmp/epheo-microshift-vm${UPGRADE_FROM:+-upgrade}}"
 SSH_PORT="${SSH_PORT:-2222}"
 VM_MEM="${VM_MEM:-8192}"
@@ -288,7 +290,7 @@ NET_RESTRICT="restrict=on,"
 [ -n "${UPGRADE_FROM}" ] && NET_RESTRICT=""
 log "booting VM (accel=${ACCEL}) with a secondary disk for the storage VG"
 sudo truncate --size=2G "${WORKDIR}/lvm-disk.raw"
-sudo qemu-system-x86_64 \
+qemu_start "${WORKDIR}/qemu.pid" \
     -machine "accel=${ACCEL}" -cpu max -smp "$(nproc)" -m "${VM_MEM}" \
     -drive "file=${DISK},if=virtio,format=qcow2" \
     -drive "file=${WORKDIR}/lvm-disk.raw,if=virtio,format=raw" \
@@ -296,7 +298,7 @@ sudo qemu-system-x86_64 \
     -device virtio-net-pci,netdev=n0 \
     -device virtio-rng-pci \
     -serial "file:${WORKDIR}/console.log" \
-    -display none -daemonize -pidfile "${WORKDIR}/qemu.pid"
+    -display none
 QEMU_PID="$(sudo cat "${WORKDIR}/qemu.pid")"
 
 wait_for 600 "ssh into the VM" vssh true

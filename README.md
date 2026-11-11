@@ -144,7 +144,9 @@ iteration.
 CI builds the image once per commit; `vm-test`, both upgrade lanes,
 `multinode-test` and `smoke` (the image booted as a plain privileged podman
 container, as dotvirt's CI runs it) then run in parallel on it, and
-publishing waits for all of them. The RPM stages are reused from cache while their inputs (pins,
+publishing waits for all of them. The VM lanes take QEMU and dnsmasq from a
+Fedora image built with the candidate (`make ci-tools`), nothing from the
+runner's Ubuntu packages. The RPM stages are reused from cache while their inputs (pins,
 `patches/`, their Containerfiles and scripts, the buildroot image) are
 unchanged.
 

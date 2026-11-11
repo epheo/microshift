@@ -115,6 +115,11 @@ rpm-cache-load:
 	printf 'FROM %s\nCOPY . /home/microshift/microshift/\n' "$(BUILDROOT_IMAGE)" | \
 	    $(PODMAN) build --pull=never -t "$(RPM_IMAGE)" -f - "$(RPM_CACHE)"
 
+# QEMU and dnsmasq for the VM tests in CI (scripts/lib-qemu.sh).
+.PHONY: ci-tools
+ci-tools:
+	$(PODMAN) build --pull=$(PULL) -t epheo-ci-tools -f packaging/ci-tools.Containerfile packaging
+
 .PHONY: smoke
 smoke:
 	DIST_IMAGE="$(DIST_IMAGE)" ./scripts/smoke-test.sh

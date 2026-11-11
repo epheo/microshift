@@ -8,8 +8,8 @@
 # greenboot health checks green on both roles. Then the controller takes an
 # update from a registry on the host and the worker must follow it.
 #
-# Requires root-capable podman, qemu-system-x86_64, dnsmasq, and sudo
-# for the bridge/taps. Runner-sized: two 5GB VMs.
+# Requires root-capable podman, qemu-system-x86_64 and dnsmasq (or
+# QEMU_IMAGE, scripts/lib-qemu.sh), and sudo for the bridge/taps. Runner-sized: two 5GB VMs.
 #
 # Usage: DIST_IMAGE=ghcr.io/epheo/microshift:latest ./scripts/multinode-test.sh
 set -euo pipefail
@@ -31,6 +31,7 @@ REG="${NET}.1:5000"
 KEEP="${KEEP:-0}"
 . "$(dirname "$0")/lib-diag.sh"
 . "$(dirname "$0")/lib-settle.sh"
+. "$(dirname "$0")/lib-qemu.sh"
 
 log() { echo "--- $*"; }
 die() { echo "FAIL: $*" >&2; exit 1; }
@@ -60,10 +61,9 @@ host_net_up() {
         sudo ip tuntap add "${t}" mode tap 2>/dev/null || true
         sudo ip link set "${t}" master "${BR}" up
     done
-    sudo dnsmasq --interface="${BR}" --bind-interfaces --except-interface=lo \
+    dnsmasq_start "${WORKDIR}/dnsmasq.pid" --interface="${BR}" --bind-interfaces --except-interface=lo \
         --dhcp-range="${NET}.10,${NET}.50,12h" \
-        --dhcp-host="${MAC1},${IP1}" --dhcp-host="${MAC2},${IP2}" \
-        --pid-file="${WORKDIR}/dnsmasq.pid" || die "dnsmasq failed to start"
+        --dhcp-host="${MAC1},${IP1}" --dhcp-host="${MAC2},${IP2}" || die "dnsmasq failed to start"
 }
 
 host_net_down() {
@@ -236,7 +236,7 @@ boot_vm() { # boot_vm <n> <disk> <mac> <tap>
     # Secondary disk: VG myvg1 with thin pool thin, which the controller
     # declares as its r-drbd Pool by itself.
     sudo truncate --size=16G "${WORKDIR}/lvm-disk${n}.raw"
-    sudo qemu-system-x86_64 \
+    qemu_start "${WORKDIR}/qemu${n}.pid" \
         -machine "accel=${accel}" -cpu max -smp 4 -m "${VM_MEM}" \
         -drive "file=${disk},if=virtio,format=qcow2" \
         -drive "file=${WORKDIR}/lvm-disk${n}.raw,if=virtio,format=raw" \
@@ -244,7 +244,7 @@ boot_vm() { # boot_vm <n> <disk> <mac> <tap>
         -device "virtio-net-pci,netdev=n0,mac=${mac}" \
         -device virtio-rng-pci \
         -serial "file:${WORKDIR}/console${n}.log" \
-        -display none -daemonize -pidfile "${WORKDIR}/qemu${n}.pid"
+        -display none
 }
 
 log "booting two VMs"
