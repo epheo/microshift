@@ -1329,11 +1329,12 @@ if vssh curl -fsS -o /dev/null --max-time 3 "http://${probed_ip}:8080/"; then
 fi
 
 # How an edge reaches a Service inside a primary network (Uniwatt ask 5): a
-# LoadBalancer with externalTrafficPolicy Local, on the port QEMU forwards
-# from the runner. The pod must see the client's own address, the slirp
-# gateway: the edge's PROXY v2 trust check depends on it. ClusterIP and
-# NodePort from the host and the default network stay logged, not asserted.
-# NodePort and LoadBalancer traffic meets OVN on br-ex before firewalld.
+# LoadBalancer with externalTrafficPolicy Local whose NodePort is the port
+# QEMU forwards from the runner. The pod must see the client's own address,
+# the slirp gateway: the edge's PROXY v2 trust check depends on it.
+# multinode-test shows the same through a worker's NodePort. ClusterIP,
+# NodePort and the LoadBalancer port from the host and the default network
+# stay logged, not asserted. This traffic meets OVN on br-ex before firewalld.
 koc apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Service
@@ -1346,25 +1347,26 @@ spec:
   selector:
     app: server
   ports:
-  - port: 30480
+  - port: 30482
     targetPort: 8080
-    nodePort: 30481
+    nodePort: 30480
 EOF
 svc_ip="$(koc -n udn-1 get service server -o jsonpath='{.spec.clusterIP}')"
-node_port=30481
-expect yes udn-1 client "${svc_ip}" 30480 "its own Service" || udn_failed="${udn_failed} own-service"
+node_port=30480
+expect yes udn-1 client "${svc_ip}" 30482 "its own Service" || udn_failed="${udn_failed} own-service"
 node_get() { vssh curl -fsS -o /dev/null --max-time 3 "http://$1/"; }
-log "observe: UDN Service ClusterIP from the host network: $(observe node_get "${svc_ip}:30480")"
-log "observe: UDN Service ClusterIP from the default network: $(observe reach default l2test-probe "${svc_ip}" 30480)"
+log "observe: UDN Service ClusterIP from the host network: $(observe node_get "${svc_ip}:30482")"
+log "observe: UDN Service ClusterIP from the default network: $(observe reach default l2test-probe "${svc_ip}" 30482)"
 log "observe: UDN Service NodePort from the host network: $(observe node_get "${node_ip}:${node_port}")"
 log "observe: UDN Service NodePort from the default network: $(observe reach default l2test-probe "${node_ip}" "${node_port}")"
 lb_assigned() { [ -n "$(koc -n udn-1 get service server -o jsonpath='{.status.loadBalancer.ingress[0].ip}')" ]; }
 outside_get() { curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:${NODEPORT_FWD}/from-outside"; }
-log "assert: a LoadBalancer with externalTrafficPolicy Local keeps an outside client's address"
+log "assert: externalTrafficPolicy Local keeps an outside client's address through the NodePort"
 if ! wait_for 60 "the LoadBalancer Service an ingress address" lb_assigned; then
     udn_failed="${udn_failed} lb-ingress"
-elif ! wait_for 60 "the LoadBalancer from outside the node" outside_get; then
-    udn_failed="${udn_failed} lb-outside"
+elif ! { log "observe: the LoadBalancer port from the host network: $(observe node_get "${node_ip}:30482")"
+        wait_for 60 "the NodePort from outside the node" outside_get; }; then
+    udn_failed="${udn_failed} nodeport-outside"
 else
     seen="$(koc -n udn-1 logs server | awk '/GET \/from-outside/ {print $1}' | sort -u | xargs)"
     log "observe: udn-1/server saw the outside client as: ${seen}"
