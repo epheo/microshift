@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Thibaut Lapierre <root@epheo.eu>
 Date: Wed, 11 Nov 2026 01:08:37 +0100
-Subject: [PATCH 16/16] etcd: vendor the patched microshift packages
+Subject: [PATCH 18/18] etcd: vendor the patched microshift packages
 
 microshift-etcd builds against its own vendored copy of MicroShift's
 pkg/config and pkg/util, which the series' changes did not reach. With
@@ -11,12 +11,13 @@ isolated network. Regenerated with go mod vendor in etcd/; rerun it last
 whenever a patch changes those packages.
 ---
  .../microshift/pkg/config/apiserver.go        | 33 +++----
- .../openshift/microshift/pkg/config/config.go | 85 +++++++++----------
+ .../openshift/microshift/pkg/config/config.go | 87 +++++++++----------
  .../pkg}/config/kubecontrollermanager.go      |  0
  .../microshift/pkg/config/multinode.go        | 59 ++++++++++++-
- .../microshift/pkg/config/network.go          | 19 +++++
+ .../microshift/pkg/config/network.go          | 19 ++++
+ .../openshift/microshift/pkg/util/cert.go     |  2 +-
  .../openshift/microshift/pkg/util/net.go      |  7 +-
- 6 files changed, 138 insertions(+), 65 deletions(-)
+ 7 files changed, 140 insertions(+), 67 deletions(-)
  copy {pkg => etcd/vendor/github.com/openshift/microshift/pkg}/config/kubecontrollermanager.go (100%)
 
 diff --git a/etcd/vendor/github.com/openshift/microshift/pkg/config/apiserver.go b/etcd/vendor/github.com/openshift/microshift/pkg/config/apiserver.go
@@ -79,7 +80,7 @@ index 8d31d1bc61607c817027e1b0dc4d680de51e7010..c2b24b0af8f838bb19c44c04d659b928
  }
  
 diff --git a/etcd/vendor/github.com/openshift/microshift/pkg/config/config.go b/etcd/vendor/github.com/openshift/microshift/pkg/config/config.go
-index 35fafe3a26b3458f5dc4b53022cac220c4f3ebf3..3ecef1bc5d56dcdc73190b2e4ae5133cdce68200 100644
+index 35fafe3a26b3458f5dc4b53022cac220c4f3ebf3..5800d8def9eb04d5d64b9740f362572ce5e96693 100644
 --- a/etcd/vendor/github.com/openshift/microshift/pkg/config/config.go
 +++ b/etcd/vendor/github.com/openshift/microshift/pkg/config/config.go
 @@ -11,6 +11,7 @@ import (
@@ -90,6 +91,15 @@ index 35fafe3a26b3458f5dc4b53022cac220c4f3ebf3..3ecef1bc5d56dcdc73190b2e4ae5133c
  	"slices"
  	"strings"
  	"time"
+@@ -41,7 +42,7 @@ var (
+ 		"169.254.0.0/16",
+ 		"::1/128",
+ 		"fe80::/10",
+-		"fd69::/125",
++		"fd69::/112",
+ 	}
+ )
+ 
 @@ -56,6 +57,8 @@ type Config struct {
  	Ingress   IngressConfig `json:"ingress"`
  	Storage   Storage       `json:"storage"`
@@ -388,6 +398,19 @@ index 192256ba7ed86ad3f5d09d43318b0549be71f63c..4635fe0d1eed02400bd646862cae62c1
 +	}
  	return nil
  }
+diff --git a/etcd/vendor/github.com/openshift/microshift/pkg/util/cert.go b/etcd/vendor/github.com/openshift/microshift/pkg/util/cert.go
+index a64bfe5c4ed56c58a08ce4d8520002bbceb0a6a7..a3c7ccf9fbeb53ad2203d8f0b93cbfbbff510adf 100644
+--- a/etcd/vendor/github.com/openshift/microshift/pkg/util/cert.go
++++ b/etcd/vendor/github.com/openshift/microshift/pkg/util/cert.go
+@@ -181,7 +181,7 @@ func VerifyAllowedSNI(advertiseAddress string, clusterNetwork []string, serviceN
+ 	} else {
+ 		if ContainIPANetwork(ipAddress, clusterNetwork) ||
+ 			ContainIPANetwork(ipAddress, serviceNetwork) ||
+-			ContainIPANetwork(ipAddress, []string{"127.0.0.1/8", "169.254.169.2/29", "::1/128", "fe80::/10", "fd69::/125"}) ||
++			ContainIPANetwork(ipAddress, []string{"127.0.0.1/8", "169.254.0.0/17", "::1/128", "fe80::/10", "fd69::/112"}) ||
+ 			advertiseAddress == ipAddress.String() {
+ 			return false
+ 		}
 diff --git a/etcd/vendor/github.com/openshift/microshift/pkg/util/net.go b/etcd/vendor/github.com/openshift/microshift/pkg/util/net.go
 index ba5c111c95f6c3871cc2c620806f13b7cc06a56b..95de6e3825134b97c339437f146d0e1a702df701 100644
 --- a/etcd/vendor/github.com/openshift/microshift/pkg/util/net.go

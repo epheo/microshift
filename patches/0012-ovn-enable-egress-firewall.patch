@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Thibaut Lapierre <root@epheo.eu>
 Date: Tue, 10 Nov 2026 11:35:07 +0100
-Subject: [PATCH 12/16] ovn: enable egress firewall
+Subject: [PATCH 12/18] ovn: enable egress firewall
 
 enable-egress-firewall=true, the EgressFirewall CRD in MicroShift's CRD
 list so it exists before OVN-K starts, and the cluster manager's right to

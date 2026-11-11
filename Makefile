@@ -92,13 +92,14 @@ rpms-out:
 	$(PODMAN) cp "$$cid:/home/microshift/microshift/_output/rpmbuild/RPMS/." "$$outdir" && \
 	echo "RPMs are available in '$$outdir'"
 
-# CI's RPM cache (scripts/rpm-cache-key.sh). The image stage takes only the
-# RPM repo and the rshared unit from the RPM image, and `make version` reads
-# version.txt there: the cache keeps those, and a stand-in image on the
-# buildroot serves them. A new COPY --from=builder in bootc.Containerfile
-# must be added here, or a cached build fails on it.
+# CI's RPM cache (scripts/rpm-cache-key.sh). From the RPM image, the image
+# stage takes the RPM repo and the rshared unit, the ovnkube stage the release
+# JSON, and `make version` reads version.txt: the cache keeps those, and a
+# stand-in image on the buildroot serves them. A new read of the RPM image in
+# bootc.Containerfile must be added here, or a cached build fails on it.
 RPM_CACHE ?= /tmp/epheo-microshift-rpm-cache
-RPM_CACHE_PATHS := _output/rpmbuild/RPMS packaging/imagemode/systemd/microshift-make-rshared.service
+RPM_CACHE_PATHS := _output/rpmbuild/RPMS packaging/imagemode/systemd/microshift-make-rshared.service \
+    assets/release/release-x86_64.json
 
 .PHONY: rpm-cache-save
 rpm-cache-save:
