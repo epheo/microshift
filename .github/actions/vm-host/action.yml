@@ -1,9 +1,7 @@
 name: Prepare the runner for VMs
-description: KVM for every user and qemu; dnsmasq for the tests that run their own on a bridge.
-inputs:
-  dnsmasq:
-    description: Install dnsmasq, with its global service off
-    default: "false"
+description: >-
+  KVM for every user, and QEMU and dnsmasq from the Fedora-based CI tools
+  image (scripts/lib-qemu.sh) instead of the runner's Ubuntu packages.
 runs:
   using: composite
   steps:
@@ -15,41 +13,10 @@ runs:
         sudo udevadm control --reload-rules
         sudo udevadm trigger --name-match=kvm
 
-    - name: Install qemu
+    - name: QEMU and dnsmasq from the CI tools image
       shell: bash
-      env:
-        DNSMASQ: ${{ inputs.dnsmasq }}
       run: |
         set -euo pipefail
-        pkgs="qemu-system-x86"
-        [ "${DNSMASQ}" = "true" ] && pkgs="${pkgs} dnsmasq"
-        # Ubuntu's own sources only: the runner's third-party repos can stall
-        # an update as well. The loop below rewrites this copy.
-        srcs="$(mktemp -d)"
-        sudo cp /etc/apt/sources.list.d/ubuntu.sources "${srcs}/"
-        apt_opts=(-q -o Acquire::http::Timeout=15 -o Acquire::Retries=1
-          -o Dir::Etc::SourceList=/dev/null -o Dir::Etc::SourceParts="${srcs}")
-        # No recommends: the tests run QEMU with -display none, and the
-        # recommends pull ~90 desktop packages (pipewire, SDL, VTE).
-        apt_install() {
-          sudo timeout 180 apt-get "${apt_opts[@]}" update &&
-            # shellcheck disable=SC2086
-            sudo timeout 300 apt-get "${apt_opts[@]}" install -y --no-install-recommends ${pkgs}
-        }
-        # The runners' Azure mirror and Canonical's archive both stalled on
-        # 2026-11-11 (every package timed out for hours); kernel.org's mirror
-        # sits on another CDN. The image's own sources come first.
-        for mirror in "" http://mirrors.edge.kernel.org/ubuntu/ http://archive.ubuntu.com/ubuntu/; do
-          if [ -n "${mirror}" ]; then
-            echo "::warning::apt failed; retrying on ${mirror}"
-            sudo sed -i -E "s#^URIs: .*#URIs: ${mirror}#" "${srcs}/ubuntu.sources"
-          fi
-          if apt_install; then installed=1; break; fi
-        done
-        [ -n "${installed:-}" ] || { echo "::error::no Ubuntu mirror served ${pkgs}"; exit 1; }
-        if [ "${DNSMASQ}" = "true" ]; then
-          # ubuntu's dnsmasq wants to run globally; the test runs its own
-          # instance on the bridge.
-          sudo systemctl stop dnsmasq 2>/dev/null || true
-          sudo systemctl disable dnsmasq 2>/dev/null || true
-        fi
+        # build.yaml's lanes load it with the candidate; other workflows build it.
+        sudo podman image exists epheo-ci-tools || make ci-tools PODMAN="sudo podman"
+        echo "QEMU_IMAGE=localhost/epheo-ci-tools:latest" >> "${GITHUB_ENV}"

@@ -130,7 +130,7 @@ ${ok} || { echo "ERROR: microshift.service did not become active" >&2; exit 1; }
 log "waiting for the node to be Ready (up to 5m)"
 ok=false
 for _ in $(seq 60); do
-    if koc get node 2>/dev/null | grep -q ' Ready '; then ok=true; break; fi
+    if koc get node 2>/dev/null | grep ' Ready ' >/dev/null; then ok=true; break; fi
     sleep 5
 done
 ${ok} || { echo "ERROR: node never became Ready" >&2; exit 1; }
@@ -146,24 +146,26 @@ done
 ${ok} || { echo "ERROR: pods did not settle (total=${total} not-ready=${bad})" >&2; exit 1; }
 
 # --- 4. Assert the distribution's opinions ----------------------------------
+# grep without -q: under pipefail an early exit on the first match fails
+# podman exec's write and with it the check (exit 2, CI 2026-11-11).
 log "assert: OVN-Kubernetes is the CNI"
-koc -n openshift-ovn-kubernetes get pods --no-headers | grep -q Running
+koc -n openshift-ovn-kubernetes get pods --no-headers | grep Running >/dev/null
 
 log "assert: enable-multi-network=true is native in ovnkube-config"
 koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkube\.conf}' \
-    | grep -q 'enable-multi-network=true'
+    | grep 'enable-multi-network=true' >/dev/null
 
 # OVN waits for this CRD at start: Running ovnkube pods above already prove
 # the CRD manager applied it first.
 log "assert: MultiNetworkPolicy is on (flag and CRD)"
 koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkube\.conf}' \
-    | grep -q 'enable-multi-networkpolicy=true'
+    | grep 'enable-multi-networkpolicy=true' >/dev/null
 koc wait --for=condition=Established --timeout=60s \
     crd/multi-networkpolicies.k8s.cni.cncf.io >/dev/null
 
 log "assert: AdminNetworkPolicy is on (flag and CRDs)"
 koc -n openshift-ovn-kubernetes get cm ovnkube-config -o jsonpath='{.data.ovnkube\.conf}' \
-    | grep -q 'enable-admin-network-policy=true'
+    | grep 'enable-admin-network-policy=true' >/dev/null
 koc wait --for=condition=Established --timeout=60s \
     crd/adminnetworkpolicies.policy.networking.k8s.io \
     crd/baselineadminnetworkpolicies.policy.networking.k8s.io >/dev/null
@@ -172,10 +174,10 @@ log "assert: multus is deployed"
 koc -n openshift-multus get daemonset multus --no-headers >/dev/null
 
 log "assert: r-drbd is running"
-koc -n r-drbd-system get pods --no-headers | grep -q Running
+koc -n r-drbd-system get pods --no-headers | grep Running >/dev/null
 
 log "assert: embedded portail image was imported into cri-o at boot"
-pexec crictl images | grep -q 'localhost/embedded/portail'
+pexec crictl images | grep 'localhost/embedded/portail' >/dev/null
 
 # #12: an OS upgrade can ship a new image under the same tag. Simulate it by
 # re-pointing the portail tag at a payload image; the import must restore it.

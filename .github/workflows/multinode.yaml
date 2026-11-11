@@ -25,8 +25,6 @@ jobs:
 
       - name: Prepare the runner for VMs
         uses: ./.github/actions/vm-host
-        with:
-          dnsmasq: "true"
 
       - name: Multinode test
         run: make multinode-test DIST_IMAGE="${{ inputs.image }}"
