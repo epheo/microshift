@@ -1,7 +1,7 @@
 #!/bin/bash
 # Print the key CI caches the srpm and rpm stages' output under. It changes
 # with anything those stages read:
-# - their make recipes and the pins they pass;
+# - their make recipes, the pins they pass, and the paths the cache keeps;
 # - every file their Containerfiles COPY, read from the Containerfiles, so a
 #   new COPY is keyed without editing this script;
 # - the buildroot image as pulled, since its tag moves;
@@ -34,7 +34,9 @@ files="$(inputs)"
 sums="$(sha256sum ${files})"
 
 {
-    sed -n '/^srpm:/,/^$/p; /^rpm:/,/^$/p' Makefile
+    # What the cache keeps is part of the key: a path added later must not
+    # restore an entry saved without it.
+    sed -n '/^srpm:/,/^$/p; /^rpm:/,/^$/p; /^RPM_CACHE_PATHS/,/[^\\]$/p' Makefile
     for v in USHIFT_GIT_URL USHIFT_GITREF OKD_VERSION_TAG OKD_RELEASE_IMAGE BUILDROOT_IMAGE; do
         echo "${v}=${!v}"
     done
