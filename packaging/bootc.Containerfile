@@ -320,8 +320,10 @@ RUN if systemctl list-unit-files bootc-publish-rhsm-facts.service >/dev/null 2>&
 # Base-image daemons a headless, air-gapped-by-default node has no use for.
 # fwupd-refresh pulls LVFS metadata from the internet daily, and fwupd's bluez
 # and UEFI plugins dbus-activate bluetoothd and udisksd along the way.
+# rpm-ostree-countme reports to the CentOS mirrors weekly, at a random time,
+# and fails without them: a failed unit on every air-gapped node.
 # Masked, not disabled: disable does not stop dbus activation.
-RUN systemctl mask bluetooth.service fwupd-refresh.timer
+RUN systemctl mask bluetooth.service fwupd-refresh.timer rpm-ostree-countme.timer
 
 # Guard: a second kernel in the image breaks bootc install at deploy time —
 # fail the build here instead.
