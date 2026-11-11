@@ -508,6 +508,462 @@ koc -n mn-udn exec mn-udn-node2 -- python3 -c \
     "import socket; print(socket.getaddrinfo('kubernetes.default.svc.cluster.local', 443)[0][4][0])" \
     | grep -q '10\.43\.' || die "cluster DNS does not resolve from a worker pod on a primary network"
 
+# --- 6b. Uniwatt's tenant shape across nodes (O6) ----------------------------
+# node1 is the controller, node2 the worker. Recorded, not fatal at once: one
+# run reports every case, and the section fails at its end.
+uw_failed=""
+uw() { local id=$1; shift; "$@" || uw_failed="${uw_failed} ${id}"; }
+# mn_reach NS POD IP PORT [SOURCE]: a TCP connect from that pod, 3s timeout.
+mn_reach() {
+    koc -n "$1" exec "$2" -- python3 -c '
+import socket, sys
+src = (sys.argv[3], 0) if len(sys.argv) > 3 else None
+socket.create_connection((sys.argv[1], int(sys.argv[2])), 3, src)' "$3" "$4" ${5:+"$5"} >/dev/null 2>&1
+}
+# mn_expect WANT NS POD IP PORT WHAT [SOURCE]: retries cover OVN programming.
+mn_expect() {
+    local want=$1 got
+    for _ in $(seq 20); do
+        if mn_reach "$2" "$3" "$4" "$5" ${7:+"$7"}; then got=yes; else got=no; fi
+        [ "${got}" = "${want}" ] && return 0
+        sleep 3
+    done
+    echo "ERROR: $2/$3 to $4:$5 reachable=${got}, want ${want} ($6)" >&2
+    return 1
+}
+# mn_ns NAME LABEL=VALUE...: a privileged namespace with those labels.
+mn_ns() {
+    local name=$1 l labels=""
+    shift
+    for l in "$@"; do labels="${labels}    ${l%%=*}: \"${l#*=}\""$'\n'; done
+    koc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${name}
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+${labels}
+EOF
+}
+# mn_cudn NAME ROLE SELECTOR_KEY SELECTOR_VALUE SUBNET
+mn_cudn() {
+    koc apply -f - >/dev/null <<EOF
+apiVersion: k8s.ovn.org/v1
+kind: ClusterUserDefinedNetwork
+metadata:
+  name: $1
+spec:
+  namespaceSelector:
+    matchLabels:
+      $3: "$4"
+  network:
+    topology: Layer2
+    layer2:
+      role: $2
+      subnets: ["$5"]
+EOF
+}
+# mn_server NS NAME NODE [NETWORKS]: a privileged pod serving HTTP on 8080.
+mn_server() {
+    local nets="{}"
+    [ -z "${4:-}" ] || nets="{k8s.v1.cni.cncf.io/networks: $4}"
+    koc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $2
+  namespace: $1
+  labels: {app: $2}
+  annotations: ${nets}
+spec:
+  nodeSelector: {kubernetes.io/hostname: $3}
+  restartPolicy: Never
+  containers:
+  - name: server
+    image: ${util_img}
+    securityContext: {privileged: true}
+    command: ["python3", "-m", "http.server", "8080"]
+EOF
+}
+mn_running() { [ "$(koc -n "$1" get pod "$2" -o jsonpath='{.status.phase}' 2>/dev/null)" = Running ]; }
+# mn_try SECONDS CMD...: retry's wait without its exit, for recorded cases.
+mn_try() {
+    local deadline=$(( $(date +%s) + $1 ))
+    shift
+    until "$@" >/dev/null 2>&1; do
+        [ "$(date +%s)" -gt "${deadline}" ] && return 1
+        sleep 5
+    done
+}
+mn_wait_pods() { # mn_wait_pods NS/POD...
+    local p
+    for p in "$@"; do
+        retry 180 "${p} Running" mn_running "${p%/*}" "${p#*/}"
+    done
+}
+mn_if() { koc -n "$1" exec "$2" -- ip -o -4 addr show dev "$3" | awk '{print $4}' | cut -d/ -f1; }
+mn_nad() { koc -n "$1" get network-attachment-definitions "$2" >/dev/null 2>&1; }
+
+# Baseline: two projects on separate primary CUDNs, one pod per node.
+log "assert: two projects on separate primary CUDNs stay isolated across nodes"
+for p in p1 p2; do
+    mn_ns "uw-${p}" k8s.ovn.org/primary-user-defined-network= "uw-proj=${p}"
+    mn_cudn "uw-${p}" Primary uw-proj "${p}" "10.210.${p#p}.0/24"
+    retry 120 "CUDN uw-${p} rendered" mn_nad "uw-${p}" "uw-${p}"
+    mn_server "uw-${p}" a node1
+    mn_server "uw-${p}" b node2
+done
+mn_wait_pods uw-p1/a uw-p1/b uw-p2/a uw-p2/b
+P1B="$(mn_if uw-p1 b ovn-udn1)"
+P2B="$(mn_if uw-p2 b ovn-udn1)"
+uw base-same mn_expect yes uw-p1 a "${P1B}" 8080 "same project across nodes"
+uw base-p1-p2 mn_expect no uw-p1 a "${P2B}" 8080 "project p1 on node1 to project p2 on node2"
+uw base-p2-p1 mn_expect no uw-p2 a "${P1B}" 8080 "project p2 on node1 to project p1 on node2"
+uw base-podip mn_expect no uw-p2 a "$(koc -n uw-p1 get pod b -o jsonpath='{.status.podIP}')" 8080 \
+    "project p2 to project p1's status.podIP"
+
+# Ask 3 from a worker: the API-only tier, subject on node2.
+log "assert: the API-only tier on a primary network, from a worker"
+for t in "${IP1} 6443" "${IP2} 10250" "${IP2} 22" "${IP1} 10250"; do
+    # shellcheck disable=SC2086 # "IP PORT" splits into two arguments
+    uw "worker-ctl-${t// /-}" mn_expect yes uw-p1 b ${t} "${t} from a worker's primary network, no policy"
+done
+koc apply -f - >/dev/null <<EOF
+apiVersion: policy.networking.k8s.io/v1alpha1
+kind: AdminNetworkPolicy
+metadata:
+  name: uw-api-only
+spec:
+  priority: 30
+  subject:
+    namespaces:
+      matchLabels:
+        kubernetes.io/metadata.name: uw-p1
+  egress:
+  - name: allow-api
+    action: Allow
+    to:
+    - nodes:
+        matchExpressions:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+    ports:
+    - portNumber:
+        protocol: TCP
+        port: 6443
+  - name: deny-nodes
+    action: Deny
+    to:
+    - nodes:
+        matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: Exists
+EOF
+uw worker-api-svc mn_expect yes uw-p1 b kubernetes.default.svc.cluster.local 443 "the API Service from a worker under the API-only ANP"
+uw worker-api-6443 mn_expect yes uw-p1 b "${IP1}" 6443 "the controller's 6443 from a worker under the API-only ANP"
+for t in "${IP2} 10250" "${IP2} 22" "${IP1} 10250"; do
+    # shellcheck disable=SC2086
+    uw "worker-deny-${t// /-}" mn_expect no uw-p1 b ${t} "${t} from a worker under the API-only ANP"
+done
+koc delete adminnetworkpolicy uw-api-only >/dev/null
+
+# Ask 5 across nodes: a LoadBalancer with externalTrafficPolicy Local, its one
+# endpoint on node2, called from the runner on the VMs' bridge. MicroShift's
+# LoadBalancer controller gives the Service the controller's node IP, node1,
+# which has no endpoint: node1 either drops it or keeps the client's address,
+# and which one is logged. node2's NodePort, the endpoint's own node, must
+# keep it.
+log "assert: externalTrafficPolicy Local keeps the client address across nodes"
+koc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: lb
+  namespace: uw-p1
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app: b
+  ports:
+  - port: 30580
+    targetPort: 8080
+    nodePort: 30581
+EOF
+lb_ips() { koc -n uw-p1 get service lb -o jsonpath='{.status.loadBalancer.ingress[*].ip}'; }
+lb_assigned() { [ -n "$(lb_ips)" ]; }
+outside() { # outside URL: up to three tries from the runner
+    local _
+    for _ in 1 2 3; do curl -fsS -o /dev/null --max-time 3 "$1" 2>/dev/null && return 0; sleep 5; done
+    return 1
+}
+lb_seen() { koc -n uw-p1 logs b | awk -v p="GET /$1 " 'index($0, p) {print $1}' | sort -u | xargs; }
+if mn_try 60 lb_assigned; then
+    log "observe: LoadBalancer ingress: $(lb_ips) (node1 ${IP1}, node2 ${IP2})"
+    for ip in $(lb_ips); do outside "http://${ip}:30580/via-lb-${ip}" || true; done
+    outside "http://${IP2}:30581/via-nodeport-node2" || true
+    outside "http://${IP1}:30581/via-nodeport-node1" || true
+    for ip in $(lb_ips); do
+        seen="$(lb_seen "via-lb-${ip}")"
+        log "observe: via the LoadBalancer address ${ip}, the pod saw '${seen:-nothing: dropped}'"
+        [ -z "${seen}" ] || [ "${seen}" = "${NET}.1" ] || {
+            echo "ERROR: via ${ip} the pod saw '${seen}': delivered with the source rewritten" >&2
+            uw_failed="${uw_failed} lb-source"; }
+    done
+    seen="$(lb_seen via-nodeport-node1)"
+    log "observe: via node1's NodePort (no endpoint), the pod saw '${seen:-nothing: dropped}'"
+    [ -z "${seen}" ] || [ "${seen}" = "${NET}.1" ] || {
+        echo "ERROR: via node1's NodePort the pod saw '${seen}': delivered with the source rewritten" >&2
+        uw_failed="${uw_failed} nodeport-other-source"; }
+    seen="$(lb_seen via-nodeport-node2)"
+    log "observe: via node2's NodePort (the endpoint's node), the pod saw '${seen}'"
+    [ "${seen}" = "${NET}.1" ] || {
+        echo "ERROR: via node2's NodePort the pod saw '${seen}', want the runner ${NET}.1" >&2
+        uw_failed="${uw_failed} nodeport-endpoint-source"; }
+else
+    uw_failed="${uw_failed} lb-ingress"
+fi
+
+# Ask 6: two namespaces on one CUDN, client on node1, backend on node2; a
+# NetworkPolicy admits the CUDN's namespaces under a default deny.
+log "assert: a Service across namespaces on one CUDN, under a NetworkPolicy on the CUDN's label"
+for ns in uw-ga uw-gb; do
+    mn_ns "${ns}" k8s.ovn.org/primary-user-defined-network= uw-cudn=shared
+done
+mn_cudn uw-shared Primary uw-cudn shared 10.210.6.0/24
+retry 120 "CUDN uw-shared rendered" mn_nad uw-gb uw-shared
+mn_server uw-ga client node1
+mn_server uw-gb backend node2
+mn_wait_pods uw-ga/client uw-gb/backend
+koc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: uw-gb
+spec:
+  selector:
+    app: backend
+  ports:
+  - port: 8080
+EOF
+gb_svc="$(koc -n uw-gb get service backend -o jsonpath='{.spec.clusterIP}')"
+uw shared-ctl mn_expect yes uw-ga client "${gb_svc}" 8080 "the other namespace's Service, no policy"
+koc apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: uw-gb
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-cudn
+  namespace: uw-gb
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          uw-cudn: shared
+EOF
+uw shared-allow mn_expect yes uw-ga client "${gb_svc}" 8080 "the Service under an allow on the CUDN's label"
+koc -n uw-gb delete networkpolicy allow-cudn >/dev/null
+uw shared-deny mn_expect no uw-ga client "${gb_svc}" 8080 "the Service once the allow is gone"
+
+# Asks 7, 8 and 10: one secondary Layer2 CUDN joins an edge (node1) to
+# Gateway pods (node2), MultiNetworkPolicy on it, and a Gateway that is also
+# on its project's primary CUDN (dual-homed).
+log "assert: MultiNetworkPolicy on a secondary CUDN across nodes"
+mn_ns uw-edge uw-transit=yes
+mn_ns uw-gw1 uw-transit=yes
+mn_ns uw-gw2 uw-transit=yes
+mn_ns uw-dual k8s.ovn.org/primary-user-defined-network= uw-transit=yes uw-dualnet=yes
+mn_cudn uw-transit Secondary uw-transit yes 10.220.0.0/24
+mn_cudn uw-dualnet Primary uw-dualnet yes 10.230.0.0/24
+for ns in uw-edge uw-gw1 uw-gw2 uw-dual; do
+    retry 120 "uw-transit rendered in ${ns}" mn_nad "${ns}" uw-transit
+done
+retry 120 "uw-dualnet rendered in uw-dual" mn_nad uw-dual uw-dualnet
+mn_server uw-edge edge node1 uw-transit
+mn_server uw-gw1 gw node2 uw-transit
+mn_server uw-gw2 gw node2 uw-transit
+mn_server uw-dual dual node2 uw-transit
+mn_server uw-dual tenant node1
+mn_wait_pods uw-edge/edge uw-gw1/gw uw-gw2/gw uw-dual/dual uw-dual/tenant
+EDGE_T="$(mn_if uw-edge edge net1)"
+GW1_T="$(mn_if uw-gw1 gw net1)"
+GW2_T="$(mn_if uw-gw2 gw net1)"
+DUAL_T="$(mn_if uw-dual dual net1)"
+DUAL_P="$(mn_if uw-dual dual ovn-udn1)"
+log "observe: transit edge ${EDGE_T}, gw1 ${GW1_T}, gw2 ${GW2_T}, dual ${DUAL_T} (primary ${DUAL_P})"
+uw mnp-ctl-gw1-gw2 mn_expect yes uw-gw1 gw "${GW2_T}" 8080 "gw1 to gw2 on transit, no policy"
+uw mnp-ctl-edge-gw2 mn_expect yes uw-edge edge "${GW2_T}" 8080 "edge to gw2 on transit, no policy"
+uw mnp-ctl-gw1-edge mn_expect yes uw-gw1 gw "${EDGE_T}" 8080 "gw1 to edge on transit, no policy"
+
+# Ask 7: gw2 admits the edge's namespace only.
+koc apply -f - >/dev/null <<EOF
+apiVersion: k8s.cni.cncf.io/v1beta1
+kind: MultiNetworkPolicy
+metadata:
+  name: from-edge
+  namespace: uw-gw2
+  annotations:
+    k8s.v1.cni.cncf.io/policy-for: uw-gw2/uw-transit
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: uw-edge
+EOF
+uw mnp-drop-gw1-gw2 mn_expect no uw-gw1 gw "${GW2_T}" 8080 "gw1 to gw2 under gw2's from-edge MNP"
+uw mnp-admit-edge mn_expect yes uw-edge edge "${GW2_T}" 8080 "edge to gw2 under gw2's from-edge MNP"
+koc -n uw-gw2 delete multi-networkpolicy from-edge >/dev/null
+
+# Ask 7: all egress denied from gw1.
+koc apply -f - >/dev/null <<EOF
+apiVersion: k8s.cni.cncf.io/v1beta1
+kind: MultiNetworkPolicy
+metadata:
+  name: no-egress
+  namespace: uw-gw1
+  annotations:
+    k8s.v1.cni.cncf.io/policy-for: uw-gw1/uw-transit
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+EOF
+uw mnp-no-egress mn_expect no uw-gw1 gw "${EDGE_T}" 8080 "gw1 to edge under a deny-all egress MNP"
+koc -n uw-gw1 delete multi-networkpolicy no-egress >/dev/null
+uw mnp-no-egress-gone mn_expect yes uw-gw1 gw "${EDGE_T}" 8080 "gw1 to edge once the egress MNP is gone"
+
+# Ask 7: the edge dials out and accepts nothing: ingress deny-all, egress to
+# gw1's namespace only. Its own connections get their replies (stateful).
+koc apply -f - >/dev/null <<EOF
+apiVersion: k8s.cni.cncf.io/v1beta1
+kind: MultiNetworkPolicy
+metadata:
+  name: dial-out
+  namespace: uw-edge
+  annotations:
+    k8s.v1.cni.cncf.io/policy-for: uw-edge/uw-transit
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: uw-gw1
+EOF
+uw mnp-dial-out mn_expect yes uw-edge edge "${GW1_T}" 8080 "edge dialing gw1 under its dial-out MNP"
+uw mnp-dial-in mn_expect no uw-gw1 gw "${EDGE_T}" 8080 "gw1 dialing the edge under the edge's dial-out MNP"
+uw mnp-dial-other mn_expect no uw-edge edge "${GW2_T}" 8080 "edge dialing gw2, outside its egress allow"
+koc -n uw-edge delete multi-networkpolicy dial-out >/dev/null
+
+# Ask 8: a tenant on the dual-homed Gateway's primary network routes the
+# transit range through it, forwarding on, and the edge routes the tenant's
+# range back the same way: port security drops the forwarded source, so
+# nothing gets through. The dual pod reaches the edge itself.
+log "assert: a dual-homed pod cannot relay its primary network into a secondary CUDN"
+uw dual-ctl mn_expect yes uw-dual dual "${EDGE_T}" 8080 "the dual-homed pod to the edge on transit"
+koc -n uw-dual exec dual -- sysctl -qw net.ipv4.ip_forward=1
+koc -n uw-dual exec tenant -- ip route replace 10.220.0.0/24 via "${DUAL_P}"
+koc -n uw-edge exec edge -- ip route replace 10.230.0.0/24 via "${DUAL_T}"
+uw dual-relay mn_expect no uw-dual tenant "${EDGE_T}" 8080 "a tenant relayed through the dual-homed pod"
+relayed="$(koc -n uw-edge logs edge | awk '$1 ~ /^10\.230\./ {print $1}' | sort -u | xargs)"
+[ -z "${relayed}" ] || { echo "ERROR: the edge served ${relayed} from the dual pod's primary network" >&2; uw_failed="${uw_failed} dual-relay-served"; }
+# The transit port pins its IP: a second address on net1 gets nowhere.
+koc -n uw-edge exec edge -- ip addr add 10.220.0.250/24 dev net1
+uw transit-ip-pinned mn_expect no uw-edge edge "${GW1_T}" 8080 "the edge from an address it was not given" 10.220.0.250
+uw transit-ip-own mn_expect yes uw-edge edge "${GW1_T}" 8080 "the edge from its own address" "${EDGE_T}"
+koc -n uw-edge exec edge -- ip addr del 10.220.0.250/24 dev net1
+# And its MAC: OVN's port security on the edge's transit port names both.
+edge_mac="$(koc -n uw-edge exec edge -- cat /sys/class/net/net1/address)"
+n1_ovnk="$(koc -n openshift-ovn-kubernetes get pods -l app=ovnkube-node --field-selector spec.nodeName=node1 -o jsonpath='{.items[0].metadata.name}')"
+edge_ps="$(koc -n openshift-ovn-kubernetes exec "${n1_ovnk}" -c nbdb -- ovn-nbctl --no-leader-only \
+    --format=csv --data=bare --no-headings --columns=name,port_security list Logical_Switch_Port 2>/dev/null \
+    | grep 'uw-edge_edge' || true)"
+log "observe: edge transit port: ${edge_ps}"
+case "${edge_ps}" in *"${edge_mac} ${EDGE_T}"*) ;; *)
+    echo "ERROR: the edge's transit port does not pin ${edge_mac} ${EDGE_T}: '${edge_ps}'" >&2
+    uw_failed="${uw_failed} transit-port-security" ;;
+esac
+
+# Ask 9 across nodes: portail binds its admin port on status.podIP. On a
+# primary-network pod that is the default-network address; kubelet on its
+# node probes it, no pod on the other node reaches it.
+log "assert: status.podIP of a primary-network pod is reachable by its kubelet only"
+koc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: admin
+  namespace: uw-p1
+  labels: {app: admin}
+spec:
+  nodeSelector: {kubernetes.io/hostname: node2}
+  restartPolicy: Never
+  containers:
+  - name: admin
+    image: ${util_img}
+    env:
+    - name: POD_IP
+      valueFrom:
+        fieldRef:
+          fieldPath: status.podIP
+    command: ["/bin/bash", "-c", "python3 -m http.server 8080 & exec python3 -m http.server 19099 --bind \"\${POD_IP}\""]
+    readinessProbe:
+      httpGet:
+        port: 19099
+      periodSeconds: 5
+EOF
+admin_ready() { [ "$(koc -n uw-p1 get pod admin -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = True ]; }
+log "waiting up to 180s for: uw-p1/admin Ready through a probe on status.podIP:19099"
+if mn_try 180 admin_ready; then
+    ADMIN_POD="$(koc -n uw-p1 get pod admin -o jsonpath='{.status.podIP}')"
+    ADMIN_UDN="$(mn_if uw-p1 admin ovn-udn1)"
+    log "observe: uw-p1/admin status.podIP ${ADMIN_POD}, ovn-udn1 ${ADMIN_UDN}"
+    case "${ADMIN_POD}" in 10.42.*) ;; *) echo "ERROR: status.podIP '${ADMIN_POD}' is not on the default network" >&2; uw_failed="${uw_failed} podip-network" ;; esac
+    uw podip-ctl-cudn mn_expect yes uw-p1 a "${ADMIN_UDN}" 8080 "a same-CUDN pod on node1 to the admin pod's UDN address"
+    uw podip-ctl-default mn_expect yes default mn-echo-node1 "$(koc get pod mn-echo-node2 -o jsonpath='{.status.podIP}')" 8080 \
+        "a default-network pod on node1 to one on node2"
+    uw podip-cudn mn_expect no uw-p1 a "${ADMIN_POD}" 19099 "a same-CUDN pod on node1 to status.podIP:19099"
+    uw podip-default mn_expect no default mn-echo-node1 "${ADMIN_POD}" 19099 "a default-network pod on node1 to status.podIP:19099"
+    koc apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-admin
+  namespace: uw-p1
+spec:
+  podSelector:
+    matchLabels: {app: admin}
+  policyTypes: [Ingress]
+EOF
+    uw podip-np mn_expect no uw-p1 a "${ADMIN_UDN}" 8080 "a same-CUDN pod to the admin pod under a deny-all NetworkPolicy"
+    sleep 30
+    admin_ready || { echo "ERROR: uw-p1/admin lost Ready under a deny-all NetworkPolicy" >&2; uw_failed="${uw_failed} probe-under-deny"; }
+else
+    koc -n uw-p1 describe pod admin >&2 || true
+    uw_failed="${uw_failed} admin-probe"
+fi
+
+koc delete adminnetworkpolicy uw-api-only --ignore-not-found >/dev/null
+koc delete namespace uw-p1 uw-p2 uw-ga uw-gb uw-edge uw-gw1 uw-gw2 uw-dual --wait=false >/dev/null
+koc delete clusteruserdefinednetwork uw-p1 uw-p2 uw-shared uw-transit uw-dualnet --wait=false >/dev/null
+[ -z "${uw_failed}" ] || die "Uniwatt tenant cases failed:${uw_failed}"
+
 # --- 7. greenboot gates both roles ---------------------------------------------
 # Run the packaged check scripts directly: that is exactly what greenboot
 # executes, without re-arming the boot-status/rollback machinery mid-life,

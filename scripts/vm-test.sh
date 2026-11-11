@@ -1328,8 +1328,12 @@ if vssh curl -fsS -o /dev/null --max-time 3 "http://${probed_ip}:8080/"; then
     exit 1
 fi
 
-# How an edge outside the network reaches a Service inside it. Logged, not
-# asserted, until it is decided which of these the distribution promises.
+# How an edge reaches a Service inside a primary network (Uniwatt ask 5): a
+# LoadBalancer with externalTrafficPolicy Local, on the port QEMU forwards
+# from the runner. The pod must see the client's own address, the slirp
+# gateway: the edge's PROXY v2 trust check depends on it. ClusterIP and
+# NodePort from the host and the default network stay logged, not asserted.
+# NodePort and LoadBalancer traffic meets OVN on br-ex before firewalld.
 koc apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Service
@@ -1337,28 +1341,38 @@ metadata:
   name: server
   namespace: udn-1
 spec:
-  type: NodePort
+  type: LoadBalancer
+  externalTrafficPolicy: Local
   selector:
     app: server
   ports:
-  - port: 8080
+  - port: 30480
     targetPort: 8080
-    nodePort: 30480
+    nodePort: 30481
 EOF
 svc_ip="$(koc -n udn-1 get service server -o jsonpath='{.spec.clusterIP}')"
-node_port=30480
-expect yes udn-1 client "${svc_ip}" 8080 "its own Service"
+node_port=30481
+expect yes udn-1 client "${svc_ip}" 30480 "its own Service" || udn_failed="${udn_failed} own-service"
 node_get() { vssh curl -fsS -o /dev/null --max-time 3 "http://$1/"; }
-log "observe: UDN Service ClusterIP from the host network: $(observe node_get "${svc_ip}:8080")"
-log "observe: UDN Service ClusterIP from the default network: $(observe reach default l2test-probe "${svc_ip}" 8080)"
+log "observe: UDN Service ClusterIP from the host network: $(observe node_get "${svc_ip}:30480")"
+log "observe: UDN Service ClusterIP from the default network: $(observe reach default l2test-probe "${svc_ip}" 30480)"
 log "observe: UDN Service NodePort from the host network: $(observe node_get "${node_ip}:${node_port}")"
 log "observe: UDN Service NodePort from the default network: $(observe reach default l2test-probe "${node_ip}" "${node_port}")"
-# This image opens no NodePort to the outside; opened here for the test only,
-# so a refusal is OVN's, not the firewall's.
-vssh firewall-cmd -q --add-port="${node_port}/tcp"
-outside_get() { curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:${NODEPORT_FWD}/"; }
-log "observe: UDN Service NodePort from outside the node: $(observe outside_get)"
-vssh firewall-cmd -q --remove-port="${node_port}/tcp"
+lb_assigned() { [ -n "$(koc -n udn-1 get service server -o jsonpath='{.status.loadBalancer.ingress[0].ip}')" ]; }
+outside_get() { curl -fsS -o /dev/null --max-time 3 "http://127.0.0.1:${NODEPORT_FWD}/from-outside"; }
+log "assert: a LoadBalancer with externalTrafficPolicy Local keeps an outside client's address"
+if ! wait_for 60 "the LoadBalancer Service an ingress address" lb_assigned; then
+    udn_failed="${udn_failed} lb-ingress"
+elif ! wait_for 60 "the LoadBalancer from outside the node" outside_get; then
+    udn_failed="${udn_failed} lb-outside"
+else
+    seen="$(koc -n udn-1 logs server | awk '/GET \/from-outside/ {print $1}' | sort -u | xargs)"
+    log "observe: udn-1/server saw the outside client as: ${seen}"
+    [ "${seen}" = 10.0.2.2 ] || {
+        echo "ERROR: the pod saw '${seen}', want the slirp gateway 10.0.2.2 alone" >&2
+        udn_failed="${udn_failed} lb-source"
+    }
+fi
 
 # The cluster manager keeps an IPAMClaim's address for whichever pod names
 # it, which is how a VM keeps its IP across restarts and migrations. The
@@ -1407,6 +1421,226 @@ second_ip="$(claimed_pod)"
     echo "ERROR: a recreated pod got ${second_ip}, its claim holds ${first_ip}" >&2
     exit 1
 }
+
+# Uniwatt's tenant shape on a primary network (O6 asks 1 to 4 and 9),
+# recorded like the checks above. The node listener on 18080 is efw-target.
+rec() { local id=$1; shift; "$@" || udn_failed="${udn_failed} ${id}"; }
+log "assert: tenant egress policy holds on a primary network"
+# Controls: a Deny below means nothing unless the path works without it.
+for port in 18080 6443 10250 22; do
+    rec "node-${port}" expect yes udn-1 client "${node_ip}" "${port}" "node port ${port} from a primary network, no policy"
+done
+rec node-18080-udn2 expect yes udn-2 client "${node_ip}" 18080 "the node from another primary network, no policy"
+
+# Ask 1: AdminNetworkPolicy egress Deny through networks and nodes peers.
+for peer in "networks: [\"${node_ip}/32\"]" "nodes: {matchExpressions: [{key: kubernetes.io/hostname, operator: Exists}]}"; do
+    koc apply -f - >/dev/null <<EOF
+apiVersion: policy.networking.k8s.io/v1alpha1
+kind: AdminNetworkPolicy
+metadata:
+  name: udn-anp-node-deny
+spec:
+  priority: 30
+  subject:
+    namespaces:
+      matchLabels:
+        kubernetes.io/metadata.name: udn-1
+  egress:
+  - name: deny-node
+    action: Deny
+    to:
+    - ${peer}
+EOF
+    rec "anp-${peer%%:*}" expect no udn-1 client "${node_ip}" 18080 "a primary network under an ANP Deny to ${peer%%:*}"
+    rec "anp-${peer%%:*}-outside" expect yes udn-2 client "${node_ip}" 18080 "a primary network outside the ANP subject"
+    koc delete adminnetworkpolicy udn-anp-node-deny >/dev/null
+    rec "anp-${peer%%:*}-gone" expect yes udn-1 client "${node_ip}" 18080 "a primary network after the ANP is deleted"
+done
+
+# Ask 2: EgressFirewall in a primary-network namespace.
+koc apply -f - >/dev/null <<EOF
+apiVersion: k8s.ovn.org/v1
+kind: EgressFirewall
+metadata:
+  name: default
+  namespace: udn-1
+spec:
+  egress:
+  - type: Deny
+    to:
+      cidrSelector: ${node_ip}/32
+EOF
+rec efw expect no udn-1 client "${node_ip}" 18080 "a primary network under an EgressFirewall Deny"
+rec efw-outside expect yes udn-2 client "${node_ip}" 18080 "a primary network without one"
+koc -n udn-1 delete egressfirewall default >/dev/null
+rec efw-gone expect yes udn-1 client "${node_ip}" 18080 "a primary network after the EgressFirewall is deleted"
+
+# Ask 3: the API-only tier on a primary network, no IP in it (multinode-test
+# also runs it from a worker).
+koc apply -f - >/dev/null <<EOF
+apiVersion: policy.networking.k8s.io/v1alpha1
+kind: AdminNetworkPolicy
+metadata:
+  name: udn-anp-api-only
+spec:
+  priority: 30
+  subject:
+    namespaces:
+      matchLabels:
+        kubernetes.io/metadata.name: udn-1
+  egress:
+  - name: allow-api
+    action: Allow
+    to:
+    - nodes:
+        matchExpressions:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+    ports:
+    - portNumber:
+        protocol: TCP
+        port: 6443
+  - name: deny-nodes
+    action: Deny
+    to:
+    - nodes:
+        matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: Exists
+EOF
+rec api-only-svc expect yes udn-1 client kubernetes.default.svc.cluster.local 443 "the API Service from a primary network under the API-only ANP"
+rec api-only-6443 expect yes udn-1 client "${node_ip}" 6443 "the API endpoint from a primary network under the API-only ANP"
+for port in 18080 10250 22; do
+    rec "api-only-${port}" expect no udn-1 client "${node_ip}" "${port}" "node port ${port} from a primary network under the API-only ANP"
+done
+koc delete adminnetworkpolicy udn-anp-api-only >/dev/null
+
+# Ask 4: a project CUDN that excludes net=own runs beside a namespace on its
+# own primary UserDefinedNetwork; both run, neither reaches the other.
+log "assert: a CUDN excluding net=own runs beside a namespace on its own primary UDN"
+for n in a b; do
+    extra=""
+    [ "${n}" = b ] && extra="    net: own"
+    koc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: udn-4${n}
+  labels:
+    k8s.ovn.org/primary-user-defined-network: ""
+    pod-security.kubernetes.io/enforce: privileged
+    p: a
+${extra}
+EOF
+done
+koc apply -f - >/dev/null <<EOF
+apiVersion: k8s.ovn.org/v1
+kind: ClusterUserDefinedNetwork
+metadata:
+  name: udn-4
+spec:
+  namespaceSelector:
+    matchLabels:
+      p: a
+    matchExpressions:
+    - key: net
+      operator: NotIn
+      values: [own]
+  network:
+    topology: Layer2
+    layer2:
+      role: Primary
+      subnets: ["10.200.4.0/24"]
+---
+apiVersion: k8s.ovn.org/v1
+kind: UserDefinedNetwork
+metadata:
+  name: own
+  namespace: udn-4b
+spec:
+  topology: Layer2
+  layer2:
+    role: Primary
+    subnets: ["10.200.5.0/24"]
+EOF
+udn4_nads() {
+    koc -n udn-4a get network-attachment-definitions udn-4 >/dev/null 2>&1 &&
+        koc -n udn-4b get network-attachment-definitions own >/dev/null 2>&1
+}
+if wait_for 120 "udn-4a on the CUDN and udn-4b on its own UDN" udn4_nads; then
+    probe_pods udn-4a
+    probe_pods udn-4b
+    ip4a="$(udn_ip udn-4a server)"
+    ip4b="$(udn_ip udn-4b server)"
+    case "${ip4a}/${ip4b}" in 10.200.4.*/10.200.5.*) ;; *)
+        echo "ERROR: udn-4a/server has '${ip4a}', udn-4b/server '${ip4b}'; want 10.200.4.x and 10.200.5.x" >&2
+        udn_failed="${udn_failed} cudn-notin-addresses" ;;
+    esac
+    rec cudn-notin-own expect yes udn-4a client "${ip4a}" 8080 "its own CUDN"
+    rec cudn-notin-a-b expect no udn-4a client "${ip4b}" 8080 "the CUDN to the namespace on its own UDN"
+    rec cudn-notin-b-a expect no udn-4b client "${ip4a}" 8080 "the namespace on its own UDN to the CUDN"
+else
+    koc -n udn-4b get network-attachment-definitions -o name >&2 || true
+    koc get clusteruserdefinednetwork udn-4 -o jsonpath='{.status.conditions}' >&2 || true
+    udn_failed="${udn_failed} cudn-notin"
+fi
+
+# Ask 9: a deny-all ingress NetworkPolicy leaves kubelet probes through, and
+# status.podIP is the default-network address, where portail binds its admin
+# port (multinode-test checks who else reaches it).
+log "assert: kubelet probes pass a deny-all ingress NetworkPolicy on a primary network"
+koc apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-admin
+  namespace: udn-1
+spec:
+  podSelector:
+    matchLabels:
+      app: admin
+  policyTypes: [Ingress]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: admin
+  namespace: udn-1
+  labels:
+    app: admin
+spec:
+  restartPolicy: Never
+  containers:
+  - name: admin
+    image: ${util_img}
+    env:
+    - name: POD_IP
+      valueFrom:
+        fieldRef:
+          fieldPath: status.podIP
+    command: ["/bin/bash", "-c", "exec python3 -m http.server 19099 --bind \"\${POD_IP}\""]
+    readinessProbe:
+      httpGet:
+        port: 19099
+      periodSeconds: 5
+EOF
+admin_ready() {
+    [ "$(koc -n udn-1 get pod admin -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" = True ]
+}
+if wait_for 180 "udn-1/admin Ready under a deny-all ingress policy" admin_ready; then
+    admin_pod_ip="$(koc -n udn-1 get pod admin -o jsonpath='{.status.podIP}')"
+    admin_udn_ip="$(udn_ip udn-1 admin)"
+    log "observe: udn-1/admin status.podIP ${admin_pod_ip}, ovn-udn1 ${admin_udn_ip}"
+    case "${admin_pod_ip}" in 10.42.*) ;; *)
+        echo "ERROR: status.podIP is '${admin_pod_ip}', want the default network (10.42.x)" >&2
+        udn_failed="${udn_failed} podip-network" ;;
+    esac
+    [ "${admin_pod_ip}" != "${admin_udn_ip}" ] || udn_failed="${udn_failed} podip-is-udn"
+else
+    koc -n udn-1 describe pod admin >&2 || true
+    udn_failed="${udn_failed} probe-under-deny"
+fi
+koc -n udn-1 delete networkpolicy deny-admin >/dev/null
 
 [ -z "${udn_failed}" ] || { echo "ERROR: primary network checks failed:${udn_failed}" >&2; exit 1; }
 
