@@ -162,6 +162,11 @@ RUN mkdir -p /etc/containers/registries.d && \
 # from the payload by src/ovs/vendor.sh, runs in place of MicroShift's.
 COPY --chmod=755 ./src/ovs/configure-ovs.sh /usr/libexec/microshift-configure-ovs.sh
 COPY --chmod=755 ./src/ovs/nodeip-hint.sh /usr/libexec/microshift-nodeip-hint
+# Booted as a container, the image builds the same br-ex: the unit gives the
+# runtime's NIC the profile configure-ovs needs, and is skipped elsewhere.
+COPY --chmod=755 ./src/ovs/container-nic.sh /usr/libexec/microshift-container-nic
+COPY ./src/ovs/microshift-container-nic.service /usr/lib/systemd/system/
+RUN systemctl enable microshift-container-nic.service
 COPY ./src/ovs/microshift-ovs-init.conf \
      /usr/lib/systemd/system/microshift-ovs-init.service.d/50-openshift-configure-ovs.conf
 # In /etc and sorting after MicroShift's 10-microshift-ignore-devices.conf:

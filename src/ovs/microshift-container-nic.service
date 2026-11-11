@@ -1,0 +1,12 @@
+[Unit]
+Description=Give a container's NIC a NetworkManager profile for br-ex
+# On a VM or a machine NetworkManager already manages the NIC.
+ConditionVirtualization=container
+Before=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/microshift-container-nic
+
+[Install]
+WantedBy=NetworkManager.service

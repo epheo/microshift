@@ -4,8 +4,8 @@ name: build
 #   pull_request          build + test, no publish
 #   push to main          build + test + publish
 #
-#   The image is built once; the fresh VM, both upgrade lanes and the
-#   two-VM worker join then run in parallel on it, and publish pushes the
+#   The image is built once; the fresh VM, both upgrade lanes, the
+#   two-VM worker join and the container boot then run in parallel on it, and publish pushes the
 #   exact image they tested once all of them pass.
 #   workflow_dispatch     build + test (+ publish unless disabled)
 #   daily schedule        check for new z-stream / OKD payload / portail
@@ -356,6 +356,29 @@ jobs:
           path: /tmp/epheo-microshift-vm*/*.log
           if-no-files-found: ignore
 
+  # The image booted as a plain privileged podman container on podman's
+  # default network, nothing seeded, as dotvirt's CI runs it: it must build
+  # the same br-ex as a node (microshift-container-nic).
+  container:
+    needs: [build]
+    # !cancelled(): see vm-test.
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.build.outputs.sha }}
+
+      - name: Load the candidate image
+        uses: ./.github/actions/candidate
+
+      - name: Container boot test
+        run: make smoke
+
   # Two VMs: a controller and a worker joined with add-node, firewalld and
   # greenboot in place, then a controller update the worker follows.
   multinode-test:
@@ -406,7 +429,7 @@ jobs:
   # a pass; only the previous-minor lane may skip, when there is no older
   # minor to upgrade from.
   tested:
-    needs: [build, vm-test, vm-test-upgrade, vm-test-upgrade-minor, multinode-test]
+    needs: [build, vm-test, vm-test-upgrade, vm-test-upgrade-minor, multinode-test, container]
     if: ${{ !cancelled() && needs.build.result != 'skipped' }}
     runs-on: ubuntu-24.04
     steps:
@@ -420,6 +443,7 @@ jobs:
             (.["vm-test"].result == "success") and
             (.["vm-test-upgrade"].result == "success") and
             (.["multinode-test"].result == "success") and
+            (.container.result == "success") and
             (.["vm-test-upgrade-minor"].result | IN("success", "skipped"))' >/dev/null
 
   # Publishes the image every lane tested, byte for byte.
@@ -512,7 +536,7 @@ jobs:
   # A bump that went red: one open issue and one PR from auto/bump carry it
   # until a later bump is promoted (which closes the issue).
   report:
-    needs: [bump, build, vm-test, vm-test-upgrade, vm-test-upgrade-minor, multinode-test, tested, publish]
+    needs: [bump, build, vm-test, vm-test-upgrade, vm-test-upgrade-minor, multinode-test, container, tested, publish]
     if: failure() && needs.bump.outputs.changed == 'true' && needs.bump.outputs.stale != 'true'
     runs-on: ubuntu-24.04
     permissions:
