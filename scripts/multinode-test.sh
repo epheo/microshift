@@ -623,17 +623,15 @@ uw base-p2-p1 mn_expect no uw-p2 a "${P1B}" 8080 "project p2 on node1 to project
 uw base-podip mn_expect no uw-p2 a "$(koc -n uw-p1 get pod b -o jsonpath='{.status.podIP}')" 8080 \
     "project p2 to project p1's status.podIP"
 
-# Ask 3 from a worker: the API-only tier, subject on node2.
-log "assert: the API-only tier on a primary network, from a worker"
-for t in "${IP1} 6443" "${IP2} 10250" "${IP2} 22" "${IP1} 10250"; do
-    # shellcheck disable=SC2086 # "IP PORT" splits into two arguments
-    uw "worker-ctl-${t// /-}" mn_expect yes uw-p1 b ${t} "${t} from a worker's primary network, no policy"
-done
+# OVN-K's AdminNetworkPolicy never applies to a primary network's traffic:
+# its controller reads default-network pod addresses only (5.0 through
+# upstream master). Logged, not asserted, so a change shows up here.
+mn_obs() { if mn_reach "$@"; then echo reachable; else echo refused; fi; }
 koc apply -f - >/dev/null <<EOF
 apiVersion: policy.networking.k8s.io/v1alpha1
 kind: AdminNetworkPolicy
 metadata:
-  name: uw-api-only
+  name: uw-deny-nodes
 spec:
   priority: 30
   subject:
@@ -641,17 +639,6 @@ spec:
       matchLabels:
         kubernetes.io/metadata.name: uw-p1
   egress:
-  - name: allow-api
-    action: Allow
-    to:
-    - nodes:
-        matchExpressions:
-        - key: node-role.kubernetes.io/control-plane
-          operator: Exists
-    ports:
-    - portNumber:
-        protocol: TCP
-        port: 6443
   - name: deny-nodes
     action: Deny
     to:
@@ -660,27 +647,54 @@ spec:
         - key: kubernetes.io/hostname
           operator: Exists
 EOF
-uw worker-api-svc mn_expect yes uw-p1 b kubernetes.default.svc.cluster.local 443 "the API Service from a worker under the API-only ANP"
-uw worker-api-6443 mn_expect yes uw-p1 b "${IP1}" 6443 "the controller's 6443 from a worker under the API-only ANP"
-for t in "${IP2} 10250" "${IP2} 22" "${IP1} 10250"; do
-    # shellcheck disable=SC2086
-    uw "worker-deny-${t// /-}" mn_expect no uw-p1 b ${t} "${t} from a worker under the API-only ANP"
-done
-# Whether the worker pod's UDN port is in the ANP's port groups on node2.
-anp_diag() {
-    local n2 nb
-    n2="$(koc -n openshift-ovn-kubernetes get pods -l app=ovnkube-node --field-selector spec.nodeName=node2 \
-        -o jsonpath='{.items[0].metadata.name}')"
-    nb=(koc -n openshift-ovn-kubernetes exec "${n2}" -c nbdb -- ovn-nbctl --no-leader-only)
-    echo "== node2 port groups (name, external_ids, ports):" >&2
-    "${nb[@]}" --format=csv --data=bare --no-headings --columns=name,external_ids,ports list Port_Group \
-        | grep -i -e anp -e admin | cut -c1-400 >&2 || true
-    echo "== node2 ports of uw-p1/b (uuid, name):" >&2
-    "${nb[@]}" --format=csv --data=bare --no-headings --columns=_uuid,name list Logical_Switch_Port \
-        | grep 'uw-p1_b' >&2 || true
+sleep 10
+log "observe: under an ANP denying all nodes, a worker's primary-network pod to the controller's 10250: $(mn_obs uw-p1 b "${IP1}" 10250)"
+koc delete adminnetworkpolicy uw-deny-nodes >/dev/null
+
+# The provider's egress tier for primary-network tenants on the API that
+# covers them, EgressFirewall: every node and one LAN host (the runner)
+# denied; the API Service, DNS and the internet kept. Subject on the worker.
+log "assert: a provider EgressFirewall fences a worker's primary-network pod"
+python3 -m http.server 18081 --bind "${NET}.1" >/dev/null 2>&1 &
+lan_pid=$!
+dns_ok() {
+    koc -n uw-p1 exec b -- python3 -c \
+        'import socket; socket.getaddrinfo("kubernetes.default.svc.cluster.local", 443)' >/dev/null 2>&1
 }
-case "${uw_failed}" in *worker-deny*) anp_diag ;; esac
-koc delete adminnetworkpolicy uw-api-only >/dev/null
+for t in "${IP1} 10250" "${IP1} 22" "${NET}.1 18081" "1.1.1.1 443" "kubernetes.default.svc.cluster.local 443"; do
+    # shellcheck disable=SC2086 # "HOST PORT" splits into two arguments
+    uw "efw-ctl-${t// /-}" mn_expect yes uw-p1 b ${t} "${t} from a worker's primary network, no policy"
+done
+uw efw-ctl-dns mn_try 30 dns_ok
+koc apply -f - >/dev/null <<EOF
+apiVersion: k8s.ovn.org/v1
+kind: EgressFirewall
+metadata:
+  name: default
+  namespace: uw-p1
+spec:
+  egress:
+  - type: Deny
+    to:
+      nodeSelector:
+        matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: Exists
+  - type: Deny
+    to:
+      cidrSelector: ${NET}.1/32
+EOF
+for t in "${IP1} 10250" "${IP1} 22" "${NET}.1 18081"; do
+    # shellcheck disable=SC2086
+    uw "efw-deny-${t// /-}" mn_expect no uw-p1 b ${t} "${t} from a worker's primary network under the EgressFirewall"
+done
+for t in "1.1.1.1 443" "kubernetes.default.svc.cluster.local 443"; do
+    # shellcheck disable=SC2086
+    uw "efw-keep-${t// /-}" mn_expect yes uw-p1 b ${t} "${t} from a worker's primary network under the EgressFirewall"
+done
+uw efw-keep-dns mn_try 30 dns_ok
+koc -n uw-p1 delete egressfirewall default >/dev/null
+kill "${lan_pid}" 2>/dev/null || true
 
 # Ask 5 across nodes: a LoadBalancer with externalTrafficPolicy Local, its one
 # endpoint on node2, called from the runner on the VMs' bridge. MicroShift's
@@ -973,7 +987,7 @@ else
     uw_failed="${uw_failed} admin-probe"
 fi
 
-koc delete adminnetworkpolicy uw-api-only --ignore-not-found >/dev/null
+koc delete adminnetworkpolicy uw-deny-nodes --ignore-not-found >/dev/null
 koc delete namespace uw-p1 uw-p2 uw-ga uw-gb uw-edge uw-gw1 uw-gw2 uw-dual --wait=false >/dev/null
 koc delete clusteruserdefinednetwork uw-p1 uw-p2 uw-shared uw-transit uw-dualnet --wait=false >/dev/null
 [ -z "${uw_failed}" ] || die "Uniwatt tenant cases failed:${uw_failed}"

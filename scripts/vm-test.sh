@@ -1425,113 +1425,16 @@ second_ip="$(claimed_pod)"
 # Uniwatt's tenant shape on a primary network (O6 asks 1 to 4 and 9),
 # recorded like the checks above. The node listener on 18080 is efw-target.
 rec() { local id=$1; shift; "$@" || udn_failed="${udn_failed} ${id}"; }
-log "assert: tenant egress policy holds on a primary network"
-# Controls: a Deny below means nothing unless the path works without it.
+# UDN host isolation, which Uniwatt relies on to protect the node: a
+# primary-network pod reaches no host port on its own node, while the API
+# Service and DNS answer (asserted above). Tenant egress policy runs across
+# nodes in multinode-test: OVN-K's AdminNetworkPolicy never applies to a
+# primary network's traffic (its controller reads default-network pod
+# addresses only), EgressFirewall does.
+log "assert: a primary-network pod reaches no host port on its own node"
 for port in 18080 6443 10250 22; do
-    rec "node-${port}" expect yes udn-1 client "${node_ip}" "${port}" "node port ${port} from a primary network, no policy"
+    rec "own-node-${port}" expect no udn-1 client "${node_ip}" "${port}" "own node port ${port} from a primary network"
 done
-rec node-18080-udn2 expect yes udn-2 client "${node_ip}" 18080 "the node from another primary network, no policy"
-# Where a primary-network pod's connect to its own node stops: the packets
-# on the node during one attempt, and the host's routes and rules for it.
-udn_node_diag() {
-    local cap
-    cap="$(mktemp)"
-    koc -n openshift-ovn-kubernetes exec ds/ovnkube-node -c ovnkube-controller -- \
-        timeout 15 tcpdump -nni any -c 16 'tcp port 18080' > "${cap}" 2>&1 &
-    sleep 3
-    reach udn-1 client "${node_ip}" 18080 || true
-    wait
-    echo "== on the node, tcp port 18080, during a connect from udn-1/client:" >&2
-    cat "${cap}" >&2
-    rm -f "${cap}"
-    vssh sh -c 'ip rule; ip route show table all | grep -e 169.254.0 -e 10.200.1 | head -20
-        nft list ruleset | grep -n -i -e udn -e 169.254.0 | head -40
-        firewall-cmd --get-active-zones' >&2 || true
-}
-case "${udn_failed}" in *node-18080*) udn_node_diag ;; esac
-
-# Ask 1: AdminNetworkPolicy egress Deny through networks and nodes peers.
-for peer in "networks: [\"${node_ip}/32\"]" "nodes: {matchExpressions: [{key: kubernetes.io/hostname, operator: Exists}]}"; do
-    koc apply -f - >/dev/null <<EOF
-apiVersion: policy.networking.k8s.io/v1alpha1
-kind: AdminNetworkPolicy
-metadata:
-  name: udn-anp-node-deny
-spec:
-  priority: 30
-  subject:
-    namespaces:
-      matchLabels:
-        kubernetes.io/metadata.name: udn-1
-  egress:
-  - name: deny-node
-    action: Deny
-    to:
-    - ${peer}
-EOF
-    rec "anp-${peer%%:*}" expect no udn-1 client "${node_ip}" 18080 "a primary network under an ANP Deny to ${peer%%:*}"
-    rec "anp-${peer%%:*}-outside" expect yes udn-2 client "${node_ip}" 18080 "a primary network outside the ANP subject"
-    koc delete adminnetworkpolicy udn-anp-node-deny >/dev/null
-    rec "anp-${peer%%:*}-gone" expect yes udn-1 client "${node_ip}" 18080 "a primary network after the ANP is deleted"
-done
-
-# Ask 2: EgressFirewall in a primary-network namespace.
-koc apply -f - >/dev/null <<EOF
-apiVersion: k8s.ovn.org/v1
-kind: EgressFirewall
-metadata:
-  name: default
-  namespace: udn-1
-spec:
-  egress:
-  - type: Deny
-    to:
-      cidrSelector: ${node_ip}/32
-EOF
-rec efw expect no udn-1 client "${node_ip}" 18080 "a primary network under an EgressFirewall Deny"
-rec efw-outside expect yes udn-2 client "${node_ip}" 18080 "a primary network without one"
-koc -n udn-1 delete egressfirewall default >/dev/null
-rec efw-gone expect yes udn-1 client "${node_ip}" 18080 "a primary network after the EgressFirewall is deleted"
-
-# Ask 3: the API-only tier on a primary network, no IP in it (multinode-test
-# also runs it from a worker).
-koc apply -f - >/dev/null <<EOF
-apiVersion: policy.networking.k8s.io/v1alpha1
-kind: AdminNetworkPolicy
-metadata:
-  name: udn-anp-api-only
-spec:
-  priority: 30
-  subject:
-    namespaces:
-      matchLabels:
-        kubernetes.io/metadata.name: udn-1
-  egress:
-  - name: allow-api
-    action: Allow
-    to:
-    - nodes:
-        matchExpressions:
-        - key: node-role.kubernetes.io/control-plane
-          operator: Exists
-    ports:
-    - portNumber:
-        protocol: TCP
-        port: 6443
-  - name: deny-nodes
-    action: Deny
-    to:
-    - nodes:
-        matchExpressions:
-        - key: kubernetes.io/hostname
-          operator: Exists
-EOF
-rec api-only-svc expect yes udn-1 client kubernetes.default.svc.cluster.local 443 "the API Service from a primary network under the API-only ANP"
-rec api-only-6443 expect yes udn-1 client "${node_ip}" 6443 "the API endpoint from a primary network under the API-only ANP"
-for port in 18080 10250 22; do
-    rec "api-only-${port}" expect no udn-1 client "${node_ip}" "${port}" "node port ${port} from a primary network under the API-only ANP"
-done
-koc delete adminnetworkpolicy udn-anp-api-only >/dev/null
 
 # Ask 4: a project CUDN that excludes net=own runs beside a namespace on its
 # own primary UserDefinedNetwork; both run, neither reaches the other.
