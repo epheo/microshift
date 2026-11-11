@@ -3,8 +3,6 @@
 # must not drift apart: the multinode lane is the only reproducer of cross-node
 # bugs, and a dedup or unit-list fix applied to one script used to be invisible
 # in the other. Each caller passes its own remote-exec function (vssh, v1, v2).
-# multinode-smoke.sh diverges on purpose (containers: no boots to filter on, no
-# NetworkManager, no bootc, no SELinux) and does not source this file.
 
 # OVS runs outside MicroShift, which only validates br-ex and exits, so an OVS
 # failure reads as a bare "microshift.service did not become active" with no

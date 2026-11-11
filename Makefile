@@ -21,6 +21,12 @@ SUDO_PODMAN ?= sudo podman
 # Base images are moving tags; never build on a stale local copy. A failed
 # check falls back to the local image.
 PULL ?= newer
+# CI builds image with LAYERS=false: its store starts empty, so intermediate
+# layers cache nothing and cost a commit per step (about 7 s each, 8 min a
+# build). podman then commits once, everything above the base in one layer.
+# Updates download the same bytes either way: no release has ever shared one
+# of our layers with the previous one, as file times differ on every build.
+LAYERS ?= true
 
 SRPM_IMAGE := epheo-microshift-srpm
 RPM_IMAGE  := epheo-microshift-rpm
@@ -50,7 +56,7 @@ rpm:
 
 .PHONY: image
 image:
-	$(PODMAN) build --pull=$(PULL) \
+	$(PODMAN) build --pull=$(PULL) --layers=$(LAYERS) \
 	    -t "$(DIST_IMAGE)" \
 	    --ulimit nofile=524288:524288 \
 	    --label microshift.ref="$(USHIFT_GITREF)" \
@@ -86,6 +92,29 @@ rpms-out:
 	$(PODMAN) cp "$$cid:/home/microshift/microshift/_output/rpmbuild/RPMS/." "$$outdir" && \
 	echo "RPMs are available in '$$outdir'"
 
+# CI's RPM cache (scripts/rpm-cache-key.sh). The image stage takes only the
+# RPM repo and the rshared unit from the RPM image, and `make version` reads
+# version.txt there: the cache keeps those, and a stand-in image on the
+# buildroot serves them. A new COPY --from=builder in bootc.Containerfile
+# must be added here, or a cached build fails on it.
+RPM_CACHE ?= /tmp/epheo-microshift-rpm-cache
+RPM_CACHE_PATHS := _output/rpmbuild/RPMS packaging/imagemode/systemd/microshift-make-rshared.service
+
+.PHONY: rpm-cache-save
+rpm-cache-save:
+	@rm -rf "$(RPM_CACHE)" && \
+	cid=$$($(PODMAN) create "$(RPM_IMAGE)") && \
+	trap "$(PODMAN) rm -f $$cid >/dev/null" EXIT && \
+	for p in $(RPM_CACHE_PATHS); do \
+	    mkdir -p "$(RPM_CACHE)/$$(dirname "$$p")" && \
+	    $(PODMAN) cp "$$cid:/home/microshift/microshift/$$p" "$(RPM_CACHE)/$$p" || exit 1; \
+	done
+
+.PHONY: rpm-cache-load
+rpm-cache-load:
+	printf 'FROM %s\nCOPY . /home/microshift/microshift/\n' "$(BUILDROOT_IMAGE)" | \
+	    $(PODMAN) build --pull=never -t "$(RPM_IMAGE)" -f - "$(RPM_CACHE)"
+
 .PHONY: smoke
 smoke:
 	DIST_IMAGE="$(DIST_IMAGE)" ./scripts/smoke-test.sh
@@ -114,14 +143,6 @@ vm-test-upgrade:
 .PHONY: multinode-test
 multinode-test:
 	DIST_IMAGE="$(DIST_IMAGE)" ./scripts/multinode-test.sh
-
-.PHONY: multinode-smoke
-multinode-smoke:
-	DIST_IMAGE="$(DIST_IMAGE)" ./scripts/multinode-smoke.sh
-
-.PHONY: multinode-smoke-clean
-multinode-smoke-clean:
-	DIST_IMAGE="$(DIST_IMAGE)" CLEAN=1 ./scripts/multinode-smoke.sh
 
 .PHONY: smoke-clean
 smoke-clean:

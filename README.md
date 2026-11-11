@@ -99,8 +99,6 @@ sudo make vm-test          # acceptance: bootc-image-builder -> qcow2 -> QEMU bo
 sudo make vm-test-upgrade  # the same assertions after a real update: boot the
                            # previously published image, bootc switch to the
                            # candidate, reboot
-sudo make multinode-smoke  # worker join in two privileged containers: join
-                           # mechanics, certs, cross-node pod/service traffic
 sudo make multinode-test   # two-VM worker join: bootc deploy + firewalld +
                            # greenboot + the same cross-node dataplane asserts,
                            # then a controller update the worker follows
@@ -142,6 +140,12 @@ survived, that the data version moved to the candidate's, and that the
 pre-upgrade data was backed up for a rollback. The upgrade itself is gated
 before anything publishes. `smoke` remains the fast inner loop for local
 iteration.
+
+CI builds the image once per commit; `vm-test`, both upgrade lanes and
+`multinode-test` then run in parallel on it, and publishing waits for all of
+them. The RPM stages are reused from cache while their inputs (pins,
+`patches/`, their Containerfiles and scripts, the buildroot image) are
+unchanged.
 
 ## Versioning
 
@@ -258,12 +262,12 @@ losing the controller means losing the cluster. Cluster-to-cluster (C2CC) routes
 on the controller only: each worker is its own OVN zone, and the route manager
 programs the controller's.
 
-Two suites gate the topology: `multinode-smoke` (containers; join
-mechanics, cert flow, cross-node pod-to-pod, pod-to-service and cluster
-DNS) and `multinode-test` (two QEMU VMs; the same dataplane asserts on a
-real bootc deployment with firewalld running and greenboot green on both
-roles, then a controller update the worker follows by digest once the
-update lock is free, and the update gate skipping a rolled-back image).
+`multinode-test` gates the topology on two QEMU VMs: what the join token
+and the worker's accounts may do, no signing material on the worker,
+cross-node pod-to-pod, pod-to-service and cluster DNS on a real bootc
+deployment with firewalld running and greenboot green on both roles, then a
+controller update the worker follows by digest once the update lock is free,
+and the update gate skipping a rolled-back image.
 
 ## Patch policy
 
