@@ -10,7 +10,7 @@ Published at `ghcr.io/epheo/microshift`.
 | Opinion | How |
 |---|---|
 | OVN-Kubernetes is the CNI | `microshift-networking` installed; no kindnet |
-| The node's NIC is in br-ex, as on OpenShift | OpenShift's own `configure-ovs.sh`, NetworkManager and OVS settings, vendored from the payload's machine-config-operator (`src/ovs`), move the default-route NIC and its IP configuration into br-ex at boot. `patches/0015` runs OVN-Kubernetes' shared gateway with OpenShift's `ipForwarding: Restricted`, and makes the node IP the kubernetes endpoint: pod egress leaves through OVN, never the host's routes. A node needs a NetworkManager-managed default-route NIC |
+| The node's NIC is in br-ex, as on OpenShift | OpenShift's own `configure-ovs.sh`, NetworkManager and OVS settings, vendored from the payload's machine-config-operator (`src/ovs`), move the NIC holding the node IP, and its IP configuration, into br-ex at boot. `patches/0015` runs OVN-Kubernetes' shared gateway with OpenShift's `ipForwarding: Restricted`, and makes the node IP the kubernetes endpoint: pod egress leaves through OVN, never the host's routes. A node needs that NIC managed by NetworkManager; booted as a container, the image gives the runtime's NIC that profile itself (`microshift-container-nic`), so a container gets the same br-ex |
 | OVN secondary networks work out of the box | `patches/0001` adds `enable-multi-network=true` to the ovnkube-config template at the source |
 | Secondary networks take policies | `patches/0010` adds `enable-multi-networkpolicy=true` and the MultiNetworkPolicy CRD (taken at build time from the payload's cluster-network-operator) to MicroShift's own CRD list, applied before OVN starts: OVN-Kubernetes waits for it at start |
 | Cluster-wide policies | `patches/0011` adds `enable-admin-network-policy=true`, the AdminNetworkPolicy and BaselineAdminNetworkPolicy CRDs (taken at build time from the payload's cluster-network-operator) to MicroShift's CRD list, and the OVN controller's rights to read them and write their status: a namespace's NetworkPolicy cannot override an admin Deny |
@@ -141,9 +141,10 @@ pre-upgrade data was backed up for a rollback. The upgrade itself is gated
 before anything publishes. `smoke` remains the fast inner loop for local
 iteration.
 
-CI builds the image once per commit; `vm-test`, both upgrade lanes and
-`multinode-test` then run in parallel on it, and publishing waits for all of
-them. The RPM stages are reused from cache while their inputs (pins,
+CI builds the image once per commit; `vm-test`, both upgrade lanes,
+`multinode-test` and `smoke` (the image booted as a plain privileged podman
+container, as dotvirt's CI runs it) then run in parallel on it, and
+publishing waits for all of them. The RPM stages are reused from cache while their inputs (pins,
 `patches/`, their Containerfiles and scripts, the buildroot image) are
 unchanged.
 
