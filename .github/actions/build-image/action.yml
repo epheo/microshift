@@ -63,4 +63,4 @@ runs:
 
     - name: Build bootc image
       shell: bash
-      run: make image PODMAN="sudo podman"
+      run: make image PODMAN="sudo podman" LAYERS=false

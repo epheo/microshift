@@ -21,6 +21,12 @@ SUDO_PODMAN ?= sudo podman
 # Base images are moving tags; never build on a stale local copy. A failed
 # check falls back to the local image.
 PULL ?= newer
+# CI builds image with LAYERS=false: its store starts empty, so intermediate
+# layers cache nothing and cost a commit per step (about 7 s each, 8 min a
+# build). podman then commits once, everything above the base in one layer.
+# Updates download the same bytes either way: no release has ever shared one
+# of our layers with the previous one, as file times differ on every build.
+LAYERS ?= true
 
 SRPM_IMAGE := epheo-microshift-srpm
 RPM_IMAGE  := epheo-microshift-rpm
@@ -50,7 +56,7 @@ rpm:
 
 .PHONY: image
 image:
-	$(PODMAN) build --pull=$(PULL) \
+	$(PODMAN) build --pull=$(PULL) --layers=$(LAYERS) \
 	    -t "$(DIST_IMAGE)" \
 	    --ulimit nofile=524288:524288 \
 	    --label microshift.ref="$(USHIFT_GITREF)" \
