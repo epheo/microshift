@@ -78,6 +78,10 @@ ARG BUILDER_RSHARED_SERVICE=/home/microshift/microshift/packaging/imagemode/syst
 # every dnf transaction in this image and in derived/site images.
 RUN echo 'excludepkgs=kernel-debug*' >> /etc/dnf/dnf.conf
 
+# Checked after the last dnf transaction; the script says why.
+COPY --chmod=755 ./src/rpm/base-rpms.sh /tmp/base-rpms.sh
+RUN /tmp/base-rpms.sh snapshot
+
 # Install MicroShift with the OVN + multus + greenboot selection, and the
 # DRBD module built above. Runtime dependencies (cri-o, openvswitch, ...) come
 # from the public mirror.openshift.com dependencies repo configured by
@@ -165,6 +169,7 @@ COPY ./src/firewall/microshift-controlplane.xml \
 # service enablement).
 COPY --chmod=755 ./src/rpm/postinstall.sh ${USHIFT_POSTINSTALL_SCRIPT}
 RUN ${USHIFT_POSTINSTALL_SCRIPT} && rm -vf "${USHIFT_POSTINSTALL_SCRIPT}"
+RUN /tmp/base-rpms.sh check && rm -vf /tmp/base-rpms.sh
 
 # postinstall's dnf transaction above is the last one in this image (later
 # stages only run skopeo/systemctl). overlayfs makes semodule non-atomic inside
