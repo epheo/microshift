@@ -503,6 +503,17 @@ done
 log "assert: the DRBD module is loaded"
 vssh grep -q '^drbd ' /proc/modules
 
+# systemd keeps firewalld active when its daemon fails to initialize: ask
+# firewalld itself.
+log "assert: firewalld runs and serves MicroShift's control plane"
+[ "$(vssh firewall-cmd --state 2>&1)" = running ] || {
+    echo "ERROR: firewalld is not running:" >&2
+    vssh journalctl -u firewalld -b --no-pager 2>&1 | tail -30 >&2
+    exit 1
+}
+vssh firewall-cmd --zone=public --query-service=microshift-controlplane >/dev/null || {
+    echo "ERROR: the public zone lacks microshift-controlplane" >&2; exit 1; }
+
 # #12: an OS upgrade can ship a new image under the same tag. Simulate it by
 # re-pointing the portail tag at a payload image; the import must restore it.
 log "assert: a re-pointed embedded tag is re-imported"

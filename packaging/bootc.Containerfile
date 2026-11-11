@@ -37,20 +37,13 @@ FROM ${RPM_IMAGE} AS builder
 # kernel, so a base kernel bump rebuilds it. KDIR pins the kmp build to that
 # kernel (the spec takes the build host's uname -r otherwise). No debuginfo:
 # the debug-source scan finds nothing under %_builddir and fails rpmbuild.
-# kernel-devel comes from the very compose the base was built from (its
-# buildinfo names it): the mirrors can trail a fresh base kernel by days.
 FROM ${BOOTC_IMAGE_URL}:${BOOTC_IMAGE_TAG} AS drbd-kmod
 ARG DRBD_VERSION
 ARG DRBD_SHA256
+COPY --chmod=755 ./src/rpm/base-compose.sh /tmp/base-compose.sh
 RUN test -n "${DRBD_VERSION}" -a -n "${DRBD_SHA256}" && \
     kver="$(ls /usr/lib/modules)" && \
-    compose="$(sed -n 's/.*"redhat.compose-id": "\([^"]*\)".*/\1/p' /usr/share/buildinfo/labels.json)" && \
-    test -n "${compose}" && \
-    printf '%s\n' '[base-compose-appstream]' \
-        "name=AppStream of ${compose}, the compose this base was built from" \
-        "baseurl=https://composes.stream.centos.org/stream-10/production/${compose}/compose/AppStream/\$basearch/os/" \
-        'gpgcheck=1' 'gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial-SHA256' \
-        > /etc/yum.repos.d/base-compose.repo && \
+    /tmp/base-compose.sh add && \
     dnf -y install "kernel-devel-${kver}" gcc make rpm-build kernel-rpm-macros \
         redhat-rpm-config elfutils-libelf-devel patch diffutils perl-interpreter && \
     curl -fsSL --retry 3 -o /tmp/drbd.tar.gz \
@@ -77,6 +70,11 @@ ARG BUILDER_RSHARED_SERVICE=/home/microshift/microshift/packaging/imagemode/syst
 # as weak-dependency resolutions of the package set below — exclude them from
 # every dnf transaction in this image and in derived/site images.
 RUN echo 'excludepkgs=kernel-debug*' >> /etc/dnf/dnf.conf
+
+# Every dnf transaction below also sees the compose this base was built
+# from, and none may downgrade a base package; the scripts say why.
+COPY --chmod=755 ./src/rpm/base-rpms.sh ./src/rpm/base-compose.sh /tmp/
+RUN /tmp/base-rpms.sh snapshot && /tmp/base-compose.sh add
 
 # Install MicroShift with the OVN + multus + greenboot selection, and the
 # DRBD module built above. Runtime dependencies (cri-o, openvswitch, ...) come
@@ -165,6 +163,8 @@ COPY ./src/firewall/microshift-controlplane.xml \
 # service enablement).
 COPY --chmod=755 ./src/rpm/postinstall.sh ${USHIFT_POSTINSTALL_SCRIPT}
 RUN ${USHIFT_POSTINSTALL_SCRIPT} && rm -vf "${USHIFT_POSTINSTALL_SCRIPT}"
+RUN /tmp/base-compose.sh remove && /tmp/base-rpms.sh check && \
+    rm -vf /tmp/base-rpms.sh /tmp/base-compose.sh
 
 # postinstall's dnf transaction above is the last one in this image (later
 # stages only run skopeo/systemctl). overlayfs makes semodule non-atomic inside
