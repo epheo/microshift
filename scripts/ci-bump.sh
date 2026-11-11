@@ -44,7 +44,7 @@ fi
 git -c user.name="github-actions[bot]" \
     -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
     commit -q -m "chore: bump pinned versions" \
-    -m "$(git diff versions.env | grep '^[+-][A-Z]' || true)" -- versions.env src/rbac
+    -m "$(git diff versions.env | grep '^[+-][A-Z]' || true)" -- versions.env src/rbac src/ovs src/cni
 # The branch only ever holds the latest attempt.
 git push -q --force origin "HEAD:refs/heads/${BRANCH}"
 out changed true

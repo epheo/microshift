@@ -1,0 +1,761 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Thibaut Lapierre <root@epheo.eu>
+Date: Tue, 10 Nov 2026 22:26:39 +0100
+Subject: [PATCH 15/16] ovn: shared gateway, the node IP as apiserver endpoint
+
+OVN-Kubernetes runs in shared gateway mode with the node's NIC in br-ex,
+OpenShift's topology: the image's configure-ovs moves the uplink and its
+IP configuration into br-ex. Pod egress leaves through the gateway router
+and the NIC, not the host routing table. --allow-no-uplink goes.
+
+Forwarding follows OpenShift's default, ipForwarding Restricted: global
+IPv4 and IPv6 forwarding off, --disable-forwarding, ovnkube enables it on
+the interfaces it owns. With the NIC in br-ex, global forwarding would
+route between the uplink and every other host interface.
+
+The apiserver advertise address defaults to the node IP, as on OpenShift.
+The virtual first address after the service CIDR only worked because it
+was br-ex's only address: ovnkube took it as the gateway IP and hairpinned
+it. Next to the node IP it is neither hairpinned for host-network clients
+nor reachable from other nodes' pods, whose traffic now bypasses host
+routes. So:
+- nothing is added to an interface; workers lose the /32 alias and the
+  routes to the control plane they needed for it.
+- the node IP is served the service-network certificate, which pods
+  validate against 10.43.0.1, never the external one: a subjectAltNames
+  entry equal to the advertise address stays out of the external
+  certificate, and its kubeconfig trusts the service-network signer.
+- the advertise address always gets a kubeconfig, the node IP that
+  worker-join-kubeconfig defaults to.
+- validation checks a user-set advertise address on the host as before,
+  not the node IP default.
+
+mDNS listens on br-ex and node IP detection reads it: br-ex holds the node
+IP. microshift-cleanup-data starts Open vSwitch again after the OVN wipe,
+since stopping ovsdb-server takes ovs-vswitchd and the uplink down.
+---
+ assets/components/ovn/common/configmap.yaml   |   2 +-
+ .../ovn/multi-node/master/daemonset.yaml      |  10 +-
+ .../ovn/multi-node/node/daemonset.yaml        |  11 +-
+ .../ovn/single-node/master/daemonset.yaml     |  13 +-
+ .../components/ovn/zones/node/daemonset.yaml  |  13 +-
+ .../config/config-openapi-spec.json           |   2 +-
+ packaging/microshift/config.yaml              |   9 +-
+ pkg/cmd/addnode_worker.go                     |  10 +-
+ pkg/cmd/init.go                               |  35 +++-
+ pkg/config/apiserver.go                       |  23 +--
+ pkg/config/config.go                          |  59 ++-----
+ pkg/config/config_test.go                     |   2 +
+ pkg/config/multinode.go                       |   3 -
+ pkg/mdns/controller.go                        |   5 +-
+ pkg/node/netconfig.go                         | 156 +-----------------
+ pkg/util/net.go                               |   7 +-
+ scripts/microshift-cleanup-data.sh            |   4 +
+ 17 files changed, 111 insertions(+), 253 deletions(-)
+
+diff --git a/assets/components/ovn/common/configmap.yaml b/assets/components/ovn/common/configmap.yaml
+index 0c7a9334f3ab2cca71f359b0d0b524d3301963ed..95ed0e71bc6f192c5a746aff4ce31b6b2882d2a5 100644
+--- a/assets/components/ovn/common/configmap.yaml
++++ b/assets/components/ovn/common/configmap.yaml
+@@ -34,7 +34,7 @@ data:
+     enable-admin-network-policy=true
+ 
+     [gateway]
+-    mode=local
++    mode=shared
+     nodeport=true
+ 
+     [masterha]
+diff --git a/assets/components/ovn/multi-node/master/daemonset.yaml b/assets/components/ovn/multi-node/master/daemonset.yaml
+index d6cc7e4e37689cb1eb22213fb52412e15c36a2e2..b719de365b49c78a22ee06f6777828d964025df8 100644
+--- a/assets/components/ovn/multi-node/master/daemonset.yaml
++++ b/assets/components/ovn/multi-node/master/daemonset.yaml
+@@ -424,9 +424,14 @@ spec:
+           # K8S_NODE_IP triggers reconcilation of this daemon when node IP changes
+           echo "$(date -Iseconds) - starting ovnkube-master, Node: ${K8S_NODE} IP: ${K8S_NODE_IP}"
+ 
+-          gateway_mode_flags="--gateway-mode local --gateway-interface br-ex"
++          gateway_mode_flags="--gateway-mode shared --gateway-interface br-ex"
+ 
+-          sysctl net.ipv4.ip_forward=1
++          # OpenShift's default ipForwarding: Restricted. With the NIC in br-ex,
++          # global forwarding would route between the uplink and every other
++          # host interface; ovnkube enables it on the interfaces it owns.
++          ip_forwarding_flag="--disable-forwarding"
++          sysctl -w net.ipv4.ip_forward=0
++          sysctl -w net.ipv6.conf.all.forwarding=0
+ 
+           echo "I$(date "+%m%d %H:%M:%S.%N") - ovnkube-master - start ovnkube --init-master ${K8S_NODE}"
+           exec /usr/bin/ovnkube \
+@@ -434,6 +439,7 @@ spec:
+             --config-file=/run/ovnkube-config/ovnkube.conf \
+             --loglevel "${OVN_KUBE_LOG_LEVEL}" \
+             ${gateway_mode_flags} \
++            ${ip_forwarding_flag} \
+             --inactivity-probe="180000" \
+             --enable-multicast \
+             --disable-snat-multiple-gws \
+diff --git a/assets/components/ovn/multi-node/node/daemonset.yaml b/assets/components/ovn/multi-node/node/daemonset.yaml
+index 728c953645d9fe221e9838d1886f7f0b2811f4bc..6283b4f6d1fcb2f1ceeadd8992ca01d301ef8f23 100644
+--- a/assets/components/ovn/multi-node/node/daemonset.yaml
++++ b/assets/components/ovn/multi-node/node/daemonset.yaml
+@@ -143,9 +143,14 @@ spec:
+           ip6tables -t raw -A OUTPUT -p udp --dport 6081 -j NOTRACK
+           echo "I$(date "+%m%d %H:%M:%S.%N") - starting ovnkube-node"
+ 
+-          gateway_mode_flags="--gateway-mode local --gateway-interface br-ex"
++          gateway_mode_flags="--gateway-mode shared --gateway-interface br-ex"
+ 
+-          sysctl net.ipv4.ip_forward=1
++          # OpenShift's default ipForwarding: Restricted. With the NIC in br-ex,
++          # global forwarding would route between the uplink and every other
++          # host interface; ovnkube enables it on the interfaces it owns.
++          ip_forwarding_flag="--disable-forwarding"
++          sysctl -w net.ipv4.ip_forward=0
++          sysctl -w net.ipv6.conf.all.forwarding=0
+ 
+           gw_interface_flag=
+           # if br-ex1 is configured on the node, we want to use it for external gateway traffic
+@@ -162,8 +167,8 @@ spec:
+             --init-node "${K8S_NODE}" \
+             --config-file=/run/ovnkube-config/ovnkube.conf \
+             --loglevel "${OVN_KUBE_LOG_LEVEL}" \
+-            --allow-no-uplink \
+             ${gateway_mode_flags} \
++            ${ip_forwarding_flag} \
+             ${gw_interface_flag} \
+             --inactivity-probe="180000" \
+             --disable-snat-multiple-gws \
+diff --git a/assets/components/ovn/single-node/master/daemonset.yaml b/assets/components/ovn/single-node/master/daemonset.yaml
+index fabae2eddea010711ba7103b60e672d0134b6b09..f2b9700e638040da23b39e2787d15f8b8133794b 100644
+--- a/assets/components/ovn/single-node/master/daemonset.yaml
++++ b/assets/components/ovn/single-node/master/daemonset.yaml
+@@ -374,11 +374,14 @@ spec:
+           ip6tables -t raw -A OUTPUT -p udp --dport 6081 -j NOTRACK
+           echo "I$(date "+%m%d %H:%M:%S.%N") - starting ovnkube-node"
+ 
+-          gateway_mode_flags="--gateway-mode local --gateway-interface br-ex"
++          gateway_mode_flags="--gateway-mode shared --gateway-interface br-ex"
+ 
+-          sysctl net.ipv4.ip_forward=1
+-          sysctl net.ipv6.conf.all.forwarding=1
+-          sysctl net.ipv6.conf.default.forwarding=1
++          # OpenShift's default ipForwarding: Restricted. With the NIC in br-ex,
++          # global forwarding would route between the uplink and every other
++          # host interface; ovnkube enables it on the interfaces it owns.
++          ip_forwarding_flag="--disable-forwarding"
++          sysctl -w net.ipv4.ip_forward=0
++          sysctl -w net.ipv6.conf.all.forwarding=0
+ 
+           gw_interface_flag=
+           # if br-ex1 is configured on the node, we want to use it for external gateway traffic
+@@ -391,10 +394,10 @@ spec:
+           exec /usr/bin/ovnkube \
+             --init-ovnkube-controller "${K8S_NODE}" \
+             --init-node "${K8S_NODE}" \
+-            --allow-no-uplink \
+             --config-file=/run/ovnkube-config/ovnkube.conf \
+             --loglevel "${OVN_KUBE_LOG_LEVEL}" \
+             ${gateway_mode_flags} \
++            ${ip_forwarding_flag} \
+             ${gw_interface_flag} \
+             --inactivity-probe="180000" \
+             --enable-multicast \
+diff --git a/assets/components/ovn/zones/node/daemonset.yaml b/assets/components/ovn/zones/node/daemonset.yaml
+index 47a78f8cca514f63cd050ffc59fb02e82101689e..89460fb4d9c60ffc7b61d46ff1bdc83106627cfc 100644
+--- a/assets/components/ovn/zones/node/daemonset.yaml
++++ b/assets/components/ovn/zones/node/daemonset.yaml
+@@ -425,11 +425,14 @@ spec:
+           ip6tables -t raw -A OUTPUT -p udp --dport 6081 -j NOTRACK
+           echo "I$(date "+%m%d %H:%M:%S.%N") - starting ovnkube-node"
+ 
+-          gateway_mode_flags="--gateway-mode local --gateway-interface br-ex"
++          gateway_mode_flags="--gateway-mode shared --gateway-interface br-ex"
+ 
+-          sysctl net.ipv4.ip_forward=1
+-          sysctl net.ipv6.conf.all.forwarding=1
+-          sysctl net.ipv6.conf.default.forwarding=1
++          # OpenShift's default ipForwarding: Restricted. With the NIC in br-ex,
++          # global forwarding would route between the uplink and every other
++          # host interface; ovnkube enables it on the interfaces it owns.
++          ip_forwarding_flag="--disable-forwarding"
++          sysctl -w net.ipv4.ip_forward=0
++          sysctl -w net.ipv6.conf.all.forwarding=0
+ 
+           gw_interface_flag=
+           # if br-ex1 is configured on the node, we want to use it for external gateway traffic
+@@ -443,10 +446,10 @@ spec:
+             --init-ovnkube-controller "${K8S_NODE}" \
+             --init-node "${K8S_NODE}" \
+             --zone "${K8S_NODE}" \
+-            --allow-no-uplink \
+             --config-file=/run/ovnkube-config/ovnkube.conf \
+             --loglevel "${OVN_KUBE_LOG_LEVEL}" \
+             ${gateway_mode_flags} \
++            ${ip_forwarding_flag} \
+             ${gw_interface_flag} \
+             --inactivity-probe="180000" \
+             --enable-multicast \
+diff --git a/cmd/generate-config/config/config-openapi-spec.json b/cmd/generate-config/config/config-openapi-spec.json
+index 941b24728dbe5e2ac909f31eff83d6de4f3bcad4..5afa59110985ab672a522b423b3e2e4e6575f6e9 100755
+--- a/cmd/generate-config/config/config-openapi-spec.json
++++ b/cmd/generate-config/config/config-openapi-spec.json
+@@ -28,7 +28,7 @@
+       ],
+       "properties": {
+         "advertiseAddress": {
+-          "description": "Kube apiserver advertise address to work around the certificates issue\nwhen requiring external access using the node IP. This will turn into\nthe IP configured in the endpoint slice for kubernetes service. Must be\na reachable IP from pods. Defaults to service network CIDR first\naddress.",
++          "description": "Kube apiserver advertise address: the IP in the endpoint slice of the\nkubernetes service. Must be on a host interface and reachable from\npods and other nodes. Defaults to the node IP, as on OpenShift. It is\nserved the service-network certificate, never the external one.",
+           "type": "string"
+         },
+         "auditLog": {
+diff --git a/packaging/microshift/config.yaml b/packaging/microshift/config.yaml
+index 3fd232c32bbb48fe21c07e2322586d25decd1f21..9fda6acc7a5f51b5d220276149d1d6a959f1b16b 100644
+--- a/packaging/microshift/config.yaml
++++ b/packaging/microshift/config.yaml
+@@ -1,9 +1,8 @@
+ apiServer:
+-    # Kube apiserver advertise address to work around the certificates issue
+-    # when requiring external access using the node IP. This will turn into
+-    # the IP configured in the endpoint slice for kubernetes service. Must be
+-    # a reachable IP from pods. Defaults to service network CIDR first
+-    # address.
++    # Kube apiserver advertise address: the IP in the endpoint slice of the
++    # kubernetes service. Must be on a host interface and reachable from
++    # pods and other nodes. Defaults to the node IP, as on OpenShift. It is
++    # served the service-network certificate, never the external one.
+     advertiseAddress: ""
+     auditLog:
+         # maxFileAge is the maximum number of days to retain old audit log files
+diff --git a/pkg/cmd/addnode_worker.go b/pkg/cmd/addnode_worker.go
+index 8ea05a0d6160a5c346504677792f025711a81212..448ded789d222172a3e294b0154a0af4b4e7ea32 100644
+--- a/pkg/cmd/addnode_worker.go
++++ b/pkg/cmd/addnode_worker.go
+@@ -90,9 +90,9 @@ func runAddWorker(ctx context.Context, opts *AddNodeOptions) error {
+ 	}()
+ 
+ 	// The role marker drives role-agnostic tools (healthcheck, greenboot) and
+-	// carries the control plane's routable IP: the worker routes the virtual
+-	// apiserver advertise address through it, and the bootstrap kubeconfig,
+-	// gone after the join, is the only other place that knows it.
++	// carries the control plane's routable IP: ovnkube reaches the apiserver
++	// at it, and the bootstrap kubeconfig, gone after the join, is the only
++	// other place that knows it.
+ 	cpIP, err := resolveControlplaneIP(opts.KubeconfigPath)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to resolve the control plane address: %w", err)
+@@ -147,8 +147,8 @@ func resolveControlplaneIP(kubeconfigPath string) (string, error) {
+ 	if len(addrs) == 0 {
+ 		return "", fmt.Errorf("cannot resolve control plane host %q", host)
+ 	}
+-	// Prefer v4: the advertise address the worker routes through it is v4
+-	// unless the cluster is single-stack v6.
++	// Prefer v4: the controller's advertise address, which ovnkube reaches
++	// it at, is v4 unless the cluster is single-stack v6.
+ 	for _, a := range addrs {
+ 		if ip := net.ParseIP(a); ip != nil && ip.To4() != nil {
+ 			return ip.String(), nil
+diff --git a/pkg/cmd/init.go b/pkg/cmd/init.go
+index 8c8e9ec6ff3affb2e6783a96c1282885b101be04..ccf59b580876185a889ce6eda00a0a638e256075 100644
+--- a/pkg/cmd/init.go
++++ b/pkg/cmd/init.go
+@@ -22,6 +22,7 @@ import (
+ 	"net/url"
+ 	"os"
+ 	"path/filepath"
++	"slices"
+ 	"strconv"
+ 	"time"
+ 
+@@ -90,7 +91,12 @@ func certSetup(cfg *config.Config) (*certchains.CertificateChains, error) {
+ 		cfg.Node.HostnameOverride,
+ 		"api." + cfg.DNS.BaseDomain,
+ 	}
+-	externalCertNames = append(externalCertNames, cfg.ApiServer.SubjectAltNames...)
++	for _, name := range cfg.ApiServer.SubjectAltNames {
++		// The advertise address belongs to the service-network certificate.
++		if !slices.Contains(cfg.ApiServer.AdvertiseAddresses, name) {
++			externalCertNames = append(externalCertNames, name)
++		}
++	}
+ 	// When Kube apiserver advertise address matches the node IP we can not add
+ 	// it to the certificates or else the internal pod access to apiserver is
+ 	// broken. Because of client-go not using SNI and the way apiserver handles
+@@ -414,6 +420,10 @@ func initKubeconfigs(
+ 	if err != nil {
+ 		return fmt.Errorf("failed to load the internal trust signer: %v", err)
+ 	}
++	serviceNetworkTrustPEM, err := os.ReadFile(cryptomaterial.CACertPath(cryptomaterial.KubeAPIServerServiceNetworkSigner(cryptomaterial.CertsDirectory(config.DataDir))))
++	if err != nil {
++		return fmt.Errorf("failed to load the service network trust signer: %v", err)
++	}
+ 
+ 	adminKubeconfigCertPEM, adminKubeconfigKeyPEM, err := certChains.GetCertKey("admin-kubeconfig-signer", "admin-kubeconfig-client")
+ 	if err != nil {
+@@ -426,12 +436,16 @@ func initKubeconfigs(
+ 	}
+ 
+ 	// Generate one kubeconfigs per name
+-	for _, name := range append(cfg.ApiServer.SubjectAltNames, cfg.Node.HostnameOverride) {
++	for _, name := range externalKubeconfigNames(cfg) {
+ 		u.Host = net.JoinHostPort(name, strconv.Itoa(cfg.ApiServer.Port))
++		trustPEM := externalTrustPEM
++		if slices.Contains(cfg.ApiServer.AdvertiseAddresses, name) {
++			trustPEM = serviceNetworkTrustPEM
++		}
+ 		if err := util.KubeConfigWithClientCerts(
+ 			cfg.KubeConfigAdminPath(name),
+ 			u.String(),
+-			externalTrustPEM,
++			trustPEM,
+ 			adminKubeconfigCertPEM,
+ 			adminKubeconfigKeyPEM,
+ 		); err != nil {
+@@ -619,9 +633,22 @@ func certsToRegenerate(cs *certchains.CertificateChains) ([][]string, error) {
+ 	return regenCerts, err
+ }
+ 
++// externalKubeconfigNames are the names that get a kubeconfig under
++// resources/kubeadmin. The advertise address is always one: it is the node IP
++// 'worker-join-kubeconfig' defaults to.
++func externalKubeconfigNames(cfg *config.Config) []string {
++	names := append(slices.Clone(cfg.ApiServer.SubjectAltNames), cfg.Node.HostnameOverride)
++	for _, ip := range cfg.ApiServer.AdvertiseAddresses {
++		if !slices.Contains(names, ip) {
++			names = append(names, ip)
++		}
++	}
++	return names
++}
++
+ func cleanupStaleKubeconfigs(cfg *config.Config, path string) error {
+ 	currentKubeconfigs := make(map[string]struct{})
+-	for _, name := range append(cfg.ApiServer.SubjectAltNames, cfg.Node.HostnameOverride) {
++	for _, name := range externalKubeconfigNames(cfg) {
+ 		currentKubeconfigs[name] = struct{}{}
+ 	}
+ 	dirs, err := os.ReadDir(path)
+diff --git a/pkg/config/apiserver.go b/pkg/config/apiserver.go
+index e58c15d3413764f52075173cfb9d9dbb2029969f..c2b24b0af8f838bb19c44c04d659b928f26df193 100644
+--- a/pkg/config/apiserver.go
++++ b/pkg/config/apiserver.go
+@@ -14,16 +14,16 @@ import (
+ type ApiServer struct {
+ 	// SubjectAltNames added to API server certs
+ 	SubjectAltNames []string `json:"subjectAltNames"`
+-	// Kube apiserver advertise address to work around the certificates issue
+-	// when requiring external access using the node IP. This will turn into
+-	// the IP configured in the endpoint slice for kubernetes service. Must be
+-	// a reachable IP from pods. Defaults to service network CIDR first
+-	// address.
++	// Kube apiserver advertise address: the IP in the endpoint slice of the
++	// kubernetes service. Must be on a host interface and reachable from
++	// pods and other nodes. Defaults to the node IP, as on OpenShift. It is
++	// served the service-network certificate, never the external one.
+ 	AdvertiseAddress string `json:"advertiseAddress,omitempty"`
+ 	// List of custom certificates used to secure requests to specific host names
+ 	NamedCertificates []NamedCertificateEntry `json:"namedCertificates"`
+ 	// Determines if kube-apiserver controller should configure the
+-	// AdvertiseAddress in the loopback interface. Automatically computed.
++	// AdvertiseAddress on an interface. Always true: the advertise address
++	// is a host address.
+ 	SkipInterface bool `json:"-"`
+ 
+ 	AuditLog AuditLog `json:"auditLog"`
+@@ -46,16 +46,7 @@ type ApiServer struct {
+ 	URL  string `json:"-"`
+ 	Port int    `json:"-"`
+ 
+-	// In dual stack mode, ovnk requires ovn.OVNGatewayInterface to have one IP
+-	// per family or else it wont start. When configuring advertiseAddress,
+-	// whether that is manual or automatic, this IP is configured in that
+-	// bridge afterwards in node package. Since there is only one IP, ovnk will
+-	// return an error complaining about the other IP family for the secondary
+-	// cluster/service network gateway. This variable holds all the different
+-	// IP addresses that ovn.OVNGatewayInterface needs. Note that this IP is
+-	// not configurable by users and it will not be used for apiserver
+-	// advertising because of dual stack limitations there. This is only to
+-	// make ovnk work properly.
++	// AdvertiseAddress, as a list for the code that takes one per family.
+ 	AdvertiseAddresses []string `json:"-"`
+ }
+ 
+diff --git a/pkg/config/config.go b/pkg/config/config.go
+index 4b1075761d59768553584c4ebe3c28e0f7667978..3ecef1bc5d56dcdc73190b2e4ae5133cdce68200 100644
+--- a/pkg/config/config.go
++++ b/pkg/config/config.go
+@@ -556,39 +556,19 @@ func (c *Config) updateComputedValues() error {
+ 	}
+ 	c.Network.DNS = clusterDNS
+ 
+-	// If KAS advertise address configured, we do not want to apply
+-	// the IP to the internal interface.
+-	if c.userSettings != nil && len(c.userSettings.ApiServer.AdvertiseAddress) != 0 {
+-		c.ApiServer.SkipInterface = true
+-	}
+-
+-	// If we have no advertise address, pick one.
++	// The node IP is the apiserver endpoint, as on OpenShift. br-ex holds it
++	// and the shared gateway reaches it from pods, host-network pods and
++	// other nodes; a virtual address off the node's subnet would need a route
++	// on every gateway router. Nothing is added to an interface.
++	c.ApiServer.SkipInterface = true
+ 	if len(c.ApiServer.AdvertiseAddress) == 0 {
+-		// Since the KAS advertise address was not provided we will default to the
+-		// next immediate subnet after the service CIDR. This is due to the fact
+-		// that using the actual apiserver service IP as an endpoint slice breaks
+-		// host network pods trying to reach apiserver, as the VIP 10.43.0.1:443 is
+-		// not translated to 10.43.0.1:6443. It remains unchanged and therefore
+-		// connects to the ingress router instead, triggering all sorts of errors.
+-		ip, err := firstIPFromNextSubnet(c.Network.ServiceNetwork[0])
+-		if err != nil {
+-			return fmt.Errorf("unable to compute AdvertiseAddress: %s", err)
++		c.ApiServer.AdvertiseAddress = c.Node.NodeIP
++		if c.IsIPv4() && c.IsIPv6() &&
++			netutils.IPFamilyOfString(c.Node.NodeIP) != netutils.IPFamilyOfCIDRString(c.Network.ServiceNetwork[0]) {
++			c.ApiServer.AdvertiseAddress = c.Node.NodeIPV6
+ 		}
+-		c.ApiServer.AdvertiseAddress = ip
+ 	}
+-
+-	// Use this variable instead, as we may be in dual stack ip an need to
+-	// configure one extra IP address in the ovn gateway interface. Pick
+-	// the IP family that was not used for the advertise address and add
+-	// the first valid IP for the next subnet.
+ 	c.ApiServer.AdvertiseAddresses = []string{c.ApiServer.AdvertiseAddress}
+-	if c.IsIPv4() && c.IsIPv6() {
+-		ip, err := firstIPFromNextSubnet(c.Network.ServiceNetwork[1])
+-		if err != nil {
+-			return fmt.Errorf("unable to compute secondary address for br-ex: %s", err)
+-		}
+-		c.ApiServer.AdvertiseAddresses = append(c.ApiServer.AdvertiseAddresses, ip)
+-	}
+ 
+ 	c.ApiServer.TLS.UpdateValues()
+ 
+@@ -614,7 +594,9 @@ func (c *Config) validate() error {
+ 	if c.ApiServer.AuthenticationConfig != "" && !filepath.IsAbs(c.ApiServer.AuthenticationConfig) {
+ 		return fmt.Errorf("apiServer.authenticationConfig must be an absolute path, got %q", c.ApiServer.AuthenticationConfig)
+ 	}
+-	if c.ApiServer.SkipInterface {
++	// The node IP default is not checked here, as before it became the
++	// default; a user-set address must already be on the host.
++	if c.ApiServer.SkipInterface && !c.advertisesNodeIP() {
+ 		err := checkAdvertiseAddressConfigured(c.ApiServer.AdvertiseAddress)
+ 		if err != nil {
+ 			return err
+@@ -676,12 +658,6 @@ func (c *Config) validate() error {
+ 		) {
+ 			return fmt.Errorf("subjectAltNames must not contain kubernetes service names")
+ 		}
+-		if stringSliceContains(
+-			c.ApiServer.SubjectAltNames,
+-			c.ApiServer.AdvertiseAddresses...,
+-		) {
+-			return fmt.Errorf("subjectAltNames must not contain apiserver advertise address IPs")
+-		}
+ 	}
+ 
+ 	if c.Etcd.MemoryLimitMB > 0 && c.Etcd.MemoryLimitMB < EtcdMinimumMemoryLimit {
+@@ -690,13 +666,6 @@ func (c *Config) validate() error {
+ 		)
+ 	}
+ 
+-	if c.ApiServer.SkipInterface {
+-		err := checkAdvertiseAddressConfigured(c.ApiServer.AdvertiseAddresses[0])
+-		if err != nil {
+-			return err
+-		}
+-	}
+-
+ 	switch c.Ingress.Status {
+ 	case StatusManaged, StatusRemoved:
+ 	default:
+@@ -835,6 +804,10 @@ func getAllHostnames() ([]string, error) {
+ 	return allHostnames, nil
+ }
+ 
++func (c *Config) advertisesNodeIP() bool {
++	return c.ApiServer.AdvertiseAddress == c.Node.NodeIP || c.ApiServer.AdvertiseAddress == c.Node.NodeIPV6
++}
++
+ func checkAdvertiseAddressConfigured(advertiseAddress string) error {
+ 	addrs, err := net.InterfaceAddrs()
+ 	if err != nil {
+diff --git a/pkg/config/config_test.go b/pkg/config/config_test.go
+index 2cac6168f76445a82559d195118449444b1d236d..1e3391db2c1e9194f493e979d3f91d97559a1bd7 100644
+--- a/pkg/config/config_test.go
++++ b/pkg/config/config_test.go
+@@ -186,6 +186,8 @@ func TestGetActiveConfigFromYAML(t *testing.T) {
+ 				c := mkDefaultConfig()
+ 				c.Node.HostnameOverride = "node1"
+ 				c.Node.NodeIP = "1.2.3.4"
++				c.ApiServer.AdvertiseAddress = "1.2.3.4"
++				c.ApiServer.AdvertiseAddresses = []string{"1.2.3.4"}
+ 				return c
+ 			}(),
+ 		},
+diff --git a/pkg/config/multinode.go b/pkg/config/multinode.go
+index 574acfe2bf76fb622c1bdada02d43b0ccd490aad..7f7d34af868367443b7d292d8712c85335e688b3 100644
+--- a/pkg/config/multinode.go
++++ b/pkg/config/multinode.go
+@@ -27,9 +27,6 @@ func ConfigMultiNode(c *Config, enabled bool, worker bool) *Config {
+ 	c.MultiNode.Controlplane = c.Node.NodeIP
+ 	c.MultiNode.Worker = worker
+ 	if worker {
+-		// The advertise address on lo would blackhole in-cluster apiserver
+-		// traffic on a node that serves no API.
+-		c.ApiServer.SkipInterface = true
+ 		// After a join the marker records the control plane's routable IP
+ 		// (the default above is this node's own, which is only right on
+ 		// the control plane itself).
+diff --git a/pkg/mdns/controller.go b/pkg/mdns/controller.go
+index 43c66404156c817cd7fe9b589c6ffa2688cd9878..021af010415f67ffef337cc40a9c4d8710a4f40d 100644
+--- a/pkg/mdns/controller.go
++++ b/pkg/mdns/controller.go
+@@ -54,10 +54,11 @@ func (c *MicroShiftmDNSController) Run(ctx context.Context, ready chan<- struct{
+ 
+ 	ifs, _ := net.Interfaces()
+ 
+-	// NOTE: this will listen the physical interface of the host.
++	// NOTE: this will listen the physical interface of the host. br-ex is
++	// one: it holds the uplink and the node IP, as on OpenShift.
+ 	for n := range ifs {
+ 		name := ifs[n].Name
+-		if ovn.IsOVNKubernetesInternalInterface(name) || name == ovn.OVNGatewayInterface {
++		if ovn.IsOVNKubernetesInternalInterface(name) {
+ 			continue
+ 		}
+ 		klog.Infof("mDNS: Starting server on interface %q, NodeIP %q, NodeName %q", name, c.NodeIP, c.NodeName)
+diff --git a/pkg/node/netconfig.go b/pkg/node/netconfig.go
+index a468bdbc477eb7879933565fdf59f9435ae311ce..7b689a3b665afe9385b4978eccfd82e3a8fee1b9 100644
+--- a/pkg/node/netconfig.go
++++ b/pkg/node/netconfig.go
+@@ -38,9 +38,6 @@ const (
+ type NetworkConfiguration struct {
+ 	kasAdvertiseAddresses      []string
+ 	skipInterfaceConfiguration bool
+-	workerNode                 bool
+-	nodeIP                     string
+-	controlplaneIP             string
+ }
+ 
+ func NewNetworkConfiguration(cfg *config.Config) *NetworkConfiguration {
+@@ -55,9 +52,6 @@ func (n *NetworkConfiguration) Dependencies() []string { return []string{} }
+ func (n *NetworkConfiguration) configure(cfg *config.Config) {
+ 	n.kasAdvertiseAddresses = cfg.ApiServer.AdvertiseAddresses
+ 	n.skipInterfaceConfiguration = cfg.ApiServer.SkipInterface
+-	n.workerNode = cfg.MultiNode.Enabled && cfg.MultiNode.Worker
+-	n.nodeIP = cfg.Node.NodeIP
+-	n.controlplaneIP = cfg.MultiNode.Controlplane
+ }
+ 
+ func (n *NetworkConfiguration) Run(ctx context.Context, ready chan<- struct{}, stopped chan<- struct{}) error {
+@@ -69,21 +63,15 @@ func (n *NetworkConfiguration) Run(ctx context.Context, ready chan<- struct{}, s
+ 		if err := n.addServiceIPLoopback(); err != nil {
+ 			return err
+ 		}
+-	} else if n.workerNode {
+-		if err := n.addWorkerGatewayConfig(); err != nil {
+-			return err
+-		}
+ 	}
+-	// Always drive stopChan on cancel; skipping interface config must not
+-	// leave Run blocked forever (workers force SkipInterface).
++	// Always drive stopChan on cancel; skipping interface config, the
++	// default, must not leave Run blocked forever.
+ 	go func() {
+ 		<-ctx.Done()
+ 		if !n.skipInterfaceConfiguration {
+ 			if err := n.removeServiceIPLoopback(); err != nil {
+ 				klog.Warningf("failed to remove IP from interface: %v", err)
+ 			}
+-		} else if n.workerNode {
+-			n.removeWorkerGatewayConfig()
+ 		}
+ 		close(stopChan)
+ 	}()
+@@ -165,143 +153,3 @@ func (n *NetworkConfiguration) removeServiceIPLoopback() error {
+ 	}
+ 	return nil
+ }
+-
+-// addWorkerGatewayConfig gives a worker the dataplane a control plane node
+-// gets from addServiceIPLoopback, without the blackhole:
+-//   - ovnkube's gateway init refuses to start without an IPv4 on br-ex.
+-//     OCP puts the node IP on br-ex; mirror that as a /32 alias on the
+-//     virtual bridge, which also makes the gateway IP this node advertises
+-//     to other zones genuinely routable.
+-//   - the virtual advertise address must leave the node: without a route
+-//     via the control plane, pod traffic to the apiserver endpoint
+-//     dead-ends locally (the original multinode CNI failure).
+-func (n *NetworkConfiguration) addWorkerGatewayConfig() error {
+-	link, err := netlink.LinkByName(ovn.OVNGatewayInterface)
+-	if err != nil {
+-		// br-ex is created by microshift-ovs-init; systemd restarts us
+-		// until it exists.
+-		return fmt.Errorf("worker node needs %s: %w", ovn.OVNGatewayInterface, err)
+-	}
+-
+-	// A node repurposed from controller to worker still carries the
+-	// advertise address from its control plane life; a local address wins
+-	// over any route, so it would swallow all apiserver endpoint traffic.
+-	n.removeAdvertiseAddresses()
+-
+-	nodeAddr, err := netlink.ParseAddr(hostCIDR(n.nodeIP))
+-	if err != nil {
+-		return err
+-	}
+-	existing, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+-	if err != nil {
+-		return err
+-	}
+-	present := false
+-	for _, a := range existing {
+-		if nodeAddr.Equal(a) {
+-			present = true
+-			break
+-		}
+-	}
+-	if !present {
+-		if err := netlink.AddrAdd(link, nodeAddr); err != nil {
+-			return err
+-		}
+-	}
+-
+-	gw := net.ParseIP(n.controlplaneIP)
+-	if gw == nil || n.controlplaneIP == n.nodeIP {
+-		// Pre-join (no marker yet) there is nowhere to route to; the
+-		// post-join restart comes back through here with the marker set.
+-		klog.Infof("no control plane address yet, skipping advertise address routes")
+-		return nil
+-	}
+-	for _, entry := range n.kasAdvertiseAddresses {
+-		ip := net.ParseIP(entry)
+-		if ip == nil || (ip.To4() == nil) != (gw.To4() == nil) {
+-			continue
+-		}
+-		prefix := 32
+-		if ip.To4() == nil {
+-			prefix = 128
+-		}
+-		_, dst, err := net.ParseCIDR(fmt.Sprintf("%s/%d", entry, prefix))
+-		if err != nil {
+-			return err
+-		}
+-		if err := netlink.RouteReplace(&netlink.Route{Dst: dst, Gw: gw}); err != nil {
+-			return fmt.Errorf("failed to route %s via %s: %w", entry, n.controlplaneIP, err)
+-		}
+-	}
+-	return nil
+-}
+-
+-func (n *NetworkConfiguration) removeWorkerGatewayConfig() {
+-	if gw := net.ParseIP(n.controlplaneIP); gw != nil && n.controlplaneIP != n.nodeIP {
+-		for _, entry := range n.kasAdvertiseAddresses {
+-			ip := net.ParseIP(entry)
+-			if ip == nil || (ip.To4() == nil) != (gw.To4() == nil) {
+-				continue
+-			}
+-			prefix := 32
+-			if ip.To4() == nil {
+-				prefix = 128
+-			}
+-			_, dst, err := net.ParseCIDR(fmt.Sprintf("%s/%d", entry, prefix))
+-			if err != nil {
+-				continue
+-			}
+-			if err := netlink.RouteDel(&netlink.Route{Dst: dst, Gw: gw}); err != nil {
+-				klog.Warningf("failed to remove route to %s: %v", entry, err)
+-			}
+-		}
+-	}
+-	link, err := netlink.LinkByName(ovn.OVNGatewayInterface)
+-	if err != nil {
+-		return
+-	}
+-	if addr, err := netlink.ParseAddr(hostCIDR(n.nodeIP)); err == nil {
+-		if err := netlink.AddrDel(link, addr); err != nil {
+-			klog.Warningf("failed to remove %s from %s: %v", n.nodeIP, ovn.OVNGatewayInterface, err)
+-		}
+-	}
+-}
+-
+-func hostCIDR(ip string) string {
+-	if net.ParseIP(ip).To4() == nil {
+-		return ip + "/128"
+-	}
+-	return ip + "/32"
+-}
+-
+-func (n *NetworkConfiguration) removeAdvertiseAddresses() {
+-	for _, name := range []string{ovn.OVNGatewayInterface, loopbackInterface} {
+-		link, err := netlink.LinkByName(name)
+-		if err != nil {
+-			continue
+-		}
+-		for _, entry := range n.kasAdvertiseAddresses {
+-			prefix := 32
+-			if net.ParseIP(entry).To4() == nil {
+-				prefix = 128
+-			}
+-			addr, err := netlink.ParseAddr(fmt.Sprintf("%s/%d", entry, prefix))
+-			if err != nil {
+-				continue
+-			}
+-			existing, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+-			if err != nil {
+-				continue
+-			}
+-			for _, existingAddr := range existing {
+-				if addr.Equal(existingAddr) {
+-					if err := netlink.AddrDel(link, addr); err != nil {
+-						klog.Warningf("failed to remove stale advertise address %s from %s: %v", entry, name, err)
+-					} else {
+-						klog.Infof("removed stale advertise address %s from %s", entry, name)
+-					}
+-				}
+-			}
+-		}
+-	}
+-}
+diff --git a/pkg/util/net.go b/pkg/util/net.go
+index ba5c111c95f6c3871cc2c620806f13b7cc06a56b..95de6e3825134b97c339437f146d0e1a702df701 100644
+--- a/pkg/util/net.go
++++ b/pkg/util/net.go
+@@ -215,9 +215,6 @@ func selectIPFromHostInterface(nodeIP string) (string, error) {
+ 	})
+ 	// get list of interfaces
+ 	for _, i := range ifaces {
+-		if i.Name == "br-ex" {
+-			continue
+-		}
+ 		addrs, err := i.Addrs()
+ 		if err != nil {
+ 			klog.Warningf("failed to get IPs for interface %s: %v", i.Name, err)
+@@ -229,7 +226,9 @@ func selectIPFromHostInterface(nodeIP string) (string, error) {
+ 			if err != nil {
+ 				return "", fmt.Errorf("unable to parse CIDR for interface %q: %s", i.Name, err)
+ 			}
+-			if ip.IsLoopback() {
++			// br-ex holds the node IP with OVN-K's link-local masquerade
++			// addresses beside it.
++			if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+ 				continue
+ 			}
+ 			if nodeIP != "" && nodeIP != ip.String() {
+diff --git a/scripts/microshift-cleanup-data.sh b/scripts/microshift-cleanup-data.sh
+index 1ae4957f168158e85e02a0496085f0e2b84acd4e..d494f1886b837f561ef7bf1ee6eea0e58bc5f7ba 100755
+--- a/scripts/microshift-cleanup-data.sh
++++ b/scripts/microshift-cleanup-data.sh
+@@ -131,6 +131,10 @@ function clean_data() {
+         # /etc/openvswitch. Left in place, a node re-roled after the wipe
+         # boots its previous logical topology into the new cluster.
+         rm -f /etc/openvswitch/ovn*_db.db /etc/openvswitch/.ovn*_db.db.~lock~
++        # br-ex carries the node's uplink: stopping ovsdb-server took
++        # ovs-vswitchd and with it the node's network down.
++        echo Restarting Open vSwitch
++        systemctl start openvswitch.service || true
+     fi
+ }
+ 

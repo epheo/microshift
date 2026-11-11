@@ -69,6 +69,7 @@ image:
 	    --build-arg DRBD_SHA256="$(DRBD_SHA256)" \
 	    --build-arg GATEWAY_API_VERSION="$(GATEWAY_API_VERSION)" \
 	    --build-arg GATEWAY_API_SHA256="$(GATEWAY_API_SHA256)" \
+	    --build-arg CNI_PLUGINS_IMAGE="$(shell cat src/cni/plugins-image)" \
 	    -f packaging/bootc.Containerfile .
 
 # Extract the version string stamped into the RPM build (used for image tags).

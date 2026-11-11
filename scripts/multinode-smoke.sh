@@ -16,9 +16,14 @@
 # Usage: DIST_IMAGE=epheo-microshift ./scripts/multinode-smoke.sh
 #        CLEAN=1 ./scripts/multinode-smoke.sh
 set -euo pipefail
+# shellcheck source=scripts/lib-container-nic.sh
+source "$(dirname "$0")/lib-container-nic.sh"
 
 DIST_IMAGE="${DIST_IMAGE:-epheo-microshift}"
 NET="${NET:-epheo-microshift-mn}"
+NET_PREFIX="${NET_PREFIX:-10.89.201}"
+CTRL_IP="${NET_PREFIX}.10"
+WORKER_IP="${NET_PREFIX}.11"
 CTRL="${CTRL:-epheo-mn-controller}"
 WORKER="${WORKER:-epheo-mn-worker}"
 LVM_DISK="${LVM_DISK:-/var/lib/epheo-microshift-smoke/lvmdisk.image}"
@@ -44,12 +49,14 @@ clean() {
 ovs_diag() { # ovs_diag <cexec|wexec> <name> -- <exec-fn> <label>, same order as lib-diag.sh
     local fn=$1 name=$2
     log "DIAGNOSTICS: ${name} OVS units, bridge, failed units"
-    for u in openvswitch ovsdb-server ovs-vswitchd microshift-ovs-init; do
+    for u in openvswitch ovsdb-server ovs-vswitchd microshift-ovs-init NetworkManager; do
         echo "--- ${name}: journalctl -u ${u} (last 40 lines)"
         ${fn} journalctl -u "${u}" --no-pager -n 40 2>&1 || true
     done
     echo "--- ${name}: ovs-vsctl show"
     ${fn} ovs-vsctl --timeout=5 show 2>&1 || true
+    echo "--- ${name}: ip -br addr"
+    ${fn} ip -br addr 2>&1 || true
     echo "--- ${name}: failed units"
     ${fn} systemctl list-units --failed --no-pager 2>&1 || true
 }
@@ -125,7 +132,7 @@ fi
 
 # --- 3. Boot the two nodes --------------------------------------------------
 clean
-sudo podman network create "${NET}" >/dev/null
+nic_network "${NET}" "${NET_PREFIX}"
 
 vol_opts=(--tty --volume /dev:/dev)
 for device in input snd dri; do
@@ -139,14 +146,17 @@ run_opts=(--privileged
     --network "${NET}")
 
 log "starting ${CTRL} (controller profile)"
-sudo podman run -d "${run_opts[@]}" \
+sudo podman create "${run_opts[@]}" --ip "${CTRL_IP}" \
     --name "${CTRL}" --hostname "${CTRL}" "${DIST_IMAGE}" >/dev/null
+nic_install "${CTRL}" "${CTRL_IP}" "${NET_PREFIX}.1"
+sudo podman start "${CTRL}" >/dev/null
 
 # The worker profile must be in place before systemd first starts microshift,
 # or the node boots a full control plane and leaves stale data behind.
 log "creating ${WORKER} with the worker profile pre-installed"
-sudo podman create "${run_opts[@]}" \
+sudo podman create "${run_opts[@]}" --ip "${WORKER_IP}" \
     --name "${WORKER}" --hostname "${WORKER}" "${DIST_IMAGE}" >/dev/null
+nic_install "${WORKER}" "${WORKER_IP}" "${NET_PREFIX}.1"
 # The image ships no microshift.service.d, and podman cp will not create a
 # missing destination dir, so copy a whole directory into the existing
 # /etc/systemd/system/ (this mirrors what microshift-profile worker writes).

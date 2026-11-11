@@ -74,7 +74,10 @@ if [ "$(grep -c -e "^USHIFT_GITREF=${USHIFT_GITREF}$" -e "^OKD_VERSION_TAG=${OKD
     update EPHEO_REV "${EPHEO_REV}" "$((EPHEO_REV + 1))"
 fi
 
-# OpenShift's grants follow the payload: re-vendor them from its sources.
+# OpenShift's grants, br-ex setup and CNI plugins image follow the payload:
+# re-vendor them from its sources.
 if ! grep -qx "OKD_VERSION_TAG=${OKD_VERSION_TAG}" versions.env; then
     ./src/rbac/vendor.sh
+    ./src/ovs/vendor.sh
+    ./src/cni/vendor.sh
 fi

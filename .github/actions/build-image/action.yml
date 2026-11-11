@@ -32,6 +32,7 @@ runs:
             quay.io/fedora/fedora:latest \
             "${BUILDROOT_IMAGE}" \
             "${BOOTC_IMAGE_URL}:${BOOTC_IMAGE_TAG}" \
+            "$(cat src/cni/plugins-image)" \
             ${PULL_ALSO}; do
           for i in $(seq 5); do
             if sudo podman pull -q "${img}"; then break; fi

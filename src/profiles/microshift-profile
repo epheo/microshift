@@ -4,7 +4,8 @@
 #   worker      node services only; the control plane is another node
 # The profile only shapes the machine (unit override, firewall). Joining a
 # cluster is a separate step: 'microshift add-node --worker --kubeconfig ...'.
-set -euo pipefail
+set -Eeuo pipefail
+trap 'echo "microshift-profile: exit $? at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
 OVERRIDE_DIR=/etc/systemd/system/microshift.service.d
 OVERRIDE=${OVERRIDE_DIR}/50-profile-worker.conf
@@ -18,11 +19,12 @@ usage() {
 firewall_apply() {
     # The daemon is down during image builds and early boot; permanent config
     # is the source of truth either way.
+    # Not --quiet: it hides firewalld's errors too.
     if firewall-cmd --state >/dev/null 2>&1; then
-        firewall-cmd --quiet --permanent "$@"
-        firewall-cmd --quiet --reload
+        firewall-cmd --permanent "$@" >/dev/null
+        firewall-cmd --reload >/dev/null
     else
-        firewall-offline-cmd --quiet "$@"
+        firewall-offline-cmd "$@" >/dev/null
     fi
 }
 

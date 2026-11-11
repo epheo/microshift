@@ -21,8 +21,7 @@ REGISTRY_IMAGE="${REGISTRY_IMAGE:-quay.io/libpod/registry:2.8}"
 REG_NAME=epheo-microshift-multinode-registry
 VM_MEM="${VM_MEM:-5120}"
 BR=ushift-mn-br0
-# Keep guest networks out of 10.42-10.44: pods, services, and the
-# apiserver advertise address (10.44.0.0 on br-ex) live there.
+# Keep guest networks out of 10.42-10.43: pods and services live there.
 NET=192.168.101
 IP1=$NET.11
 IP2=$NET.12
@@ -82,6 +81,10 @@ node_journals() { # node_journals <exec-fn> <name>
     echo "### ${name}: journalctl -u microshift (this boot) ###"
     ${fn} journalctl -u microshift --no-pager -b 2>&1
     diag_ovs_journals "${fn}" "${name}"
+    echo "### ${name}: journalctl -u firewalld (this boot) ###"
+    ${fn} journalctl -u firewalld --no-pager -b 2>&1 | tail -100
+    echo "### ${name}: journal tail, all units ###"
+    ${fn} journalctl --no-pager -b -n 400 2>&1
 }
 
 # Short enough that both nodes' worth goes to the job log verbatim.
@@ -89,7 +92,7 @@ node_summary() { # node_summary <exec-fn> <name>
     local fn=$1 name=$2
     echo "### ${name}: bootc status ###"; ${fn} bootc status 2>&1
     echo "### ${name}: br-ex, routes, cni ###"
-    ${fn} sh -c 'hostname; ip -br addr show br-ex 2>/dev/null; ip route show 10.44.0.0/32; ls /etc/cni/net.d/ 2>/dev/null' 2>&1
+    ${fn} sh -c 'hostname; ip -br addr show br-ex 2>/dev/null; ovs-vsctl --timeout=5 list-ports br-ex; ls /etc/cni/net.d/ 2>/dev/null' 2>&1
     echo "### ${name}: ovs-vsctl show ###"
     ${fn} sh -c 'ovs-vsctl --timeout=5 show | head -40' 2>&1
     echo "### ${name}: failed units ###"
@@ -381,8 +384,8 @@ fetch mn-echo-node2 "http://${CIP}:80" | grep -q 'mn-echo' \
 koc exec mn-echo-node2 -- python3 -c \
     "import socket; print(socket.getaddrinfo('kubernetes.default.svc.cluster.local', 443)[0][4][0])" \
     | grep -q '10\.43\.' || die "cluster DNS does not resolve from a worker pod"
-# The endpoint behind the default kubernetes service must answer from a
-# worker pod: this is the route-to-advertise-address path (patches/0008).
+# The endpoint behind the default kubernetes service, the controller's node
+# IP, must answer from a worker pod: the shared gateway reaches it on-link.
 apiserver_code="$(koc exec mn-echo-node2 -- python3 -c "
 import urllib.request, urllib.error, ssl
 ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
@@ -414,6 +417,24 @@ greenboot_checks v2 worker
 log "assert: the worker restarts without the bootstrap kubeconfig"
 v2 systemctl restart microshift || die "worker microshift failed to restart after the join"
 retry 300 "both nodes Ready after the worker restart" both_ready
+# A Ready node can still leave new pods without networking: a restart that
+# reran configure-ovs cleared ovn-remote under the running ovnkube.
+log "assert: a new pod on the worker gets its network after the restart"
+koc apply -f - <<EOF >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mn-after-restart
+spec:
+  nodeSelector: {kubernetes.io/hostname: node2}
+  containers:
+  - name: probe
+    image: ${util_img}
+    command: ["sleep", "3600"]
+EOF
+after_restart_up() { koc get pod mn-after-restart --no-headers 2>/dev/null | grep -q ' Running'; }
+retry 180 "a new pod Running on node2 after its restart" after_restart_up
+koc delete pod mn-after-restart --wait=false >/dev/null
 
 # --- 9. A down worker does not fail the control plane's greenboot ---------------
 # Counting the worker's unavailable DaemonSet pods would turn the control

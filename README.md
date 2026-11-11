@@ -10,6 +10,7 @@ Published at `ghcr.io/epheo/microshift`.
 | Opinion | How |
 |---|---|
 | OVN-Kubernetes is the CNI | `microshift-networking` installed; no kindnet |
+| The node's NIC is in br-ex, as on OpenShift | OpenShift's own `configure-ovs.sh`, NetworkManager and OVS settings, vendored from the payload's machine-config-operator (`src/ovs`), move the default-route NIC and its IP configuration into br-ex at boot. `patches/0015` runs OVN-Kubernetes' shared gateway with OpenShift's `ipForwarding: Restricted`, and makes the node IP the kubernetes endpoint: pod egress leaves through OVN, never the host's routes. A node needs a NetworkManager-managed default-route NIC |
 | OVN secondary networks work out of the box | `patches/0001` adds `enable-multi-network=true` to the ovnkube-config template at the source |
 | Secondary networks take policies | `patches/0010` adds `enable-multi-networkpolicy=true` and the MultiNetworkPolicy CRD (taken at build time from the payload's cluster-network-operator) to MicroShift's own CRD list, applied before OVN starts: OVN-Kubernetes waits for it at start |
 | Cluster-wide policies | `patches/0011` adds `enable-admin-network-policy=true`, the AdminNetworkPolicy and BaselineAdminNetworkPolicy CRDs (taken at build time from the payload's cluster-network-operator) to MicroShift's CRD list, and the OVN controller's rights to read them and write their status: a namespace's NetworkPolicy cannot override an admin Deny |
@@ -17,6 +18,7 @@ Published at `ghcr.io/epheo/microshift`.
 | Multus enabled | `microshift-multus` (config.d toggle + cri-o default-network drop-in) |
 | Sign-in through a site's identity provider | `patches/0014` adds `apiServer.authenticationConfig`: the absolute path of a structured AuthenticationConfiguration file (JWT issuers, audiences, claim mappings), passed to kube-apiserver as `--authentication-config` and reloaded when it changes. A site layer ships the file and a `config.d` drop-in. Client certificates and ServiceAccount tokens keep working; the file must not configure `anonymous`, which MicroShift sets |
 | Pods attach only to their namespace's networks | `patches/0013` runs Multus with namespace isolation, as OpenShift does: a pod may name NADs in its own namespace or in `network.multus.globalNamespaces` (default OpenShift's: `default`, `openshift-multus`, `openshift-sriov-network-operator`, `openshift-cnv`). A non-empty list replaces it; to share none, name an admin-only namespace such as `openshift-multus`, since Multus reads an empty list as `default` |
+| A host NIC can go to a pod | the `host-device` CNI plugin, taken at build from the payload's own container-networking-plugins image (`src/cni`) and linked into Multus' `/run/cni/bin` at boot: a NetworkAttachmentDefinition hands a pod an SR-IOV VF or any host link |
 | r-drbd is the storage driver | [r-drbd](https://github.com/epheo/r-drbd) (DRBD 9 on thin LVM) with its DRBD module built for the image kernel; local volumes on one node, replicated ones on three. See [Storage](#storage) |
 | Air-gapped by default | the full MicroShift payload is embedded as a shared-blob OCI layout and imported into cri-o at boot — first boot needs no registry |
 | [portail](https://github.com/epheo/portail) is the edge | its image is embedded and imported the same way; the router is off and the Gateway API experimental CRDs (TCPRoute, UDPRoute) ship with the image, see [The edge](#the-edge) |
@@ -195,8 +197,9 @@ roles:
 
 ```sh
 # on the controller (default profile): a join kubeconfig, valid 1h
-# (--duration); --address is a name its apiserver certificate covers
-microshift worker-join-kubeconfig --address <controller-addr> > join.kubeconfig
+# (--duration); --address is the node IP (default) or a name its apiserver
+# certificate covers
+microshift worker-join-kubeconfig [--address <controller-addr>] > join.kubeconfig
 
 # on each worker
 microshift-profile worker
@@ -283,6 +286,10 @@ After a bump to a new tag, `tree` stops at the first patch that no longer
 applies (`git am --3way`, with the old base fetched for the 3-way merge):
 resolve, `git am --continue`, then `export`. CI keeps applying with plain
 `git apply`, so a patch that only applies by 3-way still fails the build.
+
+microshift-etcd builds against its own vendored copy of MicroShift's `pkg/`.
+The last patch regenerates it (`go mod vendor` in `etcd/`): redo it whenever
+a patch changes `pkg/config` or `pkg/util`, or etcd runs on stale config code.
 
 `export` writes a file that is mostly an upstream file as a copy plus hunks
 (`--find-copies-harder -C75%`): the zones DaemonSet in `patches/0008` is

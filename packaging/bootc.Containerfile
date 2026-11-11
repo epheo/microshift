@@ -30,8 +30,13 @@
 ARG BOOTC_IMAGE_URL
 ARG BOOTC_IMAGE_TAG
 ARG RPM_IMAGE=localhost/epheo-microshift-rpm:latest
+ARG CNI_PLUGINS_IMAGE
 
 FROM ${RPM_IMAGE} AS builder
+
+# OpenShift's full CNI plugins image, pinned from the payload by
+# src/cni/vendor.sh: only host-device is taken from it.
+FROM ${CNI_PLUGINS_IMAGE} AS cni-plugins
 
 # DRBD 9 for r-drbd is not in CentOS repos: built here against the base's own
 # kernel, so a base kernel bump rebuilds it. KDIR pins the kmp build to that
@@ -152,6 +157,27 @@ RUN mkdir -p /etc/containers/registries.d && \
         dst="/etc/containers/registries.d/$(basename "${f}")"; \
         [ -f "${dst}" ] || cp "${f}" "${dst}"; \
     done
+
+# br-ex takes the node's NIC, as on OpenShift: its configure-ovs.sh, vendored
+# from the payload by src/ovs/vendor.sh, runs in place of MicroShift's.
+COPY --chmod=755 ./src/ovs/configure-ovs.sh /usr/libexec/microshift-configure-ovs.sh
+COPY --chmod=755 ./src/ovs/nodeip-hint.sh /usr/libexec/microshift-nodeip-hint
+COPY ./src/ovs/microshift-ovs-init.conf \
+     /usr/lib/systemd/system/microshift-ovs-init.service.d/50-openshift-configure-ovs.conf
+# In /etc and sorting after MicroShift's 10-microshift-ignore-devices.conf:
+# NetworkManager reads /etc/NetworkManager/conf.d after /usr/lib, the later
+# [device] match-device wins, and this list is a superset.
+COPY ./src/ovs/nm-ignore-sdn.conf /etc/NetworkManager/conf.d/sdn.conf
+COPY ./src/ovs/ovs-vswitchd-restart.conf \
+     /usr/lib/systemd/system/ovs-vswitchd.service.d/10-ovs-vswitchd-restart.conf
+COPY ./src/ovs/ovsdb-server-restart.conf \
+     /usr/lib/systemd/system/ovsdb-server.service.d/10-ovsdb-restart.conf
+
+# host-device moves a host link (an SR-IOV VF, say) into a pod. Multus runs
+# plugins from /run/cni/bin, a tmpfs its init container fills with
+# MicroShift's own plugin set; a tmpfiles link adds host-device at boot.
+COPY --from=cni-plugins /usr/src/plugins/bin/host-device /usr/libexec/microshift-cni/host-device
+COPY ./src/cni/host-device.tmpfiles.conf /usr/lib/tmpfiles.d/microshift-host-device.conf
 
 # Role-scoped firewalld services; postinstall bakes the controller baseline
 # and microshift-profile switches roles post-deploy.
