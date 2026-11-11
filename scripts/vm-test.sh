@@ -556,6 +556,8 @@ koc -n openshift-ovn-kubernetes get configmap ovnkube-config -o jsonpath='{.data
 log "assert: pods and host-network pods validate the API certificate at 10.43.0.1"
 koc create namespace o7-probe --dry-run=client -o yaml | koc apply -f - >/dev/null
 koc label namespace o7-probe pod-security.kubernetes.io/enforce=privileged --overwrite >/dev/null
+# A pod in a new namespace is refused until its default ServiceAccount exists.
+wait_for 120 "o7-probe's default ServiceAccount" koc -n o7-probe get serviceaccount default || exit 1
 for host_network in false true; do
     koc apply -f - <<EOF >/dev/null
 apiVersion: v1
