@@ -1,0 +1,11 @@
+[Unit]
+Description=Remove embedded container images nothing ships or uses any more
+Wants=microshift.service
+After=microshift.service import-embedded-images.service
+# Control plane only: it reads every workload, which a worker's credentials
+# cannot. Workers keep all their embedded tags.
+ConditionPathExists=/var/lib/microshift/resources/kubeadmin/kubeconfig
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/prune-embedded-images.sh

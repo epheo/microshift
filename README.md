@@ -35,6 +35,9 @@ Everything site-specific (IPs, VLANs, NADs, hardware quirks, extra embedded
 images) belongs in a derived image, not here. Site layers can drop additional
 OCI archives + manifest lines under `/usr/lib/embedded-images/` and the boot
 import service picks them up.
+On the control plane, 30 minutes after each boot, `prune-embedded-images.timer`
+removes the `localhost/embedded/*` tags that neither the booted, rollback nor
+staged deployment ships and that no pod or workload template names.
 
 ## Storage
 
@@ -134,6 +137,9 @@ egress). Its opinion assertions are functional, not existence checks:
 - the router is not deployed;
 - the embedded portail image starts from cri-o's store with pull policy
   Never, and a re-pointed embedded tag is re-imported;
+- the prune removes an embedded tag nothing ships or names, and keeps one a
+  scaled-to-zero Deployment names, the shipped tags, and on the upgrade
+  lanes the rollback deployment's;
 - the API accepts TCPRoute and UDPRoute objects;
 - steady-state journal volume is capped (regression cover for the log-noise
   patches, which could silently go dead on a bump while still applying

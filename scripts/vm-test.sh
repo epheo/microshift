@@ -535,6 +535,35 @@ vssh /usr/bin/import-embedded-images.sh | grep -F "importing ${portail_ref} from
 log "assert: the whole embedded payload is in cri-o's store"
 vssh /usr/bin/import-embedded-images.sh | { ! grep -q '^importing'; }
 
+# Two extra names on the shipped portail image, so they share its image ID:
+# a prune that deletes images rather than names would take portail with them.
+# The named one is in a Deployment scaled to zero, as a site's manifests are
+# when they lag the node: no container uses it, yet it must stay.
+log "assert: the prune removes only embedded tags nothing ships or names"
+has_tag() { vssh crictl images | awk -v r="${1%:*}" -v t="${1##*:}" '$1 == r && $2 == t {f=1} END {exit !f}'; }
+vssh skopeo copy -q "${store}${portail_ref}" "${store}localhost/embedded/prune-test:orphan"
+vssh skopeo copy -q "${store}${portail_ref}" "${store}localhost/embedded/prune-test:named"
+koc -n default create deployment prune-test --image=localhost/embedded/prune-test:named --replicas=0 >/dev/null
+vssh systemctl start prune-embedded-images.service || {
+    vssh journalctl -u prune-embedded-images --no-pager -b 2>&1 | tail -30 >&2; exit 1; }
+! has_tag localhost/embedded/prune-test:orphan || {
+    echo "ERROR: the prune kept a tag nothing ships or names" >&2; exit 1; }
+has_tag localhost/embedded/prune-test:named || {
+    echo "ERROR: the prune removed a tag a Deployment names" >&2; exit 1; }
+has_tag "${portail_ref}" || {
+    echo "ERROR: the prune removed the shipped ${portail_ref}" >&2; exit 1; }
+vssh /usr/bin/import-embedded-images.sh | { ! grep -q '^importing'; }
+if [ -n "${UPGRADE_FROM}" ]; then
+    rollback_commit="$(vssh bootc status --json | jq -r '.status.rollback.ostree.checksum')"
+    for ref in $(vssh ostree cat --repo=/sysroot/ostree/repo "${rollback_commit}" /usr/lib/embedded-images/manifest \
+            | awk '$2 ~ /^localhost\/embedded\// {print $2}'); do
+        has_tag "${ref}" || {
+            echo "ERROR: the prune removed ${ref}, which the rollback deployment ships" >&2; exit 1; }
+    done
+fi
+koc -n default delete deployment prune-test >/dev/null
+vssh crictl rmi localhost/embedded/prune-test:named >/dev/null
+
 # Functional probes reuse an image already on the node (the OVN-K image):
 # no extra registry pull, no docker.io rate limits.
 util_img="$(koc -n openshift-ovn-kubernetes get pods -o jsonpath='{.items[0].spec.containers[0].image}')"
