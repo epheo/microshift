@@ -6,7 +6,7 @@
 #
 # Minor (and any future major) crossings are automatic, gated on one
 # mechanical condition: a new upstream GA minor is adopted only once a stable
-# OKD payload of the same minor exists — until then the script keeps shipping
+# OKD payload of the same minor is released; until then the script keeps shipping
 # z-streams of the pinned minor. A crossing advances one minor per run, so
 # every minor gets published on the way up: a node refuses data more than
 # MAX_VERSION_SKEW (2) minors older than its binary. The CI gate (patch
@@ -29,9 +29,33 @@ all_ushift="$(git ls-remote --tags "${USHIFT_GIT_URL}" 'refs/tags/*' \
     | awk '{print $2}' | sed -e 's|refs/tags/||' -e 's|\^{}||' \
     | grep -E '^[0-9]+\.[0-9]+\.[0-9]+' | grep -vE -- '-(ec|rc)\.' | sort -uV)"
 
-all_okd="$(skopeo list-tags "docker://${OKD_RELEASE_IMAGE}" \
+quay_okd="$(skopeo list-tags "docker://${OKD_RELEASE_IMAGE}" \
     | jq -r '.Tags[]' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-okd-scos\.[0-9]+$' \
     | sort -uV)"
+
+# A quay tag is not a release yet: packaging/srpm.Containerfile downloads oc
+# from the tag's GitHub release, which can lag the tag by hours or never come
+# (4.21.0-okd-scos.12). Only tags newer than the pin can be picked, so only
+# those are checked.
+has_oc() {
+    local code
+    code="$(curl -sL --retry 3 -o /dev/null -r 0-0 -w '%{http_code}' \
+        "https://github.com/okd-project/okd/releases/download/$1/openshift-client-linux-$1.tar.gz")"
+    case "${code}" in
+        200|206) return 0 ;;
+        404) return 1 ;;
+        *) echo "error: HTTP ${code} checking the oc download of $1" >&2; exit 1 ;;
+    esac
+}
+all_okd="${OKD_VERSION_TAG}"
+for t in $(printf '%s\n%s\n' "${OKD_VERSION_TAG}" "${quay_okd}" | sort -uV \
+        | awk -v pin="${OKD_VERSION_TAG}" 'newer; $0 == pin { newer = 1 }'); do
+    if has_oc "${t}"; then
+        all_okd+=$'\n'"${t}"
+    else
+        echo "skip: OKD ${t} has no GitHub release with oc yet"
+    fi
+done
 
 # The next minor released on BOTH sides after the pinned one, else the
 # pinned one.
