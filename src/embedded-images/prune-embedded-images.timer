@@ -1,0 +1,10 @@
+[Unit]
+Description=Remove embedded container images nothing ships or uses any more
+ConditionPathExists=/run/ostree-booted
+
+[Timer]
+# Once per boot, since only the boot import adds tags; late, off the boot path.
+OnBootSec=30min
+
+[Install]
+WantedBy=timers.target

@@ -303,7 +303,10 @@ COPY ./src/rbac/kustomization.yaml ./src/rbac/openshift-parity.yaml ./src/rbac/e
 
 COPY --chmod=755 ./src/embedded-images/import-embedded-images.sh /usr/bin/import-embedded-images.sh
 COPY ./src/embedded-images/import-embedded-images.service /usr/lib/systemd/system/import-embedded-images.service
-RUN systemctl enable import-embedded-images.service
+COPY --chmod=755 ./src/embedded-images/prune-embedded-images.sh /usr/bin/prune-embedded-images.sh
+COPY ./src/embedded-images/prune-embedded-images.service ./src/embedded-images/prune-embedded-images.timer \
+    /usr/lib/systemd/system/
+RUN systemctl enable import-embedded-images.service prune-embedded-images.timer
 
 # kubelet sandbox creation hard-fails on open /etc/resolv.conf, and nothing
 # in this image ships one: NetworkManager only writes it when DHCP hands out
