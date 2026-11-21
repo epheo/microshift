@@ -30,6 +30,21 @@ routes. So:
 - validation checks a user-set advertise address on the host as before,
   not the node IP default.
 
+Without a default route MicroShift takes the first address in interface
+index order, and upstream skips br-ex, which held only the virtual address.
+br-ex now holds the node IP and is an Open vSwitch port like OVN-K's own:
+Open vSwitch recreates them at every boot in any order, ovn-k8s-mp0 can come
+first with 10.42.0.2, and sysconfwatch then restarts MicroShift onto it,
+apiserver certificate included, while clients still dial the node IP. So
+without a configured node IP, once br-ex exists its address is the only
+answer for IPv4 and IPv6 alike, masquerade and link-local addresses aside,
+and no address yet is an error MicroShift waits out. Before br-ex exists the
+upstream choice stands, minus OVN-K's interfaces: br-int, ovs-system,
+ovn-k8s-mp* and the tunnel ports. The IPv6 default route now leaves through
+br-ex, so its addresses are filtered the same way. TestSelectIPPrefersBrEx
+and TestSelectIPv6PrefersBrEx cover the orders; vm-test reboots the fresh
+lane, which has no default route, and asserts the node IP stays br-ex's.
+
 mDNS listens on br-ex and node IP detection reads it: br-ex holds the node
 IP. microshift-cleanup-data starts Open vSwitch again after the OVN wipe,
 since stopping ovsdb-server takes ovs-vswitchd and the uplink down.
@@ -44,14 +59,15 @@ since stopping ovsdb-server takes ovs-vswitchd and the uplink down.
  pkg/cmd/addnode_worker.go                     |  10 +-
  pkg/cmd/init.go                               |  35 +++-
  pkg/config/apiserver.go                       |  23 +--
- pkg/config/config.go                          |  59 ++-----
+ pkg/config/config.go                          |  59 ++----
  pkg/config/config_test.go                     |   2 +
  pkg/config/multinode.go                       |   3 -
  pkg/mdns/controller.go                        |   5 +-
- pkg/node/netconfig.go                         | 156 +-----------------
- pkg/util/net.go                               |   7 +-
+ pkg/node/netconfig.go                         | 156 +---------------
+ pkg/util/net.go                               | 170 +++++++++++++-----
+ pkg/util/net_test.go                          |  76 ++++++++
  scripts/microshift-cleanup-data.sh            |   4 +
- 17 files changed, 111 insertions(+), 253 deletions(-)
+ 18 files changed, 311 insertions(+), 292 deletions(-)
 
 diff --git a/assets/components/ovn/common/configmap.yaml b/assets/components/ovn/common/configmap.yaml
 index 0c7a9334f3ab2cca71f359b0d0b524d3301963ed..95ed0e71bc6f192c5a746aff4ce31b6b2882d2a5 100644
@@ -720,30 +736,312 @@ index a468bdbc477eb7879933565fdf59f9435ae311ce..7b689a3b665afe9385b4978eccfd82e3
 -	}
 -}
 diff --git a/pkg/util/net.go b/pkg/util/net.go
-index ba5c111c95f6c3871cc2c620806f13b7cc06a56b..95de6e3825134b97c339437f146d0e1a702df701 100644
+index ba5c111c95f6c3871cc2c620806f13b7cc06a56b..d8657209878b97a99fe28cf6f9547e75515f0085 100644
 --- a/pkg/util/net.go
 +++ b/pkg/util/net.go
-@@ -215,9 +215,6 @@ func selectIPFromHostInterface(nodeIP string) (string, error) {
+@@ -192,10 +192,87 @@ func addNoProxyEnvVarEntries(entries map[string]struct{}, envVar string) {
+ }
+ 
+ func selectIPFromHostInterface(nodeIP string) (string, error) {
+-	ifaces, err := tcpnet.Interfaces()
++	hosts, err := hostInterfaces()
+ 	if err != nil {
+ 		return "", err
+ 	}
++	return selectIP(hosts, nodeIP, false)
++}
++
++func hostInterfaces() ([]hostInterface, error) {
++	ifaces, err := tcpnet.Interfaces()
++	if err != nil {
++		return nil, err
++	}
++	var hosts []hostInterface
++	for _, i := range ifaces {
++		addrs, err := i.Addrs()
++		if err != nil {
++			klog.Warningf("failed to get IPs for interface %s: %v", i.Name, err)
++			continue
++		}
++		h := hostInterface{name: i.Name, index: i.Index}
++		for _, a := range addrs {
++			h.addrs = append(h.addrs, a.String())
++		}
++		hosts = append(hosts, h)
++	}
++	return hosts, nil
++}
++
++// hostInterface is what node IP selection reads from one interface.
++type hostInterface struct {
++	name  string
++	index int
++	addrs []string // CIDR notation, as net.Interface.Addrs prints them
++}
++
++// ovnOwned names the interfaces Open vSwitch and OVN-Kubernetes create for
++// themselves, tunnel endpoints of every encapsulation included; none holds
++// the node IP.
++func ovnOwned(name string) bool {
++	if name == "br-int" || name == "ovs-system" || name == "gre_sys" {
++		return true
++	}
++	for _, prefix := range []string{"ovn-k8s-mp", "genev_sys_", "vxlan_sys_", "stt_sys_"} {
++		if strings.HasPrefix(name, prefix) {
++			return true
++		}
++	}
++	return false
++}
++
++// masqueradeV6 is OpenShift's IPv6 masquerade subnet (patches/0017); br-ex
++// holds an address from it beside the node IP. Its IPv4 twin is link-local.
++var masqueradeV6 = func() *tcpnet.IPNet {
++	_, n, _ := tcpnet.ParseCIDR("fd69::/112")
++	return n
++}()
++
++// usableIP returns the interface's first address of the family that may be
++// the node IP, or nodeIP itself when the interface holds it.
++func usableIP(i hostInterface, nodeIP string, v6 bool) (string, error) {
++	for _, addr := range i.addrs {
++		ip, _, err := tcpnet.ParseCIDR(addr)
++		if err != nil {
++			return "", fmt.Errorf("unable to parse CIDR for interface %q: %s", i.name, err)
++		}
++		if (ip.To4() == nil) != v6 {
++			continue
++		}
++		// br-ex holds the node IP with OVN-K's masquerade addresses beside it.
++		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || masqueradeV6.Contains(ip) {
++			continue
++		}
++		if nodeIP != "" && nodeIP != ip.String() {
++			continue
++		}
++		return ip.String(), nil
++	}
++	return "", nil
++}
++
++func selectIP(ifaces []hostInterface, nodeIP string, v6 bool) (string, error) {
+ 	// Sort all interfaces by index. Interfaces are listed in the same ordering as
+ 	// in /proc/net/dev. The ordering is not based in interface index, and it is
+ 	// not guaranteed to list system interfaces first. Veth interfaces from containers
+@@ -205,37 +282,47 @@ func selectIPFromHostInterface(nodeIP string) (string, error) {
+ 	// NetworkManager and the ones that could get a wrong node IP depend on a systemd
+ 	// unit that requires system networking to be ready, we can assume the lower
+ 	// indices are safe to use.
+-	slices.SortFunc(ifaces, func(a, b tcpnet.Interface) int {
+-		if a.Index > b.Index {
++	slices.SortFunc(ifaces, func(a, b hostInterface) int {
++		if a.index > b.index {
+ 			return 1
+-		} else if a.Index < b.Index {
++		} else if a.index < b.index {
+ 			return -1
+ 		}
+ 		return 0
  	})
- 	// get list of interfaces
+-	// get list of interfaces
++	// configure-ovs moved the node IP onto br-ex, an Open vSwitch port like
++	// OVN-K's own. Open vSwitch recreates them at every boot in any order, so
++	// the index no longer tells the node IP from ovn-k8s-mp0's. Once br-ex
++	// exists it is the only answer: any other address (OVN-K's ports, podman0,
++	// virbr0) would be a wrong node IP and apiserver certificate, and an error
++	// makes MicroShift wait for br-ex's address instead.
++	if nodeIP == "" {
++		for _, i := range ifaces {
++			if i.name != "br-ex" {
++				continue
++			}
++			ip, err := usableIP(i, "", v6)
++			if err != nil {
++				return "", err
++			}
++			if ip == "" {
++				return "", fmt.Errorf("br-ex holds no usable address of the family yet")
++			}
++			return ip, nil
++		}
++	}
++	// No br-ex yet (first boot, before configure-ovs): the upstream choice,
++	// minus OVN-K's interfaces.
  	for _, i := range ifaces {
 -		if i.Name == "br-ex" {
++		if ovnOwned(i.name) {
+ 			continue
+ 		}
+-		addrs, err := i.Addrs()
++		ip, err := usableIP(i, nodeIP, v6)
+ 		if err != nil {
+-			klog.Warningf("failed to get IPs for interface %s: %v", i.Name, err)
+-			continue
++			return "", err
+ 		}
+-
+-		for _, addr := range addrs {
+-			ip, _, err := tcpnet.ParseCIDR(addr.String())
+-			if err != nil {
+-				return "", fmt.Errorf("unable to parse CIDR for interface %q: %s", i.Name, err)
+-			}
+-			if ip.IsLoopback() {
+-				continue
+-			}
+-			if nodeIP != "" && nodeIP != ip.String() {
+-				continue
+-			}
+-			return ip.String(), nil
++		if ip != "" {
++			return ip, nil
+ 		}
+ 	}
+ 	return "", fmt.Errorf("no interface with valid address found on host")
+@@ -284,35 +371,32 @@ func GetHostIPv6(ipHint string) (string, error) {
+ 		if err != nil {
+ 			return "", err
+ 		}
++		// The default route leaves through br-ex, which also holds the
++		// masquerade and link-local addresses.
++		route := hostInterface{name: link.Attrs().Name, index: link.Attrs().Index}
+ 		for _, addr := range addrList {
+-			if ipHint != "" && ipHint != addr.IP.String() {
+-				continue
+-			}
+-			return addr.IP.String(), nil
++			route.addrs = append(route.addrs, addr.IPNet.String())
++		}
++		ip, err := usableIP(route, ipHint, true)
++		if err != nil {
++			return "", err
++		}
++		if ip != "" {
++			return ip, nil
+ 		}
+ 	}
+ 
+-	// If there is no default route then pick the first ipv6
+-	// address that fits.
+-	addrList, err := handle.AddrList(nil, netlink.FAMILY_V6)
++	// No default route: the same choice as IPv4, br-ex first, never an
++	// interface OVN-K owns.
++	hosts, err := hostInterfaces()
+ 	if err != nil {
+ 		return "", err
+ 	}
+-	for _, addr := range addrList {
+-		ip, _, err := tcpnet.ParseCIDR(addr.String())
+-		if err != nil {
+-			return "", fmt.Errorf("unable to parse CIDR from address %q: %s", addr.String(), err)
+-		}
+-		if ip.IsLoopback() || ip.IsLinkLocalMulticast() {
 -			continue
 -		}
- 		addrs, err := i.Addrs()
- 		if err != nil {
- 			klog.Warningf("failed to get IPs for interface %s: %v", i.Name, err)
-@@ -229,7 +226,9 @@ func selectIPFromHostInterface(nodeIP string) (string, error) {
- 			if err != nil {
- 				return "", fmt.Errorf("unable to parse CIDR for interface %q: %s", i.Name, err)
- 			}
--			if ip.IsLoopback() {
-+			// br-ex holds the node IP with OVN-K's link-local masquerade
-+			// addresses beside it.
-+			if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
- 				continue
- 			}
- 			if nodeIP != "" && nodeIP != ip.String() {
+-		if ipHint != "" && ipHint != ip.String() {
+-			continue
+-		}
+-		return ip.String(), nil
++	ip, err := selectIP(hosts, ipHint, true)
++	if err != nil {
++		return "", fmt.Errorf("unable to find host IPv6 address: %w", err)
+ 	}
+-
+-	return "", fmt.Errorf("unable to find host IPv6 address")
++	return ip, nil
+ }
+ 
+ func FindDefaultRouteMinMTU() (mtu int, err error) {
+diff --git a/pkg/util/net_test.go b/pkg/util/net_test.go
+index 4c863ffd323b5c56cc7b6a6f04c6cdc7dc15eb57..e15c76ea64ea133e07775880017547c2dc8b611c 100644
+--- a/pkg/util/net_test.go
++++ b/pkg/util/net_test.go
+@@ -2,6 +2,7 @@ package util
+ 
+ import (
+ 	"os"
++	"slices"
+ 	"testing"
+ 
+ 	"github.com/stretchr/testify/assert"
+@@ -49,3 +50,78 @@ func TestAddToNoProxyEnv_with_both(t *testing.T) {
+ 	assert.Equal(t, "", os.Getenv("no_proxy"), "no_proxy expected to be empty")
+ 	clearNoProxy()
+ }
++
++// Without a default route: br-ex holds the node IP (configure-ovs moved it
++// there), and on a reboot Open vSwitch may recreate ovn-k8s-mp0 before it.
++func TestSelectIPPrefersBrEx(t *testing.T) {
++	reboot := []hostInterface{
++		{name: "lo", index: 1, addrs: []string{"127.0.0.1/8"}},
++		{name: "enp0s3", index: 2},
++		{name: "ovs-system", index: 3},
++		{name: "br-int", index: 4},
++		{name: "ovn-k8s-mp0", index: 5, addrs: []string{"10.42.0.2/24"}},
++		{name: "storage0", index: 6, addrs: []string{"172.16.0.5/24"}},
++		{name: "br-ex", index: 7, addrs: []string{"169.254.0.2/17", "10.0.2.15/24"}},
++	}
++	for _, tc := range []struct {
++		name   string
++		ifaces []hostInterface
++		nodeIP string
++		want   string
++	}{
++		{"reboot order", reboot, "", "10.0.2.15"},
++		{"configured node IP", reboot, "172.16.0.5", "172.16.0.5"},
++		{"configured node IP on br-ex", reboot, "10.0.2.15", "10.0.2.15"},
++		{"first boot, before configure-ovs", []hostInterface{
++			{name: "lo", index: 1, addrs: []string{"127.0.0.1/8"}},
++			{name: "enp0s3", index: 2, addrs: []string{"10.0.2.15/24"}},
++		}, "", "10.0.2.15"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			got, err := selectIP(slices.Clone(tc.ifaces), tc.nodeIP, false)
++			if err != nil || got != tc.want {
++				t.Fatalf("selectIP = %q, %v; want %q", got, err, tc.want)
++			}
++		})
++	}
++	for name, ifaces := range map[string][]hostInterface{
++		"OVN-K's management port alone": {
++			{name: "ovn-k8s-mp0", index: 1, addrs: []string{"10.42.0.2/24"}},
++		},
++		// Between addresses, another bridge must not stand in for br-ex.
++		"br-ex without its address yet": {
++			{name: "ovn-k8s-mp0", index: 3, addrs: []string{"10.42.0.2/24"}},
++			{name: "podman0", index: 4, addrs: []string{"10.88.0.1/16"}},
++			{name: "br-ex", index: 5, addrs: []string{"169.254.0.2/17"}},
++		},
++		// An IPv6 address never answers for IPv4.
++		"br-ex holding only IPv6": {
++			{name: "enp0s3", index: 2},
++			{name: "br-ex", index: 7, addrs: []string{"169.254.0.2/17", "fd69::2/112", "2001:db8::15/64"}},
++		},
++	} {
++		if ip, err := selectIP(ifaces, "", false); err == nil {
++			t.Fatalf("%s: selectIP = %q, want an error", name, ip)
++		}
++	}
++}
++
++// IPv6 follows the same rule, and br-ex's masquerade and link-local
++// addresses never stand for the node.
++func TestSelectIPv6PrefersBrEx(t *testing.T) {
++	reboot := []hostInterface{
++		{name: "lo", index: 1, addrs: []string{"::1/128"}},
++		{name: "ovn-k8s-mp0", index: 5, addrs: []string{"fd01:0:0:1::2/64"}},
++		{name: "vxlan_sys_4789", index: 6, addrs: []string{"fe80::2/64"}},
++		{name: "br-ex", index: 7, addrs: []string{"10.0.2.15/24", "fd69::2/112", "fe80::1/64", "2001:db8::15/64"}},
++	}
++	got, err := selectIP(slices.Clone(reboot), "", true)
++	if err != nil || got != "2001:db8::15" {
++		t.Fatalf("selectIP v6 = %q, %v; want 2001:db8::15", got, err)
++	}
++	if _, err := selectIP([]hostInterface{
++		{name: "br-ex", index: 7, addrs: []string{"fd69::2/112", "fe80::1/64"}},
++	}, "", true); err == nil {
++		t.Fatal("a masquerade or link-local address taken as the node IPv6")
++	}
++}
 diff --git a/scripts/microshift-cleanup-data.sh b/scripts/microshift-cleanup-data.sh
 index 1ae4957f168158e85e02a0496085f0e2b84acd4e..d494f1886b837f561ef7bf1ee6eea0e58bc5f7ba 100755
 --- a/scripts/microshift-cleanup-data.sh
