@@ -1964,7 +1964,9 @@ fi
 # Only the fresh lane runs without one: restrict=on drops slirp's gateway.
 if [ -z "${UPGRADE_FROM}" ]; then
     log "assert: across a reboot without a default route, the node IP stays br-ex's"
-    [ -z "$(vssh ip -4 route show default)" ] || {
+    # Captured first: an ssh failure must fail the check, not read as empty.
+    routes="$(vssh ip -4 route show default)" || { echo "ERROR: cannot read the VM's routes" >&2; exit 1; }
+    [ -z "${routes}" ] || {
         echo "ERROR: the fresh lane has a default route; it no longer covers the fallback" >&2; exit 1; }
     reboot_boot_id="$(vssh cat /proc/sys/kernel/random/boot_id)"
     rebooted() {
@@ -1982,9 +1984,12 @@ if [ -z "${UPGRADE_FROM}" ]; then
     node_ip="$(koc get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')"
     vssh ip -4 -o addr show dev br-ex | grep -qF " ${node_ip}/" || {
         echo "ERROR: after the reboot the node IP is ${node_ip}, not br-ex's" >&2; exit 1; }
-    restarts="$(vssh journalctl -b -u microshift.service --no-pager | grep -c 'IP address has changed' || true)"
+    journal="$(vssh journalctl -b -u microshift.service --no-pager)" || {
+        echo "ERROR: cannot read MicroShift's journal" >&2; exit 1; }
+    # sysconfwatch restarts on a changed node IP and on none found.
+    restarts="$(grep -cE 'IP address has changed|Cannot find a host IP' <<<"${journal}" || true)"
     [ "${restarts}" = 0 ] || {
-        echo "ERROR: MicroShift restarted ${restarts} time(s) for a node IP change after the reboot" >&2; exit 1; }
+        echo "ERROR: MicroShift restarted ${restarts} time(s) for its node IP after the reboot" >&2; exit 1; }
 fi
 
 log "VM ${UPGRADE_FROM:+UPGRADE }TEST PASSED"
