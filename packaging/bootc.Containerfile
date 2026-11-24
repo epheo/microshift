@@ -298,6 +298,8 @@ COPY --from=ovnkube --chmod=755 /tmp/ovnkube /usr/libexec/microshift-ovnkube
 # - Graceful node shutdown lets pods release their volumes first.
 # - microshift-r-drbd-default-pool declares the Pool for VG myvg1 with thin
 #   pool thin when it exists, and leaves any other node as it is.
+# - microshift-r-drbd-data-disks builds that VG from the console installer's
+#   data disks, once; without the installer's plan it does nothing.
 RUN printf '%s\n' drbd drbd_transport_tcp dm-snapshot dm-thin-pool \
         > /usr/lib/modules-load.d/r-drbd.conf && \
     echo 'options drbd usermode_helper=disabled' > /usr/lib/modprobe.d/r-drbd.conf
@@ -309,7 +311,19 @@ COPY ./src/r-drbd/release-r-drbd-x86_64.json /usr/share/microshift/release/relea
 COPY --chmod=755 ./src/r-drbd/greenboot-check.sh /etc/greenboot/check/required.d/50_microshift_r_drbd_check.sh
 COPY --chmod=755 ./src/r-drbd/default-pool.sh /usr/libexec/microshift-r-drbd-default-pool
 COPY ./src/r-drbd/microshift-r-drbd-default-pool.service /usr/lib/systemd/system/microshift-r-drbd-default-pool.service
-RUN systemctl enable microshift-r-drbd-default-pool.service
+COPY --chmod=755 ./src/r-drbd/data-disks.sh /usr/libexec/microshift-r-drbd-data-disks
+COPY ./src/r-drbd/microshift-r-drbd-data-disks.service /usr/lib/systemd/system/microshift-r-drbd-data-disks.service
+RUN systemctl enable microshift-r-drbd-default-pool.service microshift-r-drbd-data-disks.service
+
+# What the console installer (epheo/microshift-installer) offers this image
+# as. Images built FROM this one inherit these labels: one that is another
+# purpose sets its own. secure-boot=off comes from the Makefile, only while
+# the DRBD module is unsigned.
+LABEL io.github.epheo.installer.id="microshift" \
+      io.github.epheo.installer.name="MicroShift" \
+      io.github.epheo.installer.summary="Kubernetes for your own apps" \
+      io.github.epheo.installer.includes="MicroShift on the OKD payload;Replicated volumes (r-drbd);Gateway API (portail);Updates that roll back;Workers that join" \
+      io.github.epheo.installer.data-disks="thin"
 
 # Embed the full MicroShift payload under /usr/lib/embedded-images.
 # import-embedded-images.service imports every manifest entry into cri-o's

@@ -82,7 +82,7 @@ image:
 	    --build-arg GATEWAY_API_SHA256="$(GATEWAY_API_SHA256)" \
 	    --build-arg CNI_PLUGINS_IMAGE="$(shell cat src/cni/plugins-image)" \
 	    --build-arg KMOD_SIGNED=$(if $(KMOD_KEY),yes,no) \
-	    $(if $(KMOD_KEY),--secret id=kmod-key$(comma)src=$(KMOD_KEY)) \
+	    $(if $(KMOD_KEY),--secret id=kmod-key$(comma)src=$(KMOD_KEY),--label io.github.epheo.installer.secure-boot=off) \
 	    -f packaging/bootc.Containerfile .
 
 # Extract the version string stamped into the RPM build (used for image tags).
