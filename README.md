@@ -61,6 +61,36 @@ volumes, and stays the default class. To move, back up the volumes, create the
 thin pool, restore onto `r-drbd-local`, then remove TopoLVM
 (`oc delete namespace topolvm-system`, its CSIDriver and StorageClass).
 
+### Secure Boot
+
+Secure Boot loads only signed modules, and the DRBD module is built here.
+CI signs it with the project key, the `KMOD_SIGNING_KEY` secret: one PEM
+holding the key and its certificate. The certificate ships as
+`/usr/lib/microshift-installer/mok.der`: the installer queues it with
+`mokutil --import`, and MokManager asks once, at the next start, for the
+password the installer shows. Builds without the secret (forks, or
+`make image` without `KMOD_KEY=key.pem`) ship unsigned modules and no
+certificate, and need Secure Boot off.
+
+The kernel trusts an enrolled key for modules only in its `.machine`
+keyring, which takes CA certificates that sign certificates and nothing
+else (`CONFIG_INTEGRITY_CA_MACHINE_KEYRING_MAX`). Make the key once, offline,
+and keep it there:
+
+```sh
+openssl req -x509 -new -nodes -newkey rsa:3072 -sha256 -days 36500 \
+    -subj "/CN=epheo microshift kernel modules/" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign" \
+    -keyout key.pem -out cert.pem
+cat key.pem cert.pem | gh secret set KMOD_SIGNING_KEY --env kmod-signing
+```
+
+- The secret lives in environment `kmod-signing`, whose deployment branches are `main` only, with no required reviewers (every build on `main` would wait): pull requests build unsigned.
+- No repository secret may share its name: a job outside the environment reads that one, so pull requests would get it.
+- A build on `main` without it fails: an unsigned module would not load on Secure Boot nodes, and every update would roll back.
+- The key is for good: a new one means enrolling it through MokManager at every node's console; until then their updates roll back.
+
 ## The edge
 
 portail replaces the OpenShift router.

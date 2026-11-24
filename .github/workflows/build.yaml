@@ -134,6 +134,10 @@ jobs:
       )
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    # KMOD_SIGNING_KEY is a secret of environment kmod-signing, which deploys
+    # from main only: a pull request cannot reach it, even by editing this
+    # file, and builds unsigned, as a fork does.
+    environment: ${{ github.ref == 'refs/heads/main' && 'kmod-signing' || '' }}
     permissions:
       contents: read
     outputs:
@@ -164,6 +168,9 @@ jobs:
 
       - name: Build the image
         uses: ./.github/actions/build-image
+        env:
+          KMOD_SIGNING_KEY: ${{ secrets.KMOD_SIGNING_KEY }}
+          KMOD_REQUIRED: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build the CI tools image (QEMU, dnsmasq)
         run: make ci-tools PODMAN="sudo podman"
@@ -450,8 +457,11 @@ jobs:
   # Publishes the image every lane tested, byte for byte.
   publish:
     needs: [bump, build, tested]
+    # main only: schedules and the bump dispatch run on main's ref; any other
+    # branch's image is unsigned and untested as main.
     if: |
       !cancelled() && github.event_name != 'pull_request' &&
+      github.ref == 'refs/heads/main' &&
       (github.event_name != 'workflow_dispatch' || inputs.push-image) &&
       needs.tested.result == 'success'
     runs-on: ubuntu-24.04

@@ -61,6 +61,20 @@ runs:
       shell: bash
       run: make rpm-cache-load PODMAN="sudo podman"
 
+    # The caller passes the KMOD_SIGNING_KEY secret in env, and
+    # KMOD_REQUIRED=true where the image publishes: an unsigned DRBD there
+    # would not load on Secure Boot nodes, which then roll the update back.
+    # Elsewhere (pull requests, forks) the modules stay unsigned.
     - name: Build bootc image
       shell: bash
-      run: make image PODMAN="sudo podman" LAYERS=false
+      run: |
+        key=
+        if [ -n "${KMOD_SIGNING_KEY:-}" ]; then
+            key="${RUNNER_TEMP}/kmod-key.pem"
+            (umask 077 && printf '%s\n' "${KMOD_SIGNING_KEY}" > "${key}")
+        elif [ "${KMOD_REQUIRED:-}" = true ]; then
+            echo "::error::KMOD_SIGNING_KEY is empty: this build publishes, and Secure Boot nodes cannot load an unsigned DRBD"
+            exit 1
+        fi
+        make image PODMAN="sudo podman" LAYERS=false KMOD_KEY="${key}"
+        rm -f "${RUNNER_TEMP}/kmod-key.pem"
