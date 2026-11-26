@@ -16,7 +16,9 @@
 # the apiserver takes JWTs from an issuer named in
 # apiServer.authenticationConfig, the
 # embedded portail image is started with pull policy Never, the API
-# accepts TCPRoute and UDPRoute objects, and RBAC answers as OpenShift's
+# accepts TCPRoute and UDPRoute objects, portail on 443 terminates HTTPS
+# for a wildcard and passes one exact name through by SNI behind the
+# node IP the LoadBalancer controller gives it, and RBAC answers as OpenShift's
 # does for signed-in users and the stock project roles (src/rbac).
 # The fresh-install VM runs with zero egress (restrict=on): going GREEN
 # proves the air-gapped first boot the embedded payload exists for.
@@ -59,6 +61,9 @@ SSH_PORT="${SSH_PORT:-2222}"
 # A host port forwarded to a fixed NodePort, to reach a Service from outside
 # the node.
 NODEPORT_FWD="${NODEPORT_FWD:-30480}"
+# A host port forwarded to the node's 443, where a Gateway's LoadBalancer
+# Service answers.
+GATEWAY_FWD="${GATEWAY_FWD:-30443}"
 VM_MEM="${VM_MEM:-8192}"
 BIB_IMAGE="${BIB_IMAGE:-quay.io/centos-bootc/bootc-image-builder:latest}"
 REGISTRY_IMAGE="${REGISTRY_IMAGE:-quay.io/libpod/registry:2.8}"
@@ -299,7 +304,7 @@ qemu_start "${WORKDIR}/qemu.pid" \
     -machine "accel=${ACCEL}" -cpu max -smp "$(nproc)" -m "${VM_MEM}" \
     -drive "file=${DISK},if=virtio,format=qcow2" \
     -drive "file=${WORKDIR}/lvm-disk.raw,if=virtio,format=raw" \
-    -netdev "user,id=n0,ipv6=off,${NET_RESTRICT}hostfwd=tcp::${SSH_PORT}-:22,hostfwd=tcp::${NODEPORT_FWD}-:30480" \
+    -netdev "user,id=n0,ipv6=off,${NET_RESTRICT}hostfwd=tcp::${SSH_PORT}-:22,hostfwd=tcp::${NODEPORT_FWD}-:30480,hostfwd=tcp::${GATEWAY_FWD}-:443" \
     -device virtio-net-pci,netdev=n0 \
     -device virtio-rng-pci \
     -serial "file:${WORKDIR}/console.log" \
@@ -1647,6 +1652,243 @@ EOF
 wait_for 180 "TCPRoute and UDPRoute accepted" routes_accepted || {
     koc get crd -o name | grep gateway.networking >&2 || true
     vssh journalctl -u microshift --no-pager | grep -i kustomiz | tail -20 >&2 || true
+    exit 1
+}
+
+# portail at the embedded version, installed from its own deploy/install as a
+# site does (da2). On 443, an HTTPS listener terminates *.gw.test while a TLS
+# listener passes the exact idm.gw.test through, chosen by SNI: Named mode
+# with Kanidm relies on the pair. The client is the runner, through QEMU's
+# forward to the node's 443, where MicroShift's LoadBalancer controller puts
+# the Gateway's Service.
+log "assert: portail on 443 terminates HTTPS for *.gw.test and passes idm.gw.test through"
+gw="${WORKDIR}/portail"
+mkdir -p "${gw}"
+for f in crds/gatewayparameters.yaml crds/ratelimitpolicy.yaml install/namespace.yaml \
+        install/rbac.yaml install/controller.yaml install/gatewayclass.yaml; do
+    curl -fsSL --retry 3 -o "${gw}/${f##*/}" \
+        "https://raw.githubusercontent.com/epheo/portail/v${portail_ref##*:}/deploy/${f}"
+done
+# Upstream names the registry image, untagged: the node holds only the
+# embedded copy, for the controller and the data planes it provisions.
+sed -i -e "s|image: ghcr.io/epheo/portail\(:.*\)\?$|image: ${portail_ref}|" \
+    -e "s|args: \[controller\]|args: [controller, --dataplane-image=${portail_ref}]|" "${gw}/controller.yaml"
+grep -qF "args: [controller, --dataplane-image=${portail_ref}]" "${gw}/controller.yaml" || {
+    echo "ERROR: portail's deploy/install/controller.yaml changed shape: set the embedded image by hand" >&2
+    exit 1
+}
+yamls() { local f; for f; do echo ---; cat "${gw}/${f}"; done; }
+yamls gatewayparameters.yaml ratelimitpolicy.yaml | koc apply --server-side -f - >/dev/null
+koc wait --for=condition=Established --timeout=60s \
+    crd/gatewayparameters.portail.epheo.eu crd/ratelimitpolicies.portail.epheo.eu >/dev/null
+yamls namespace.yaml rbac.yaml controller.yaml gatewayclass.yaml | koc apply --server-side -f - >/dev/null
+
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=*.gw.test" \
+    -addext "subjectAltName=DNS:*.gw.test" -keyout "${gw}/gw.key" -out "${gw}/gw.crt" 2>/dev/null
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=idm.gw.test \
+    -addext "subjectAltName=DNS:idm.gw.test" -keyout "${gw}/idm.key" -out "${gw}/idm.crt" 2>/dev/null
+# One plain HTTP backend for the terminated name, one TLS backend with its own
+# certificate for the passed-through one.
+gw_server="$(sed 's/^/      /' <<'PY'
+import http.server, ssl, sys
+body = sys.argv[1].encode() + b"\n"
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+s = http.server.ThreadingHTTPServer(("", int(sys.argv[2])), H)
+if len(sys.argv) > 3:
+    c = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    c.load_cert_chain(sys.argv[3] + "/tls.crt", sys.argv[3] + "/tls.key")
+    # The handshake in the request thread: a silent client blocks only itself.
+    s.socket = c.wrap_socket(s.socket, server_side=True, do_handshake_on_connect=False)
+s.serve_forever()
+PY
+)"
+koc apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gw-probe
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gw-tls
+  namespace: portail-system
+type: kubernetes.io/tls
+data:
+  tls.crt: $(base64 -w0 "${gw}/gw.crt")
+  tls.key: $(base64 -w0 "${gw}/gw.key")
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: idm-tls
+  namespace: gw-probe
+type: kubernetes.io/tls
+data:
+  tls.crt: $(base64 -w0 "${gw}/idm.crt")
+  tls.key: $(base64 -w0 "${gw}/idm.key")
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: backends
+  namespace: gw-probe
+  labels:
+    app: gw-backends
+spec:
+  containers:
+  - name: web
+    image: ${util_img}
+    command:
+    - python3
+    - -c
+    - |
+${gw_server}
+    - web
+    - "8080"
+  - name: idm
+    image: ${util_img}
+    command:
+    - python3
+    - -c
+    - |
+${gw_server}
+    - idm
+    - "8443"
+    - /tls
+    volumeMounts:
+    - name: idm-tls
+      mountPath: /tls
+  volumes:
+  - name: idm-tls
+    secret:
+      secretName: idm-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: gw-probe
+spec:
+  selector:
+    app: gw-backends
+  ports:
+  - port: 80
+    targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: idm
+  namespace: gw-probe
+spec:
+  selector:
+    app: gw-backends
+  ports:
+  - port: 443
+    targetPort: 8443
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: edge-probe
+  namespace: portail-system
+spec:
+  gatewayClassName: portail
+  listeners:
+  - name: https
+    port: 443
+    protocol: HTTPS
+    hostname: "*.gw.test"
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - name: gw-tls
+    allowedRoutes:
+      namespaces:
+        from: All
+  - name: idm
+    port: 443
+    protocol: TLS
+    hostname: idm.gw.test
+    tls:
+      mode: Passthrough
+    allowedRoutes:
+      namespaces:
+        from: All
+      kinds:
+      - kind: TLSRoute
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: web
+  namespace: gw-probe
+spec:
+  parentRefs:
+  - name: edge-probe
+    namespace: portail-system
+    sectionName: https
+  hostnames:
+  - app.gw.test
+  rules:
+  - backendRefs:
+    - name: web
+      port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TLSRoute
+metadata:
+  name: idm
+  namespace: gw-probe
+spec:
+  parentRefs:
+  - name: edge-probe
+    namespace: portail-system
+    sectionName: idm
+  hostnames:
+  - idm.gw.test
+  rules:
+  - backendRefs:
+    - name: idm
+      port: 443
+EOF
+
+gw_diag() {
+    koc -n portail-system get gateway edge-probe -o yaml >&2 || true
+    koc -n gw-probe get httproute,tlsroute -o yaml >&2 || true
+    koc -n portail-system get pods,services -o wide >&2 || true
+    koc -n gw-probe get pods -o wide >&2 || true
+    koc -n portail-system logs deployment/portail-controller --tail=50 >&2 || true
+    koc -n portail-system logs deployment/portail-edge-probe --tail=50 >&2 || true
+    log "observe: app.gw.test from the node: $(observe vssh curl -ksS -o /dev/null --max-time 5 \
+        --resolve "app.gw.test:443:${node_ip}" https://app.gw.test/)"
+}
+gw_lb_is_node() {
+    [ "$(koc -n portail-system get service portail-edge-probe \
+        -o jsonpath='{.status.loadBalancer.ingress[0].ip}')" = "${node_ip}" ]
+}
+wait_for 300 "the Gateway's LoadBalancer Service at the node IP ${node_ip}" gw_lb_is_node || { gw_diag; exit 1; }
+# Each name verifies only against its own certificate: the Gateway's proves
+# portail terminated, idm's proves the backend did, which only it holds.
+gw_get() { # gw_get HOST CA
+    curl -fsS --max-time 5 --cacert "$2" --resolve "$1:${GATEWAY_FWD}:127.0.0.1" \
+        -H "Host: $1" "https://$1:${GATEWAY_FWD}/"
+}
+gw_serves() {
+    [ "$(gw_get app.gw.test "${gw}/gw.crt")" = web ] && [ "$(gw_get idm.gw.test "${gw}/idm.crt")" = idm ]
+}
+wait_for 180 "app.gw.test terminated by portail, idm.gw.test passed through, both on 443" gw_serves || {
+    log "observe: app.gw.test: $(gw_get app.gw.test "${gw}/gw.crt" 2>&1 | tail -1)"
+    log "observe: idm.gw.test: $(gw_get idm.gw.test "${gw}/idm.crt" 2>&1 | tail -1)"
+    gw_diag
     exit 1
 }
 

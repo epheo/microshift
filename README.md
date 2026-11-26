@@ -135,6 +135,11 @@ egress). Its opinion assertions are functional, not existence checks:
 - the embedded portail image starts from cri-o's store with pull policy
   Never, and a re-pointed embedded tag is re-imported;
 - the API accepts TCPRoute and UDPRoute objects;
+- portail, installed from its own `deploy/install` at the embedded version,
+  gets the node IP for its Gateway's LoadBalancer Service, and on 443
+  terminates HTTPS for `*.gw.test` while passing `idm.gw.test` through to a
+  backend that holds its own certificate, chosen by SNI, for a client
+  outside the node;
 - steady-state journal volume is capped (regression cover for the log-noise
   patches, which could silently go dead on a bump while still applying
   cleanly).
