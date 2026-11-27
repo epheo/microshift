@@ -71,6 +71,7 @@ image:
 	    --label r-drbd.commit="$(R_DRBD_COMMIT)" \
 	    --label drbd.version="$(DRBD_VERSION)" \
 	    --label gateway-api.version="$(GATEWAY_API_VERSION)" \
+	    --label amorce.image="$(AMORCE_IMAGE)" \
 	    --label org.opencontainers.image.revision="$(shell git rev-parse HEAD 2>/dev/null)" \
 	    --build-arg RPM_IMAGE="localhost/$(RPM_IMAGE):latest" \
 	    --build-arg BOOTC_IMAGE_URL="$(BOOTC_IMAGE_URL)" \
@@ -81,6 +82,7 @@ image:
 	    --build-arg GATEWAY_API_VERSION="$(GATEWAY_API_VERSION)" \
 	    --build-arg GATEWAY_API_SHA256="$(GATEWAY_API_SHA256)" \
 	    --build-arg CNI_PLUGINS_IMAGE="$(shell cat src/cni/plugins-image)" \
+	    --build-arg AMORCE_IMAGE="$(AMORCE_IMAGE)" \
 	    --build-arg KMOD_SIGNED=$(if $(KMOD_KEY),yes,no) \
 	    $(if $(KMOD_KEY),--secret id=kmod-key$(comma)src=$(KMOD_KEY),--label io.github.epheo.installer.secure-boot=off) \
 	    -f packaging/bootc.Containerfile .

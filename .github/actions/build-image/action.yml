@@ -20,7 +20,8 @@ runs:
       shell: bash
       run: |
         ./scripts/ci-pull.sh quay.io/fedora/fedora:latest "${BUILDROOT_IMAGE}" \
-            "${BOOTC_IMAGE_URL}:${BOOTC_IMAGE_TAG}" "$(cat src/cni/plugins-image)"
+            "${BOOTC_IMAGE_URL}:${BOOTC_IMAGE_TAG}" "$(cat src/cni/plugins-image)" \
+            "${AMORCE_IMAGE}"
 
     - name: Key the RPM stages by their inputs
       id: rpm-key
