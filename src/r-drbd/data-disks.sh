@@ -7,7 +7,7 @@
 # it is, unless it is this unit's own, left bare by a start that stopped.
 set -euo pipefail
 
-PLAN=/etc/microshift-installer/data-disks.json
+PLAN=/etc/amorce/data-disks.json
 VG=myvg1
 THIN=thin
 DONE=/var/lib/microshift-r-drbd/data-disks-built

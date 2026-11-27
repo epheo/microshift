@@ -1,7 +1,7 @@
 [Unit]
 Description=Build the installer's data disks into VG myvg1, thin pool thin
 Documentation=https://github.com/epheo/microshift#installer
-ConditionPathExists=/etc/microshift-installer/data-disks.json
+ConditionPathExists=/etc/amorce/data-disks.json
 ConditionPathExists=!/var/lib/microshift-r-drbd/data-disks-built
 After=local-fs.target
 Before=microshift-r-drbd-default-pool.service
