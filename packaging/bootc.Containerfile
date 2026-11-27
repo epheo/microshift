@@ -50,13 +50,42 @@ RUN test -n "${DRBD_VERSION}" -a -n "${DRBD_SHA256}" && \
     kver="$(ls /usr/lib/modules)" && \
     /tmp/base-compose.sh add && \
     dnf -y install "kernel-devel-${kver}" gcc make rpm-build kernel-rpm-macros \
-        redhat-rpm-config elfutils-libelf-devel patch diffutils perl-interpreter && \
+        redhat-rpm-config elfutils-libelf-devel patch diffutils perl-interpreter \
+        openssl cpio && \
     curl -fsSL --retry 3 -o /tmp/drbd.tar.gz \
         "https://pkg.linbit.com/downloads/drbd/9/drbd-${DRBD_VERSION}.tar.gz" && \
     echo "${DRBD_SHA256}  /tmp/drbd.tar.gz" | sha256sum -c - && \
     tar -C /tmp -xzf /tmp/drbd.tar.gz && \
     make -C "/tmp/drbd-${DRBD_VERSION}" kmp-rpm KDIR="/usr/src/kernels/${kver}" \
         RPMOPT='--define "debug_package %{nil}"'
+
+# Secure Boot loads only signed modules. With KMOD_SIGNED=yes and the
+# kmod-key secret, a PEM holding the project's key and certificate, the DRBD
+# modules are signed here, at their package paths, and the certificate ships
+# for the installer to enroll (mokutil). KMOD_SIGNED keys the layer cache,
+# which never sees the secret: a signed and an unsigned build never share
+# this layer. With no, nothing is signed and no certificate ships.
+ARG KMOD_SIGNED=no
+RUN --mount=type=secret,id=kmod-key \
+    mkdir -p /root/kmod-signed/tree && \
+    case "${KMOD_SIGNED}" in \
+        yes) test -s /run/secrets/kmod-key || { echo "KMOD_SIGNED=yes without the kmod-key secret" >&2; exit 1; } ;; \
+        no) ;; \
+        *) echo "KMOD_SIGNED is yes or no, not ${KMOD_SIGNED}" >&2; exit 1 ;; \
+    esac && \
+    if [ "${KMOD_SIGNED}" = yes ]; then \
+        kver="$(ls /usr/lib/modules)" && \
+        mkdir /tmp/kmod && \
+        rpm2cpio /root/rpmbuild/RPMS/*/kmod-drbd-[0-9]*.rpm | cpio -idm --quiet -D /tmp/kmod && \
+        cd /tmp/kmod && \
+        for m in $(find . -name '*.ko'); do \
+            "/usr/src/kernels/${kver}/scripts/sign-file" sha256 \
+                /run/secrets/kmod-key /run/secrets/kmod-key "${m}" && \
+            cp --parents -a "${m}" /root/kmod-signed/tree/ || exit 1; \
+        done && \
+        find /root/kmod-signed/tree -name drbd.ko | grep -q . && \
+        openssl x509 -in /run/secrets/kmod-key -outform DER -out /root/kmod-signed/mok.der; \
+    fi
 
 # ovnkube for primary user-defined networks (patches/0016), until the payload
 # ships kubelet-cgroup-path: src/ovn/build-ovnkube.sh says why, and fails the
@@ -117,6 +146,29 @@ RUN ${REPO_CONFIG_SCRIPT} -create ${USHIFT_RPM_REPO_PATH} && \
     rm -vf  ${REPO_CONFIG_SCRIPT} && \
     rm -rvf ${USHIFT_RPM_REPO_PATH} /tmp/drbd-kmod && \
     dnf clean all
+
+# The signed DRBD modules replace the package's (rpm -V lists them), and the
+# certificate goes where the installer looks for a key to enroll.
+COPY --from=drbd-kmod /root/kmod-signed/ /tmp/kmod-signed/
+# Every module the package owns must now be signed, as must the one modprobe
+# loads by its name, so neither a module that failed to sign nor a path
+# change in a DRBD bump ships an unsigned copy.
+RUN if [ -e /tmp/kmod-signed/mok.der ]; then \
+        kver="$(ls /usr/lib/modules)" && \
+        cd /tmp/kmod-signed/tree && \
+        for m in $(find . -name '*.ko'); do cp -p "${m}" "/${m}" || exit 1; done && \
+        cd / && \
+        install -D -m 644 /tmp/kmod-signed/mok.der /usr/lib/microshift-installer/mok.der && \
+        depmod -a "${kver}" && \
+        for m in $(rpm -ql kmod-drbd | grep '\.ko$'); do \
+            n="$(basename "${m}" .ko)" && \
+            test -n "$(modinfo -F signer "${m}")" || \
+                { echo "${m}: unsigned" >&2; exit 1; }; \
+            test -n "$(modinfo -k "${kver}" -F signer "${n}")" || \
+                { echo "${n}: modprobe would load an unsigned module" >&2; exit 1; }; \
+        done; \
+    fi && \
+    rm -rf /tmp/kmod-signed
 
 # OVN-K hard-fails without xt_CT/nft_compat (ovnkube-node's geneve NOTRACK
 # rule) and the node never goes Ready. They live in kernel-modules-extra,

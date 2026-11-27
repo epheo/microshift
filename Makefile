@@ -18,6 +18,11 @@ export
 
 PODMAN ?= podman
 SUDO_PODMAN ?= sudo podman
+
+# KMOD_KEY: a PEM file with the key and certificate that sign the DRBD
+# modules, for Secure Boot; unset, they stay unsigned.
+KMOD_KEY ?=
+comma := ,
 # Base images are moving tags; never build on a stale local copy. A failed
 # check falls back to the local image.
 PULL ?= newer
@@ -76,6 +81,8 @@ image:
 	    --build-arg GATEWAY_API_VERSION="$(GATEWAY_API_VERSION)" \
 	    --build-arg GATEWAY_API_SHA256="$(GATEWAY_API_SHA256)" \
 	    --build-arg CNI_PLUGINS_IMAGE="$(shell cat src/cni/plugins-image)" \
+	    --build-arg KMOD_SIGNED=$(if $(KMOD_KEY),yes,no) \
+	    $(if $(KMOD_KEY),--secret id=kmod-key$(comma)src=$(KMOD_KEY)) \
 	    -f packaging/bootc.Containerfile .
 
 # Extract the version string stamped into the RPM build (used for image tags).
