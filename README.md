@@ -66,7 +66,7 @@ thin pool, restore onto `r-drbd-local`, then remove TopoLVM
 Secure Boot loads only signed modules, and the DRBD module is built here.
 CI signs it with the project key, the `KMOD_SIGNING_KEY` secret: one PEM
 holding the key and its certificate. The certificate ships as
-`/usr/lib/microshift-installer/mok.der`: the installer queues it with
+`/usr/lib/amorce/mok.der`: the installer queues it with
 `mokutil --import`, and MokManager asks once, at the next start, for the
 password the installer shows. Builds without the secret (forks, or
 `make image` without `KMOD_KEY=key.pem`) ship unsigned modules and no
@@ -315,14 +315,14 @@ and the update gate skipping a rolled-back image.
 
 ## Installer
 
-The console installer (epheo/microshift-installer) writes install media for
+The console installer (epheo/amorce) writes install media for
 this image and any image built FROM it; this image's
 `io.github.epheo.installer.*` labels offer it as the MicroShift purpose.
 It only drives this image's own mechanisms, so an install without it
 (`bootc install`, bootc-image-builder) loses nothing:
 
 - Data disks: it wipes the disks chosen for data and records them in
-  `/etc/microshift-installer/data-disks.json`; at the first start
+  `/etc/amorce/data-disks.json`; at the first start
   `microshift-r-drbd-data-disks` runs the [Storage](#storage) recipe on
   them, once, and the default Pool follows. A plan of another layout is left
   to the image that asked for it (stornas mirrors pairs).

@@ -158,7 +158,7 @@ RUN if [ -e /tmp/kmod-signed/mok.der ]; then \
         cd /tmp/kmod-signed/tree && \
         for m in $(find . -name '*.ko'); do cp -p "${m}" "/${m}" || exit 1; done && \
         cd / && \
-        install -D -m 644 /tmp/kmod-signed/mok.der /usr/lib/microshift-installer/mok.der && \
+        install -D -m 644 /tmp/kmod-signed/mok.der /usr/lib/amorce/mok.der && \
         depmod -a "${kver}" && \
         for m in $(rpm -ql kmod-drbd | grep '\.ko$'); do \
             n="$(basename "${m}" .ko)" && \
@@ -315,7 +315,7 @@ COPY --chmod=755 ./src/r-drbd/data-disks.sh /usr/libexec/microshift-r-drbd-data-
 COPY ./src/r-drbd/microshift-r-drbd-data-disks.service /usr/lib/systemd/system/microshift-r-drbd-data-disks.service
 RUN systemctl enable microshift-r-drbd-default-pool.service microshift-r-drbd-data-disks.service
 
-# What the console installer (epheo/microshift-installer) offers this image
+# What the console installer (epheo/amorce) offers this image
 # as. Images built FROM this one inherit these labels: one that is another
 # purpose sets its own. secure-boot=off comes from the Makefile, only while
 # the DRBD module is unsigned.
