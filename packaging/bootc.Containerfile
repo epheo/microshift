@@ -35,7 +35,6 @@ ARG AMORCE_IMAGE
 
 FROM ${RPM_IMAGE} AS builder
 
-# The console installer's whole image, for its installed console's files.
 FROM ${AMORCE_IMAGE} AS amorce
 
 # OpenShift's full CNI plugins image, pinned from the payload by
