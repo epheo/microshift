@@ -31,8 +31,12 @@ ARG BOOTC_IMAGE_URL
 ARG BOOTC_IMAGE_TAG
 ARG RPM_IMAGE=localhost/epheo-microshift-rpm:latest
 ARG CNI_PLUGINS_IMAGE
+ARG AMORCE_IMAGE
 
 FROM ${RPM_IMAGE} AS builder
+
+# The console installer's whole image, for its installed console's files.
+FROM ${AMORCE_IMAGE} AS amorce
 
 # OpenShift's full CNI plugins image, pinned from the payload by
 # src/cni/vendor.sh: only host-device is taken from it.
@@ -324,6 +328,17 @@ LABEL io.github.epheo.installer.id="microshift" \
       io.github.epheo.installer.summary="Kubernetes for your own apps" \
       io.github.epheo.installer.includes="MicroShift on the OKD payload;Replicated volumes (r-drbd);Gateway API (portail);Updates that roll back;Workers that join" \
       io.github.epheo.installer.data-disks="thin"
+
+# amorce's installed console, taken as its README gives it: bootc updates it
+# with everything else. It takes tty1 and opens 9190 and 2222 (README,
+# Installer).
+COPY --from=amorce /usr/bin/amorce /usr/bin/amorce
+COPY --from=amorce /usr/share/amorce /usr/share/amorce
+RUN install -m 644 /usr/share/amorce/dist/amorce-console.service /usr/lib/systemd/system/ && \
+    install -m 644 /usr/share/amorce/dist/amorce.xml /usr/lib/firewalld/services/ && \
+    firewall-offline-cmd --zone=public --add-service=amorce && \
+    systemctl enable amorce-console.service && \
+    systemctl mask getty@tty1.service
 
 # Embed the full MicroShift payload under /usr/lib/embedded-images.
 # import-embedded-images.service imports every manifest entry into cri-o's

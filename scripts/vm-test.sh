@@ -18,8 +18,9 @@
 # embedded portail image is started with pull policy Never, the API
 # accepts TCPRoute and UDPRoute objects, portail on 443 terminates HTTPS
 # for a wildcard and passes one exact name through by SNI behind the
-# node IP the LoadBalancer controller gives it, and RBAC answers as OpenShift's
-# does for signed-in users and the stock project roles (src/rbac).
+# node IP the LoadBalancer controller gives it, RBAC answers as OpenShift's
+# does for signed-in users and the stock project roles (src/rbac), and
+# amorce's console holds tty1 and serves SSH on 2222.
 # The fresh-install VM runs with zero egress (restrict=on): going GREEN
 # proves the air-gapped first boot the embedded payload exists for.
 #
@@ -525,6 +526,22 @@ log "assert: firewalld runs and serves MicroShift's control plane"
 }
 vssh firewall-cmd --zone=public --query-service=microshift-controlplane >/dev/null || {
     echo "ERROR: the public zone lacks microshift-controlplane" >&2; exit 1; }
+
+# The console retries a tty it cannot open forever without failing its unit.
+log "assert: amorce's console holds tty1 and serves SSH on 2222, open in the public zone"
+amorce_ok() {
+    [ "$(vssh systemctl show -P ActiveState amorce-console.service)" = active ] &&
+        [ "$(vssh systemctl show -P NRestarts amorce-console.service)" = 0 ] &&
+        [ "$(vssh systemctl is-enabled getty@tty1.service 2>&1)" = masked ] &&
+        vssh firewall-cmd --zone=public --query-service=amorce >/dev/null &&
+        [ -n "$(vssh ss -Hltn sport = :2222)" ] &&
+        ! vssh journalctl -b -u amorce-console.service --no-pager | grep -q 'open /dev/tty1:'
+}
+amorce_ok || {
+    echo "ERROR: amorce's console is not running as shipped:" >&2
+    vssh sh -c 'systemctl status --no-pager amorce-console.service getty@tty1.service; firewall-cmd --zone=public --list-services; ss -ltnp; journalctl -b -u amorce-console.service --no-pager | tail -30' 2>&1 | tail -80 >&2
+    exit 1
+}
 
 # #12: an OS upgrade can ship a new image under the same tag. Simulate it by
 # re-pointing the portail tag at a payload image; the import must restore it.

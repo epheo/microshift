@@ -337,6 +337,13 @@ It only drives this image's own mechanisms, so an install without it
 - Secure Boot: it enrolls the module certificate ([Secure Boot](#secure-boot)).
   Unsigned builds carry `io.github.epheo.installer.secure-boot=off`, which
   the installer warns about.
+- Console: the image ships amorce's installed console (`AMORCE_IMAGE`,
+  pinned by digest, bumped by hand), updated by bootc with everything else.
+  It takes tty1: logins move behind enter or to alt+F2, the serial getty
+  stays. Firewalld's `amorce` service opens 9190 (the site's reports and
+  joins) and 2222 (the console over SSH, root's keys) in the public zone.
+  An updated node whose public zone was changed locally, a worker for one,
+  keeps its own zone: add `amorce` there by hand.
 
 ## Patch policy
 
