@@ -1664,16 +1664,19 @@ wait_for 180 "TCPRoute and UDPRoute accepted" routes_accepted || {
 log "assert: portail on 443 terminates HTTPS for *.gw.test and passes idm.gw.test through"
 gw="${WORKDIR}/portail"
 mkdir -p "${gw}"
+portail_tag="${portail_ref%%@*}"
+portail_tag="${portail_tag##*:}"
 for f in crds/gatewayparameters.yaml crds/ratelimitpolicy.yaml install/namespace.yaml \
         install/rbac.yaml install/controller.yaml install/gatewayclass.yaml; do
     curl -fsSL --retry 3 -o "${gw}/${f##*/}" \
-        "https://raw.githubusercontent.com/epheo/portail/v${portail_ref##*:}/deploy/${f}"
+        "https://raw.githubusercontent.com/epheo/portail/v${portail_tag}/deploy/${f}"
 done
 # Upstream names the registry image, untagged: the node holds only the
 # embedded copy, for the controller and the data planes it provisions.
 sed -i -e "s|image: ghcr.io/epheo/portail\(:.*\)\?$|image: ${portail_ref}|" \
     -e "s|args: \[controller\]|args: [controller, --dataplane-image=${portail_ref}]|" "${gw}/controller.yaml"
-grep -qF "args: [controller, --dataplane-image=${portail_ref}]" "${gw}/controller.yaml" || {
+grep -qF "image: ${portail_ref}" "${gw}/controller.yaml" &&
+    grep -qF "args: [controller, --dataplane-image=${portail_ref}]" "${gw}/controller.yaml" || {
     echo "ERROR: portail's deploy/install/controller.yaml changed shape: set the embedded image by hand" >&2
     exit 1
 }
