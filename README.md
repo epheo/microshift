@@ -313,6 +313,31 @@ deployment with firewalld running and greenboot green on both roles, then a
 controller update the worker follows by digest once the update lock is free,
 and the update gate skipping a rolled-back image.
 
+## Installer
+
+The console installer (epheo/microshift-installer) writes install media for
+this image and any image built FROM it; this image's
+`io.github.epheo.installer.*` labels offer it as the MicroShift purpose.
+It only drives this image's own mechanisms, so an install without it
+(`bootc install`, bootc-image-builder) loses nothing:
+
+- Data disks: it wipes the disks chosen for data and records them in
+  `/etc/microshift-installer/data-disks.json`; at the first start
+  `microshift-r-drbd-data-disks` runs the [Storage](#storage) recipe on
+  them, once, and the default Pool follows. A plan of another layout is left
+  to the image that asked for it (stornas mirrors pairs).
+  It waits up to a minute for slow disks to appear, and tries again at the
+  next start without them. A volume group it made but left bare (a start
+  that stopped before the thin pool) gets the thin pool; any other `myvg1`
+  stays untouched.
+- Workers: a worker's installer masks MicroShift, so it never starts as a
+  controller; its console then runs `microshift-profile worker`, unmasks and
+  enables MicroShift, and `microshift add-node --worker` with a join
+  kubeconfig the controller makes (`worker-join-kubeconfig`).
+- Secure Boot: it enrolls the module certificate ([Secure Boot](#secure-boot)).
+  Unsigned builds carry `io.github.epheo.installer.secure-boot=off`, which
+  the installer warns about.
+
 ## Patch policy
 
 `patches/` is a series applied on pristine upstream tags. Keep it short,
